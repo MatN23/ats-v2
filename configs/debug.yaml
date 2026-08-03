@@ -1,0 +1,60 @@
+# Fast CPU/GPU smoke-test config. ~14M parameters.
+model:
+  name: ats_debug
+  hidden_size: 128
+  num_layers: 4
+  num_heads: 4
+  num_kv_heads: 4
+  intermediate_size: 512
+  max_seq_len: 512
+  vocab_size: 50304
+  tie_word_embeddings: true
+  use_moe: false
+  use_mod: false
+  use_swa: false
+  use_mla: false
+  dropout: 0.0
+  use_flash_attention: false
+  gradient_checkpointing: false
+
+training:
+  max_steps: 100
+  learning_rate: 1.0e-3
+  warmup_steps: 10
+  min_lr_ratio: 0.1
+  grad_clip_norm: 1.0
+  grad_accum_steps: 1
+  micro_batch_size: 4
+  eval_every: 50
+  save_every: 50
+  keep_last_n_checkpoints: 2
+  mixed_precision: fp32
+  seed: 42
+
+data:
+  sources:
+    - path: ./data/debug.jsonl
+      weight: 1.0
+  seq_length: 512
+  tokenizer_name: "tiktoken:cl100k_base"
+  streaming: false
+
+parallelism:
+  strategy: auto
+  gpus: 1
+  nodes: 1
+
+logging:
+  project_name: ats-debug
+  use_wandb: false
+  use_tensorboard: false
+  log_every: 5
+
+checkpoint:
+  output_dir: ./checkpoints/debug
+
+adaptive:
+  enabled: true
+  history_size: 100
+  spike_window: 10
+  plateau_window: 20

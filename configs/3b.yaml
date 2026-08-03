@@ -1,0 +1,56 @@
+# 3b dense model. Architecture auto-tuned from model.size (see
+# ats/config/defaults.py::MODEL_SIZE_PRESETS). All optional architecture
+# features are OFF by default; enable via CLI flags, e.g.:
+#   python train.py --config configs/3b.yaml --use-swa
+model:
+  name: ats_3b
+  size: "3b"
+  vocab_size: 50304
+  max_seq_len: 4096
+  tie_word_embeddings: true
+  use_moe: false
+  use_mod: false
+  use_swa: false
+  use_mla: false
+  dropout: 0.0
+  use_flash_attention: true
+  gradient_checkpointing: true
+
+training:
+  max_steps: 100000
+  learning_rate: 3.0e-4
+  warmup_steps: 2000
+  min_lr_ratio: 0.1
+  grad_clip_norm: 1.0
+  grad_accum_steps: 8
+  micro_batch_size: 1
+  eval_every: 1000
+  save_every: 1000
+  keep_last_n_checkpoints: 3
+  mixed_precision: bf16
+  seed: 42
+
+data:
+  sources:
+    - path: ./data/train.jsonl
+      weight: 1.0
+  seq_length: 4096
+  tokenizer_name: "tiktoken:cl100k_base"
+  streaming: true
+
+parallelism:
+  strategy: auto
+  gpus: 8
+  nodes: 1
+
+logging:
+  project_name: ats-3b
+  use_wandb: false
+  use_tensorboard: true
+  log_every: 10
+
+checkpoint:
+  output_dir: ./checkpoints/3b
+
+adaptive:
+  enabled: true

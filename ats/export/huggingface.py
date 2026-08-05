@@ -94,6 +94,55 @@ def _remap_state_dict(ats_state_dict: Dict[str, torch.Tensor], num_layers: int) 
     return hf_state_dict
 
 
+def _build_model_card(model_config: ModelConfig) -> str:
+    attention_kind = "MLA" if model_config.use_mla else ("SWA" if model_config.use_swa else "GQA")
+    ffn_kind = "MoE" if model_config.use_moe else "SwiGLU (dense)"
+    tags = ["ats-v2", model_config.name, "moe" if model_config.use_moe else "dense"]
+    if model_config.use_swa:
+        tags.append("sliding-window-attention")
+    if model_config.use_mod:
+        tags.append("mixture-of-depths")
+
+    tag_lines = "\n".join(f"  - {tag}" for tag in tags)
+    lines = [
+        "---",
+        "license: apache-2.0",
+        "tags:",
+        tag_lines,
+        "---",
+        "",
+        f"# {model_config.name}",
+        "",
+        "Trained with [ats-v2](https://github.com/anthropics/ats-v2) using:",
+        "",
+        f"- Architecture: {model_config.name}",
+        f"- Hidden size: {model_config.hidden_size}",
+        f"- Layers: {model_config.num_layers}",
+        f"- Attention heads: {model_config.num_heads} (KV heads: {model_config.num_kv_heads})",
+        f"- Attention mechanism: {attention_kind}",
+        f"- FFN: {ffn_kind}",
+        f"- Vocab size: {model_config.vocab_size}",
+        f"- Max sequence length: {model_config.max_seq_len}",
+        f"- Tied embeddings: {model_config.tie_word_embeddings}",
+    ]
+    if model_config.use_swa:
+        lines.append(
+            f"- Sliding window: {model_config.swa_window_size} tokens "
+            f"(full attention every {model_config.swa_full_attention_interval} layers)"
+        )
+    if model_config.use_moe:
+        lines.append(
+            f"- Experts: {model_config.num_experts}, top-{model_config.moe_top_k} routing"
+        )
+    lines.append("")
+    lines.append(
+        "This checkpoint was exported automatically by `ats.export.huggingface."
+        "export_to_huggingface`; the fields above are read directly from the "
+        "training config, not hand-written."
+    )
+    return "\n".join(lines) + "\n"
+
+
 def export_to_huggingface(
     model: ATSTransformer, model_config: ModelConfig, output_dir: str,
     tokenizer_dir: Optional[str] = None,
@@ -150,6 +199,10 @@ def export_to_huggingface(
         for item in tokenizer_src.iterdir():
             if item.is_file():
                 shutil.copy2(item, out_path / item.name)
+
+    model_card = _build_model_card(model_config)
+    with open(out_path / "README.md", "w", encoding="utf-8") as f:
+        f.write(model_card)
 
     logger.info("Exported HuggingFace checkpoint to %s", out_path)
     return out_path

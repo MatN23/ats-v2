@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ats-v2"
+version = "2.0.0"
+description = "Adaptive Training System v2: a config-driven LLM training framework on DeepSpeed."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "ats-v2 contributors" }]
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1.0",
+    "deepspeed>=0.12.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "tiktoken>=0.5.0",
+    "transformers>=4.36.0",
+    "safetensors>=0.4.0",
+    "numpy>=1.24.0",
+    "datasets>=2.15.0",
+    "huggingface-hub>=0.19.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4.0"]
+eval = ["lm-eval>=0.4.0"]
+triton = ["triton>=2.1.0"]
+
+[project.scripts]
+ats-train = "ats.cli.train:main"
+ats-eval = "ats.cli.evaluate:main"
+ats-export = "ats.cli.export:main"
+ats-doctor = "ats.cli.doctor:main"
+ats-finetune = "ats.cli.finetune:main"
+ats-align = "ats.cli.align:main"
+
+[tool.setuptools.packages.find]
+include = ["ats", "ats.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

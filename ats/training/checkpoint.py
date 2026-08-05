@@ -16,6 +16,9 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+import yaml
+from safetensors.torch import load_file as safetensors_load_file
+from safetensors.torch import save_file as safetensors_save_file
 
 from ats.config.schema import ATSConfig, ConfigError
 from ats.utils.logging_utils import get_logger
@@ -23,6 +26,7 @@ from ats.utils.logging_utils import get_logger
 logger = get_logger("ats.training.checkpoint")
 
 _TRAINING_STATE_FILENAME = "training_state.json"
+_SAFETENSORS_FILENAME = "model.safetensors"
 
 
 class TrainingHaltError(RuntimeError):
@@ -51,6 +55,21 @@ def _restore_rng_state(state: Dict[str, Any]) -> None:
         torch.cuda.set_rng_state_all(
             [torch.tensor(t, dtype=torch.uint8) for t in state["torch_cuda"]]
         )
+
+
+def load_model_weights_safetensors(checkpoint_dir: str) -> Dict[str, torch.Tensor]:
+    """Loads just the model weights from a checkpoint's model.safetensors
+    file, with no DeepSpeed engine and no pickle execution risk. Useful for
+    export/inspection tooling that only needs weights, not optimizer state
+    or the ability to resume training."""
+    path = Path(checkpoint_dir) / _SAFETENSORS_FILENAME
+    if not path.exists():
+        raise ConfigError(
+            f"No {_SAFETENSORS_FILENAME} found at {path}. "
+            f"Fix: point checkpoint_dir at a directory created by "
+            f"CheckpointManager.save (e.g. checkpoints/run/step_5000)."
+        )
+    return safetensors_load_file(str(path))
 
 
 class CheckpointManager:
@@ -83,6 +102,25 @@ class CheckpointManager:
                 {"global_step": global_step, "epoch": epoch, "config_hash": self.config.config_hash()},
                 f, indent=2,
             )
+
+        # Write a copy of the resolved config alongside the checkpoint so
+        # export.py (and manual inspection) can find it without requiring
+        # --config to be passed explicitly every time.
+        config_path = ckpt_dir / "config.yaml"
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(self.config.model_dump(), f, sort_keys=False)
+
+        # Write a plain safetensors snapshot of the model weights alongside
+        # DeepSpeed's own checkpoint. DeepSpeed's save_checkpoint() above
+        # already handles full ZeRO-sharded optimizer/model resume (that's
+        # DeepSpeed's own internal format, not something ats controls or
+        # should reimplement) -- this safetensors copy is an ADDITIONAL,
+        # de-sharded, pickle-free artifact for fast loading / HF export /
+        # manual inspection, matching the .safetensors benefits (fast I/O,
+        # no arbitrary-code-execution risk on load, HF-standard format).
+        module = model_engine.module if hasattr(model_engine, "module") else model_engine
+        state_dict = {k: v.detach().cpu().contiguous() for k, v in module.state_dict().items()}
+        safetensors_save_file(state_dict, str(ckpt_dir / _SAFETENSORS_FILENAME))
 
         logger.info("Saved checkpoint at step %d to %s", global_step, ckpt_dir)
         self._prune_old_checkpoints()

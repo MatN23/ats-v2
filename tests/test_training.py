@@ -168,3 +168,46 @@ def test_checkpoint_load_rejects_mismatched_config(tmp_path):
     from ats.config.schema import ConfigError
     with pytest.raises(ConfigError):
         other_manager.load(engine, str(ckpt_dir))
+
+
+def test_checkpoint_save_writes_config_yaml(tmp_path):
+    """Regression test: export.py's auto-discovery depends on
+    CheckpointManager.save() actually writing config.yaml into the
+    checkpoint's tag directory. Previously nothing ever wrote this file, so
+    the auto-discovery path always failed even when export.py looked in the
+    'right' place."""
+    import yaml
+
+    config = _make_config(tmp_path)
+    model = torch.nn.Linear(8, 8)
+    engine = _TinyModelEngine(model)
+    manager = CheckpointManager(config)
+
+    ckpt_dir = manager.save(engine, global_step=3, epoch=0)
+    config_path = ckpt_dir / "config.yaml"
+    assert config_path.exists()
+
+    with open(config_path) as f:
+        loaded = yaml.safe_load(f)
+    assert loaded["model"]["hidden_size"] == config.model.hidden_size
+    assert loaded["training"]["max_steps"] == config.training.max_steps
+
+
+def test_checkpoint_save_writes_safetensors(tmp_path):
+    """Regression/spec test: model weights must be saved as .safetensors
+    (fast, pickle-free, HF-standard), not solely inside DeepSpeed's own
+    pickle-based checkpoint format."""
+    from ats.training.checkpoint import load_model_weights_safetensors
+
+    config = _make_config(tmp_path)
+    model = torch.nn.Linear(8, 8)
+    engine = _TinyModelEngine(model)
+    manager = CheckpointManager(config)
+
+    ckpt_dir = manager.save(engine, global_step=7, epoch=0)
+    safetensors_path = ckpt_dir / "model.safetensors"
+    assert safetensors_path.exists()
+
+    loaded_weights = load_model_weights_safetensors(str(ckpt_dir))
+    assert torch.allclose(loaded_weights["weight"], model.weight.detach())
+    assert torch.allclose(loaded_weights["bias"], model.bias.detach())

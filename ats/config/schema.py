@@ -203,11 +203,22 @@ class TrainingConfig(BaseModel):
     grad_clip_norm: float = 1.0
     grad_accum_steps: int = 1
     micro_batch_size: int = 1
+    weight_decay: float = 0.1
     eval_every: int = 1000
     save_every: int = 1000
     keep_last_n_checkpoints: int = 3
     mixed_precision: Literal["bf16", "fp16", "fp32"] = "bf16"
     seed: int = 42
+
+    @field_validator("weight_decay")
+    @classmethod
+    def _validate_weight_decay(cls, v: float) -> float:
+        if v < 0:
+            raise ConfigError(
+                f"training.weight_decay must be >= 0, got {v}. "
+                f"Fix: set training.weight_decay to a non-negative float, e.g. 0.1."
+            )
+        return v
 
     @field_validator("micro_batch_size")
     @classmethod

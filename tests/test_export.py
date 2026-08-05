@@ -94,3 +94,24 @@ def test_diffusion_export_raises(tmp_path):
     model = ATSTransformer(config)
     with pytest.raises(ConfigError):
         export_to_huggingface(model, config, str(tmp_path / "exported_diffusion"))
+
+
+@pytest.mark.skipif(not _SAFETENSORS_AVAILABLE, reason="safetensors not installed in this environment")
+def test_export_writes_model_card(tmp_path):
+    config = _dense_config(use_swa=True, swa_window_size=64)
+    model = ATSTransformer(config)
+    out_dir = export_to_huggingface(model, config, str(tmp_path / "exported_card"))
+
+    readme_path = out_dir / "README.md"
+    assert readme_path.exists()
+    content = readme_path.read_text()
+    assert "license: apache-2.0" in content
+    assert f"Hidden size: {config.hidden_size}" in content
+    assert "Sliding window: 64 tokens" in content
+    # Model card content must be derived from the actual config, not hardcoded:
+    # a different hidden_size must produce a different card.
+    other_config = _dense_config(hidden_size=64, use_swa=True, swa_window_size=64)
+    other_model = ATSTransformer(other_config)
+    other_out_dir = export_to_huggingface(other_model, other_config, str(tmp_path / "exported_card_2"))
+    other_content = (other_out_dir / "README.md").read_text()
+    assert content != other_content

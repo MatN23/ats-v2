@@ -47,11 +47,18 @@ def _resolve_config_path(args: argparse.Namespace) -> str:
         return args.config
     from pathlib import Path
 
-    candidate = Path(args.checkpoint).parent / "config.yaml"
+    # CheckpointManager.save() writes config.yaml INSIDE the checkpoint's own
+    # tag directory (e.g. checkpoints/run/step_10000/config.yaml), not in its
+    # parent, so look there first.
+    candidate = Path(args.checkpoint) / "config.yaml"
     if candidate.exists():
         return str(candidate)
+    legacy_candidate = Path(args.checkpoint).parent / "config.yaml"
+    if legacy_candidate.exists():
+        return str(legacy_candidate)
     raise ConfigError(
-        f"No --config was given and no sibling config.yaml was found at {candidate}. "
+        f"No --config was given and no config.yaml was found at {candidate} "
+        f"(or {legacy_candidate}). "
         f"Fix: pass --config configs/<size>.yaml explicitly, matching the config the "
         f"checkpoint was trained with."
     )

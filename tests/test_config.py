@@ -110,18 +110,12 @@ def test_config_hash_changes_when_architecture_changes():
     assert cfg_a.config_hash() != cfg_b.config_hash()
 
 
-# --- CLI override merge logic (train.py) ---
+# --- CLI override merge logic (ats.cli.train) ---
 
 def _cli_config(argv):
     """Helper: parse argv (excluding --config) against the debug config and
-    return the merged ATSConfig, importing train.py as a top-level module."""
-    import sys
-    from pathlib import Path
-
-    repo_root = str(Path(__file__).resolve().parent.parent)
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
-    import train as train_module
+    return the merged ATSConfig, using the real ats.cli.train module."""
+    from ats.cli import train as train_module
 
     parser = train_module.build_arg_parser()
     args = parser.parse_args(["--config", "configs/debug.yaml"] + argv)

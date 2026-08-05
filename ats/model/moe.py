@@ -50,6 +50,20 @@ class _PyTorchMoEFallback(nn.Module):
             [SwiGLU(hidden_size, intermediate_size) for _ in range(num_experts)]
         )
 
+    def compute_routing(self, flat_x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (top_k_probs, top_k_idx, router_probs) for a flattened
+        [num_tokens, hidden_size] input: top_k_probs are the (renormalized,
+        sum-to-1-per-token) gating weights for the selected experts,
+        top_k_idx are their indices, router_probs is the full softmax
+        distribution over all experts (used for the load-balancing aux
+        loss). Factored out of forward() so it can be exercised directly by
+        tests without duplicating the gating math."""
+        router_logits = self.gate(flat_x)  # [num_tokens, num_experts]
+        router_probs = F.softmax(router_logits, dim=-1)
+        top_k_probs, top_k_idx = torch.topk(router_probs, self.top_k, dim=-1)
+        top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        return top_k_probs, top_k_idx, router_probs
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         batch, seq_len, hidden_size = x.shape
         if hidden_size != self.hidden_size:
@@ -59,10 +73,7 @@ class _PyTorchMoEFallback(nn.Module):
         flat_x = x.reshape(-1, hidden_size)
         num_tokens = flat_x.shape[0]
 
-        router_logits = self.gate(flat_x)  # [num_tokens, num_experts]
-        router_probs = F.softmax(router_logits, dim=-1)
-        top_k_probs, top_k_idx = torch.topk(router_probs, self.top_k, dim=-1)
-        top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        top_k_probs, top_k_idx, router_probs = self.compute_routing(flat_x)
 
         capacity = max(1, int(self.capacity_factor * num_tokens * self.top_k / self.num_experts))
         output = torch.zeros_like(flat_x)

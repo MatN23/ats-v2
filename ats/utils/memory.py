@@ -1,15 +1,155 @@
 """Memory helpers: auto batch-size finder (binary search with real forward/backward
-passes, catching only torch.cuda.OutOfMemoryError) and GPU memory reporting."""
+passes, catching only torch.cuda.OutOfMemoryError), GPU memory reporting, and a
+pre-flight memory *estimator* that runs before any GPU memory is allocated."""
 
 from __future__ import annotations
 
-from typing import Callable, Dict
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, Dict, Optional
 
 import torch
 
 from ats.utils.logging_utils import get_logger
 
+if TYPE_CHECKING:
+    from ats.config.schema import ATSConfig
+
 logger = get_logger("ats.utils.memory")
+
+_BYTES_PER_PARAM = {"bf16": 2, "fp16": 2, "fp32": 4}
+_BYTES_PER_GIB = 1024 ** 3
+# Adam keeps two fp32 moment tensors (m, v) per parameter, plus (under mixed
+# precision) an fp32 master-weight copy. This is the standard
+# mixed-precision-Adam memory accounting used by DeepSpeed's own ZeRO memory
+# calculator; see https://www.deepspeed.ai/tutorials/zero/ for the same
+# 4 (master) + 4 + 4 (moments) = 12 bytes/param figure at ZeRO stage 0.
+_ADAM_BYTES_PER_PARAM_FP32_STATES = 12
+# Rough activation-memory-per-token-per-layer constant, following the
+# standard transformer activation memory formula (Korthikanti et al. 2022 /
+# Megatron-LM's activation recomputation paper): roughly
+# ~34 * hidden_size bytes per token per layer without recomputation, in
+# fp16/bf16. This is a heuristic, not an exact accounting of every buffer;
+# it exists to give an order-of-magnitude pre-flight warning, not a
+# guarantee.
+_ACTIVATION_BYTES_PER_TOKEN_PER_LAYER_PER_HIDDEN = 34
+
+
+@dataclass
+class MemoryReport:
+    total_gb: float
+    model_gb: float
+    optimizer_gb: float
+    activation_gb: float
+    fits_on_single_gpu: bool
+    suggested_batch_size: int
+    suggested_grad_accum: int
+    suggested_zero_stage: int
+    available_gb: float
+
+
+def _zero_stage_from_strategy(strategy: str) -> int:
+    mapping = {
+        "deepspeed_zero0": 0, "deepspeed_zero1": 1, "deepspeed_zero2": 2,
+        "deepspeed_zero3": 3, "deepspeed_moe": 2, "fsdp": 3,
+    }
+    return mapping.get(strategy, 2)
+
+
+def _detect_available_gpu_memory_gb() -> float:
+    if not torch.cuda.is_available():
+        return 0.0
+    device = torch.cuda.current_device()
+    return torch.cuda.get_device_properties(device).total_memory / _BYTES_PER_GIB
+
+
+def estimate_memory(config: "ATSConfig", target_batch_size: Optional[int] = None) -> MemoryReport:
+    """Estimate peak per-GPU memory before training starts (no GPU memory is
+    allocated by this function). Uses the same parameter-count arithmetic as
+    ats.parallelism.auto_parallel.estimate_param_count, standard
+    mixed-precision-Adam optimizer-state accounting, and a standard
+    (heuristic) transformer activation-memory formula.
+
+    This is an estimate for pre-flight warnings, not an exact simulator —
+    real memory use depends on the specific CUDA allocator, fragmentation,
+    and framework overhead. Treat the suggested_* fields as a starting point.
+    """
+    from ats.parallelism.auto_parallel import estimate_param_count, resolve_strategy
+
+    if not config.model.is_resolved():
+        raise ValueError(
+            "estimate_memory requires a resolved ModelConfig (hidden_size/num_layers/"
+            "etc must not be None). Call ats.config.defaults.apply_size_preset() first."
+        )
+
+    world_size = max(1, config.parallelism.gpus * config.parallelism.nodes)
+    strategy = resolve_strategy(config)
+    zero_stage = _zero_stage_from_strategy(strategy)
+
+    num_params = estimate_param_count(config.model)
+    bytes_per_param = _BYTES_PER_PARAM[config.training.mixed_precision]
+
+    model_bytes = num_params * bytes_per_param
+    optimizer_bytes = num_params * _ADAM_BYTES_PER_PARAM_FP32_STATES
+    gradient_bytes = num_params * 4  # gradients accumulated in fp32
+
+    # ZeRO sharding: stage 1 shards optimizer state, stage 2 additionally
+    # shards gradients, stage 3 additionally shards parameters themselves.
+    if zero_stage >= 1:
+        optimizer_bytes = optimizer_bytes / world_size
+    if zero_stage >= 2:
+        gradient_bytes = gradient_bytes / world_size
+    if zero_stage >= 3:
+        model_bytes = model_bytes / world_size
+
+    batch_size = target_batch_size if target_batch_size is not None else config.training.micro_batch_size
+    seq_len = config.data.seq_length
+    activation_bytes = (
+        batch_size * seq_len * config.model.num_layers * config.model.hidden_size
+        * _ACTIVATION_BYTES_PER_TOKEN_PER_LAYER_PER_HIDDEN
+    )
+    if config.model.gradient_checkpointing:
+        # Checkpointing only retains layer-boundary activations, recomputing
+        # the rest during backward; approximate as an O(sqrt(num_layers))
+        # reduction, which is the standard checkpointing memory bound.
+        activation_bytes = activation_bytes / max(1.0, config.model.num_layers ** 0.5)
+
+    model_gb = (model_bytes + gradient_bytes) / _BYTES_PER_GIB
+    optimizer_gb = optimizer_bytes / _BYTES_PER_GIB
+    activation_gb = activation_bytes / _BYTES_PER_GIB
+    total_gb = model_gb + optimizer_gb + activation_gb
+
+    available_gb = _detect_available_gpu_memory_gb()
+    fits = (total_gb <= 0.8 * available_gb) if available_gb > 0 else True
+
+    suggested_batch_size = batch_size
+    suggested_grad_accum = config.training.grad_accum_steps
+    if available_gb > 0 and not fits:
+        non_activation_gb = model_gb + optimizer_gb
+        remaining_gb = max(0.0, 0.8 * available_gb - non_activation_gb)
+        per_sample_activation_gb = activation_gb / max(1, batch_size)
+        if per_sample_activation_gb > 0:
+            suggested_batch_size = max(1, int(remaining_gb / per_sample_activation_gb))
+        else:
+            suggested_batch_size = 1
+        if suggested_batch_size < batch_size:
+            ratio = max(1, batch_size // max(1, suggested_batch_size))
+            suggested_grad_accum = config.training.grad_accum_steps * ratio
+
+    suggested_zero_stage = zero_stage
+    if available_gb > 0 and not fits and zero_stage < 3:
+        suggested_zero_stage = zero_stage + 1
+
+    return MemoryReport(
+        total_gb=total_gb,
+        model_gb=model_gb,
+        optimizer_gb=optimizer_gb,
+        activation_gb=activation_gb,
+        fits_on_single_gpu=fits,
+        suggested_batch_size=suggested_batch_size,
+        suggested_grad_accum=suggested_grad_accum,
+        suggested_zero_stage=suggested_zero_stage,
+        available_gb=available_gb,
+    )
 
 
 def get_gpu_memory_info() -> Dict[str, float]:

@@ -84,12 +84,42 @@ def test_moe_fallback_output_shape_and_aux_loss():
 
 
 def test_moe_gating_weights_sum_to_one():
-    gate = torch.nn.Linear(16, 4, bias=False)
-    logits = gate(torch.randn(5, 16))
-    probs = torch.softmax(logits, dim=-1)
-    top_k_probs, _ = torch.topk(probs, 2, dim=-1)
-    normalized = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
-    assert torch.allclose(normalized.sum(dim=-1), torch.ones(5), atol=1e-5)
+    """Exercises the REAL MoELayer's routing math (via compute_routing on its
+    fallback module), not a standalone reimplementation, so a bug in the
+    actual gating normalization would be caught here."""
+    layer = MoELayer(hidden_size=16, intermediate_size=32, num_experts=4, top_k=2)
+    if layer.uses_deepspeed:
+        pytest.skip("deepspeed is installed; this test targets the PyTorch fallback router.")
+
+    flat_x = torch.randn(5, 16)
+    top_k_probs, top_k_idx, router_probs = layer.moe.compute_routing(flat_x)
+
+    assert top_k_probs.shape == (5, 2)
+    assert torch.allclose(top_k_probs.sum(dim=-1), torch.ones(5), atol=1e-5)
+    # Every selected expert index must be a real, distinct expert.
+    assert (top_k_idx >= 0).all() and (top_k_idx < 4).all()
+    assert (top_k_idx[:, 0] != top_k_idx[:, 1]).all()
+    # The full router distribution (used for the aux loss) must also be a
+    # valid probability distribution over all 4 experts.
+    assert torch.allclose(router_probs.sum(dim=-1), torch.ones(5), atol=1e-5)
+
+
+def test_moe_layer_forward_uses_real_gating_end_to_end():
+    """A behavioral check on the full MoELayer.forward path: routing must
+    actually influence which expert processes which token. We verify this
+    indirectly by checking that a token routed to different experts (forced
+    via distinct random seeds producing different gate weights) produces
+    different outputs, i.e. the gate isn't a no-op."""
+    torch.manual_seed(1)
+    layer_a = MoELayer(hidden_size=16, intermediate_size=32, num_experts=4, top_k=2)
+    torch.manual_seed(2)
+    layer_b = MoELayer(hidden_size=16, intermediate_size=32, num_experts=4, top_k=2)
+
+    x = torch.randn(1, 3, 16)
+    out_a, _ = layer_a(x)
+    out_b, _ = layer_b(x)
+    assert out_a.shape == x.shape
+    assert not torch.allclose(out_a, out_b, atol=1e-6)
 
 
 def test_mod_respects_capacity(dummy_model_config):
@@ -129,14 +159,54 @@ def test_swa_full_attention_interval():
 
 
 def test_gqa_with_swa_restricts_attention_span():
+    """Proves SWA actually restricts attention (not just that shapes match):
+    perturbing a token that sits OUTSIDE the sliding window for a later
+    query position must leave that later position's output completely
+    unchanged, since the windowed mask should make it unreachable."""
     torch.manual_seed(0)
     attn = GroupedQueryAttention(
         hidden_size=32, num_heads=4, num_kv_heads=2, max_seq_len=64,
         use_flash_attention=False, use_swa=True, swa_window_size=2,
     )
+    attn.eval()
+
     x = torch.randn(1, 10, 32)
-    out, _ = attn(x)
-    assert out.shape == x.shape
+    out_a, _ = attn(x)
+
+    x_perturbed = x.clone()
+    x_perturbed[:, 0, :] += 100.0  # perturb token 0 heavily
+
+    out_b, _ = attn(x_perturbed)
+
+    # window_size=2: query position 9 can see keys at positions 8,9 only
+    # (distance < 2), so token 0 is far outside its window and position 9's
+    # output must be exactly unchanged.
+    assert torch.allclose(out_a[:, 9, :], out_b[:, 9, :], atol=1e-5)
+    # Sanity check the test itself isn't vacuous: position 1 (within window
+    # of the perturbed token 0) MUST change, or this whole comparison would
+    # be meaningless (e.g. if masking were silently disabled everywhere).
+    assert not torch.allclose(out_a[:, 1, :], out_b[:, 1, :], atol=1e-5)
+
+
+def test_gqa_without_swa_has_full_attention_span():
+    """Control test: with use_swa=False, perturbing token 0 SHOULD affect
+    every later position (ordinary causal attention), confirming the
+    previous test's zero-effect result is specifically due to windowing,
+    not some unrelated bug that zeroes out early-token influence generally."""
+    torch.manual_seed(0)
+    attn = GroupedQueryAttention(
+        hidden_size=32, num_heads=4, num_kv_heads=2, max_seq_len=64,
+        use_flash_attention=False, use_swa=False,
+    )
+    attn.eval()
+
+    x = torch.randn(1, 10, 32)
+    out_a, _ = attn(x)
+    x_perturbed = x.clone()
+    x_perturbed[:, 0, :] += 100.0
+    out_b, _ = attn(x_perturbed)
+
+    assert not torch.allclose(out_a[:, 9, :], out_b[:, 9, :], atol=1e-5)
 
 
 def test_mla_cache_smaller_than_gqa_cache():

@@ -21,6 +21,7 @@ and differ only in which architecture the CLI enables.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from typing import List, Optional
 
@@ -115,6 +116,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-lr-ratio", type=float, default=None)
     parser.add_argument("--warmup-steps", type=int, default=None)
     parser.add_argument("--grad-clip-norm", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--grad-accum-steps", type=int, default=None)
     parser.add_argument("--eval-every", type=int, default=None)
     parser.add_argument("--save-every", type=int, default=None)
@@ -227,6 +229,7 @@ def apply_cli_overrides(config: ATSConfig, args: argparse.Namespace) -> ATSConfi
         "min_lr_ratio": args.min_lr_ratio,
         "warmup_steps": args.warmup_steps,
         "grad_clip_norm": args.grad_clip_norm,
+        "weight_decay": args.weight_decay,
         "grad_accum_steps": args.grad_accum_steps,
         "micro_batch_size": args.micro_batch_size,
         "eval_every": args.eval_every,
@@ -310,9 +313,26 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     model = ATSTransformer(config.model)
 
+    # DeepSpeed/torchrun launchers set RANK (global) and LOCAL_RANK (per-node)
+    # environment variables. We shard the data stream by global rank across
+    # the full world (gpus * nodes) so every process sees a disjoint slice
+    # instead of every GPU redundantly processing the same examples.
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+    world_size = config.parallelism.gpus * config.parallelism.nodes
+    try:
+        if rank >= world_size:
+            raise ConfigError(
+                f"Environment RANK/LOCAL_RANK ({rank}) is >= parallelism.gpus * "
+                f"parallelism.nodes ({world_size}). Fix: make sure "
+                f"parallelism.gpus/nodes in the config matches how the job was launched."
+            )
+    except ConfigError as exc:
+        logger.error("Rank/world_size mismatch: %s", exc)
+        return 1
+
     train_dataloader = build_dataloader(
         config.data, batch_size=config.training.micro_batch_size,
-        rank=0, world_size=config.parallelism.gpus * config.parallelism.nodes,
+        rank=rank, world_size=world_size,
         seed=config.training.seed,
     )
 

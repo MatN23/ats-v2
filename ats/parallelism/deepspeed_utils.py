@@ -4,7 +4,7 @@ DeepSpeed engine. This is the only place ats calls deepspeed.initialize().
 
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch.nn as nn
 
@@ -21,6 +21,39 @@ _ZERO_STAGE_BY_STRATEGY = {
     "deepspeed_zero3": 3,
     "deepspeed_moe": 2,
 }
+
+
+def get_param_groups(model: nn.Module, lr: float, weight_decay: float) -> List[Dict[str, Any]]:
+    """Splits parameters into a weight-decayed group (matrix-shaped weights:
+    attention/FFN/MoE projections, embeddings) and a non-decayed group
+    (biases and normalization scale parameters). Weight decay on 1D
+    parameters like RMSNorm weights or biases empirically hurts and is
+    universally excluded in standard LLM training recipes (GPT-2/3, Llama,
+    etc.) — decaying a norm's scale or a bias pulls it toward zero for no
+    representational benefit."""
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # 1D parameters (biases, RMSNorm/LayerNorm weights, and any
+        # explicitly-named "embedding"/"norm" parameter) are excluded from
+        # weight decay; everything else (2D+ projection matrices) is decayed.
+        if param.dim() <= 1 or "norm" in name or "bias" in name:
+            no_decay.append(param)
+        else:
+            decay.append(param)
+
+    groups = []
+    if decay:
+        groups.append({"params": decay, "lr": lr, "weight_decay": weight_decay})
+    if no_decay:
+        groups.append({"params": no_decay, "lr": lr, "weight_decay": 0.0})
+    if not groups:
+        raise ConfigError(
+            "get_param_groups found no trainable parameters on the model. "
+            "Fix: check that the model has parameters with requires_grad=True."
+        )
+    return groups
 
 
 def build_deepspeed_config(config: ATSConfig, micro_batch_size: int) -> Dict[str, Any]:
@@ -74,7 +107,10 @@ def build_deepspeed_config(config: ATSConfig, micro_batch_size: int) -> Dict[str
             "lr": config.training.learning_rate,
             "betas": [0.9, 0.95],
             "eps": 1e-8,
-            "weight_decay": 0.1,
+            # weight_decay is intentionally omitted here: it's set per
+            # parameter-group instead (see get_param_groups), so biases and
+            # norm weights get weight_decay=0.0 while projection matrices
+            # get the real value.
         },
     }
 
@@ -115,9 +151,12 @@ def initialize_engine(
     ds_config = build_deepspeed_config(config, micro_batch_size)
     logger.info("Initializing DeepSpeed engine with config: %s", ds_config)
 
+    param_groups = get_param_groups(
+        model, lr=config.training.learning_rate, weight_decay=config.training.weight_decay,
+    )
     model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
         model=model,
-        model_parameters=[p for p in model.parameters() if p.requires_grad],
+        model_parameters=param_groups,
         config=ds_config,
     )
     return model_engine, optimizer, _, lr_scheduler

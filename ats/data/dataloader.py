@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 import torch
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from ats.config.schema import ConfigError, DataConfig
 from ats.data.dataset import MixedDataset
@@ -15,8 +15,17 @@ from ats.data.tokenizer import Tokenizer
 
 class _TorchMixedDataset(IterableDataset):
     """Thin torch.utils.data.IterableDataset adapter around MixedDataset,
-    sharding by (rank, world_size) so each distributed worker sees a disjoint
-    stream via deterministic per-rank seeding."""
+    sharding by (rank, world_size) so each distributed process sees a
+    disjoint stream.
+
+    When used with DataLoader(num_workers > 0), PyTorch forks/copies this
+    dataset object into each worker process, so every worker would otherwise
+    iterate the exact same underlying MixedDataset stream (same seed, same
+    file read order) and yield duplicate data. __iter__ additionally
+    sub-shards by the DataLoader worker's (worker_id, num_workers) via
+    torch.utils.data.get_worker_info(), combined with the outer (rank,
+    world_size) sharding, so each (process, worker) pair gets a disjoint
+    slice of the same deterministic stream."""
 
     def __init__(
         self, mixed_dataset: MixedDataset, rank: int = 0, world_size: int = 1,
@@ -30,8 +39,19 @@ class _TorchMixedDataset(IterableDataset):
         self.world_size = world_size
 
     def __iter__(self):
+        worker_info = get_worker_info()
+        if worker_info is None:
+            worker_id, num_workers = 0, 1
+        else:
+            worker_id, num_workers = worker_info.id, worker_info.num_workers
+
+        # Combine outer (rank, world_size) sharding with inner (worker_id,
+        # num_workers) sharding into one effective shard index/count.
+        effective_id = self.rank * num_workers + worker_id
+        effective_total = self.world_size * num_workers
+
         for i, example in enumerate(self.mixed_dataset):
-            if i % self.world_size == self.rank:
+            if i % effective_total == effective_id:
                 yield example
 
 

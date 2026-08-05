@@ -19,8 +19,67 @@ from ats.training.checkpoint import CheckpointManager, TrainingHaltError
 from ats.training.monitor import Monitor
 from ats.training.scheduler import WarmupCosineScheduler
 from ats.utils.logging_utils import get_logger
+from ats.utils.memory import estimate_memory
 
 logger = get_logger("ats.training.trainer")
+
+
+def _preflight_memory_check(config: ATSConfig, micro_batch_size: int) -> None:
+    """Runs before any GPU memory is allocated for training. Logs a warning
+    table (not a hard failure -- the estimate is a heuristic) if the
+    estimated peak memory exceeds 80% of detected GPU memory."""
+    try:
+        report = estimate_memory(config, target_batch_size=micro_batch_size)
+    except ValueError as exc:
+        logger.warning("Skipping pre-flight memory estimate: %s", exc)
+        return
+
+    if report.available_gb <= 0:
+        logger.info(
+            "Pre-flight memory estimate: model=%.1fGB optimizer=%.1fGB "
+            "activations=%.1fGB total=%.1fGB (no GPU detected to compare against)",
+            report.model_gb, report.optimizer_gb, report.activation_gb, report.total_gb,
+        )
+        return
+
+    logger.info(
+        "Pre-flight memory estimate: model=%.1fGB optimizer=%.1fGB "
+        "activations=%.1fGB total=%.1fGB / %.1fGB available",
+        report.model_gb, report.optimizer_gb, report.activation_gb,
+        report.total_gb, report.available_gb,
+    )
+    if not report.fits_on_single_gpu:
+        logger.warning(
+            "Estimated memory (%.1fGB) exceeds 80%% of available GPU memory (%.1fGB). "
+            "Suggested fix: --micro-batch-size %d --grad-accum-steps %d, or "
+            "--parallelism-strategy deepspeed_zero%d, or --gradient-checkpointing.",
+            report.total_gb, report.available_gb,
+            report.suggested_batch_size, report.suggested_grad_accum, report.suggested_zero_stage,
+        )
+
+
+def _log_oom_and_reraise(
+    config: ATSConfig, micro_batch_size: int, grad_accum_steps: int, step: int, exc: Exception,
+) -> None:
+    """Logs an actionable OOM message (estimated memory breakdown + concrete
+    suggested flags) and re-raises the original exception immediately --
+    this is NOT a bare except that swallows the error."""
+    try:
+        report = estimate_memory(config, target_batch_size=micro_batch_size)
+        model_gb, opt_gb, act_gb = report.model_gb, report.optimizer_gb, report.activation_gb
+    except ValueError:
+        model_gb = opt_gb = act_gb = float("nan")
+
+    logger.error(
+        "CUDA OOM at step %d.\n"
+        "Model: ~%.1f GB | Optimizer: ~%.1f GB | Activations: ~%.1f GB\n"
+        "Try: --micro-batch-size %d --grad-accum-steps %d\n"
+        "Or:  --gradient-checkpointing\n"
+        "Or:  --parallelism-strategy deepspeed_zero3",
+        step, model_gb, opt_gb, act_gb,
+        max(1, micro_batch_size // 2), grad_accum_steps * 2,
+    )
+    raise exc
 
 
 class Trainer:
@@ -35,6 +94,9 @@ class Trainer:
         self.config = config
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
+        self.micro_batch_size = micro_batch_size
+
+        _preflight_memory_check(config, micro_batch_size)
 
         self.model_engine, self.optimizer, _, _ = initialize_engine(
             model, config, micro_batch_size
@@ -122,7 +184,13 @@ class Trainer:
                 train_iter = iter(self.train_dataloader)
                 batch = next(train_iter)
 
-            metrics = self.train_step(batch)
+            try:
+                metrics = self.train_step(batch)
+            except torch.cuda.OutOfMemoryError as exc:
+                _log_oom_and_reraise(
+                    self.config, self.micro_batch_size, self.config.training.grad_accum_steps,
+                    self.global_step, exc,
+                )
             tokens_per_step = int(batch["input_ids"].numel())
             self.monitor.log(
                 self.global_step,
@@ -199,6 +267,9 @@ class DiffusionTrainer:
         self.config = config
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
+        self.micro_batch_size = micro_batch_size
+
+        _preflight_memory_check(config, micro_batch_size)
 
         # Keep a direct reference to the embedding table before wrapping in
         # DeepSpeed, so train_step can pass it into DiffusionLM.forward
@@ -290,7 +361,13 @@ class DiffusionTrainer:
                 train_iter = iter(self.train_dataloader)
                 batch = next(train_iter)
 
-            metrics = self.train_step(batch)
+            try:
+                metrics = self.train_step(batch)
+            except torch.cuda.OutOfMemoryError as exc:
+                _log_oom_and_reraise(
+                    self.config, self.micro_batch_size, self.config.training.grad_accum_steps,
+                    self.global_step, exc,
+                )
             tokens_per_step = int(batch["input_ids"].numel())
             self.monitor.log(
                 self.global_step,

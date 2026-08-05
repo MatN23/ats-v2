@@ -13,6 +13,10 @@ model:
   use_mod: false
   use_swa: false
   use_mla: false
+  use_mamba: false
+  use_mtp: false
+  model_type: autoregressive
+  quantization: none
   dropout: 0.0
   use_flash_attention: false
   gradient_checkpointing: false

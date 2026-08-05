@@ -1,9 +1,16 @@
-"""Weighted-mixture dataset over multiple sources (local jsonl/text shards,
-HuggingFace datasets in streaming mode, or WebDataset tar shards).
+"""Weighted-mixture dataset over multiple sources.
 
-No data loss at shard boundaries: the final partial chunk of a shard is
-padded with the tokenizer's pad token and a labels mask of -100 rather than
-being dropped.
+Two source kinds are supported:
+  - Raw text (.jsonl): tokenized on the fly, exactly as before.
+  - Preprocessed (.bin + a sibling meta.json, written by preprocess.py):
+    pre-tokenized fixed-length blocks read via numpy memmap, with no
+    on-the-fly tokenization. This is what preprocess.py's --packing output
+    is meant to be read by.
+
+No data loss at raw-text shard boundaries: the final partial chunk of a
+shard is padded with the tokenizer's pad token and a labels mask of -100
+rather than being dropped. Preprocessed sources apply the same rule at
+preprocessing time (see preprocess.py), storing per-block valid lengths.
 """
 
 from __future__ import annotations
@@ -11,12 +18,18 @@ from __future__ import annotations
 import json
 import random
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Literal, Optional, Tuple
+
+import numpy as np
 
 from ats.config.schema import ConfigError, DataSource
 from ats.data.tokenizer import Tokenizer
 
 IGNORE_INDEX = -100
+PREPROCESSED_META_FILENAME = "meta.json"
+PREPROCESSED_TOKEN_DTYPE = np.int32
+
+SourceKind = Literal["text", "preprocessed"]
 
 
 def _iter_local_jsonl(path: Path) -> Iterator[str]:
@@ -41,27 +54,81 @@ def _iter_local_jsonl(path: Path) -> Iterator[str]:
             yield record["text"]
 
 
-def _resolve_source(source: DataSource) -> Iterator[str]:
+def _load_preprocessed_meta(bin_path: Path) -> Dict[str, Any]:
+    meta_path = bin_path.parent / PREPROCESSED_META_FILENAME
+    if not meta_path.exists():
+        raise ConfigError(
+            f"Preprocessed source {bin_path} has no sibling {PREPROCESSED_META_FILENAME} "
+            f"in {bin_path.parent}. Fix: point data.sources[*].path at a directory produced "
+            f"by preprocess.py (containing tokens.bin, valid_lengths.npy, and meta.json)."
+        )
+    with open(meta_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _iter_preprocessed_examples(bin_path: Path, expected_seq_length: int) -> Iterator[Dict[str, Any]]:
+    meta = _load_preprocessed_meta(bin_path)
+    if meta["seq_length"] != expected_seq_length:
+        raise ConfigError(
+            f"Preprocessed source {bin_path} was built with seq_length="
+            f"{meta['seq_length']}, but data.seq_length={expected_seq_length}. "
+            f"Fix: re-run preprocess.py with --seq-length {expected_seq_length}, or "
+            f"update data.seq_length to match the preprocessed files."
+        )
+    num_blocks = meta["num_blocks"]
+    seq_length = meta["seq_length"]
+
+    tokens = np.memmap(bin_path, dtype=PREPROCESSED_TOKEN_DTYPE, mode="r", shape=(num_blocks, seq_length))
+    valid_lengths_path = bin_path.parent / "valid_lengths.npy"
+    if not valid_lengths_path.exists():
+        raise ConfigError(f"Preprocessed source {bin_path} is missing valid_lengths.npy.")
+    valid_lengths = np.load(valid_lengths_path)
+    if len(valid_lengths) != num_blocks:
+        raise ConfigError(
+            f"valid_lengths.npy for {bin_path} has {len(valid_lengths)} entries, "
+            f"expected {num_blocks} (one per block)."
+        )
+
+    for block_idx in range(num_blocks):
+        block = tokens[block_idx].tolist()
+        valid_len = int(valid_lengths[block_idx])
+        labels = list(block)
+        for i in range(valid_len, seq_length):
+            labels[i] = IGNORE_INDEX
+        yield {"input_ids": block, "labels": labels}
+
+
+def _resolve_source(source: DataSource) -> Tuple[SourceKind, Iterator[Any]]:
     path = Path(source.path)
+    if path.suffix == ".bin":
+        if not path.exists():
+            raise ConfigError(
+                f"data source path does not exist: {path}. "
+                f"Fix: check data.sources[*].path in your config, or run preprocess.py first."
+            )
+        return "preprocessed", path  # actual iterator built later once seq_length is known
     if path.suffix in (".jsonl", ".json"):
         if not path.exists():
             raise ConfigError(
                 f"data source path does not exist: {path}. "
                 f"Fix: check data.sources[*].path in your config."
             )
-        return _iter_local_jsonl(path)
+        return "text", _iter_local_jsonl(path)
     raise ConfigError(
         f"Unsupported data source path '{source.path}'. "
-        f"ats-v2 currently reads local .jsonl files directly; for HuggingFace "
-        f"datasets streaming or WebDataset tar shards, point data.sources[*].path "
-        f"at a loader script that yields records with a 'text' field."
+        f"ats-v2 currently reads local .jsonl files (raw text, tokenized on the fly) "
+        f"or .bin files produced by preprocess.py (pre-tokenized blocks). "
+        f"HuggingFace datasets streaming and WebDataset tar-shard support are not "
+        f"implemented yet. Fix: point data.sources[*].path at a local .jsonl or .bin file."
     )
 
 
 class MixedDataset:
     """Iterable dataset that samples proportionally to `source.weight` across
-    `sources`, tokenizes, and yields fixed-length `seq_length` chunks with no
-    data loss at source-file boundaries."""
+    `sources`. Raw-text (.jsonl) sources are tokenized and packed into
+    fixed-length `seq_length` chunks on the fly, with no data loss at
+    source-file boundaries. Preprocessed (.bin) sources are read directly as
+    already-fixed-length blocks via numpy memmap."""
 
     def __init__(
         self, sources: List[DataSource], tokenizer: Tokenizer, seq_length: int, seed: int = 42,
@@ -79,12 +146,29 @@ class MixedDataset:
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         rng = random.Random(self.seed)
-        source_iters = [iter(_resolve_source(s)) for s in self.sources]
+        kinds: List[SourceKind] = []
+        source_iters: List[Iterator[Any]] = []
+        for s in self.sources:
+            kind, payload = _resolve_source(s)
+            kinds.append(kind)
+            if kind == "preprocessed":
+                source_iters.append(_iter_preprocessed_examples(payload, self.seq_length))
+            else:
+                source_iters.append(payload)
+
         buffer: List[int] = []
         active = list(range(len(self.sources)))
 
         while active:
             idx = rng.choices(active, weights=[self._probs[i] for i in active], k=1)[0]
+
+            if kinds[idx] == "preprocessed":
+                try:
+                    yield next(source_iters[idx])
+                except StopIteration:
+                    active.remove(idx)
+                continue
+
             try:
                 text = next(source_iters[idx])
             except StopIteration:

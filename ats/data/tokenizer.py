@@ -32,9 +32,9 @@ class Tokenizer:
                     f"Unknown tiktoken encoding '{encoding_name}'. "
                     f"Fix: use a valid tiktoken encoding name, e.g. 'cl100k_base'."
                 ) from exc
-            self.vocab_size = self._enc.n_vocab
-            self.eos_token_id = self.vocab_size  # reserved id just past the real vocab
-            self.pad_token_id = self.vocab_size
+            self.vocab_size = self._enc.n_vocab + 1  # +1 reserved slot for pad/eos
+            self.eos_token_id = self._enc.n_vocab  # last valid index: vocab_size - 1
+            self.pad_token_id = self._enc.n_vocab
 
         elif tokenizer_name.startswith("hf:"):
             self._backend = "hf"

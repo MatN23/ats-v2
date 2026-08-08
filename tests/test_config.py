@@ -212,3 +212,23 @@ def test_cli_without_micro_batch_size_flag_preserves_yaml_value():
 def test_cli_micro_batch_size_flag_overrides_yaml():
     config = _cli_config(["--micro-batch-size", "16"])
     assert config.training.micro_batch_size == 16
+
+
+def test_load_config_350m_yaml_resolves_via_preset():
+    """Regression test: configs/350m.yaml previously referenced a model.size
+    preset ('350m') that did not exist in MODEL_SIZE_PRESETS, so loading it
+    raised ConfigError immediately. Now covered directly."""
+    config = load_config("configs/350m.yaml")
+    assert config.model.hidden_size == 1024
+    assert config.model.num_layers == 24
+
+
+def test_all_size_configs_load_without_error():
+    """Every configs/*.yaml file must actually be loadable -- this would
+    have caught the missing-350m-preset bug immediately for ALL size
+    configs, not just the ones with an explicit test."""
+    import pathlib
+
+    for path in sorted(pathlib.Path("configs").glob("*.yaml")):
+        config = load_config(str(path))
+        assert config.model.is_resolved(), f"{path}: model config did not resolve"

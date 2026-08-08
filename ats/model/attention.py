@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ats.model.quantization import make_linear
 from ats.model.rope import RotaryEmbedding, apply_rotary_pos_emb
 from ats.model.swa import generate_swa_mask
 
@@ -39,6 +40,7 @@ class GroupedQueryAttention(nn.Module):
         use_flash_attention: bool = True,
         use_swa: bool = False,
         swa_window_size: int = 4096,
+        quantization: str = "none",
     ) -> None:
         super().__init__()
         if hidden_size % num_heads != 0:
@@ -70,10 +72,10 @@ class GroupedQueryAttention(nn.Module):
                 "installed; falling back to torch.nn.functional.scaled_dot_product_attention."
             )
 
-        self.q_proj = nn.Linear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(num_heads * self.head_dim, hidden_size, bias=False)
+        self.q_proj = make_linear(hidden_size, num_heads * self.head_dim, quantization, bias=False)
+        self.k_proj = make_linear(hidden_size, num_kv_heads * self.head_dim, quantization, bias=False)
+        self.v_proj = make_linear(hidden_size, num_kv_heads * self.head_dim, quantization, bias=False)
+        self.o_proj = make_linear(num_heads * self.head_dim, hidden_size, quantization, bias=False)
         self.rotary_emb = RotaryEmbedding(self.head_dim, max_seq_len, rope_theta)
 
     @staticmethod

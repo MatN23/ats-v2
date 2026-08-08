@@ -214,10 +214,120 @@ backbone — wiring that through every module (attention, FFN, MoE experts) is
 a larger change than this revision includes; today it's available for
 callers to use directly.
 
+## Scale limitations: what this framework does and doesn't do for memory
+
+**ats-v2 targets dense/MoE models up to roughly 14B parameters on ZeRO-3
+alone.** Several features that sound like they should reduce *training*
+memory actually don't, and it's worth being explicit about which is which
+rather than letting the feature names imply more than they deliver:
+
+| Technique | In ats-v2? | Training memory impact | Why |
+|---|---|---|---|
+| ZeRO-3 | Yes | High | Shards params + optimizer + gradients across GPUs |
+| Gradient checkpointing | Yes | High (~2-4x) | Real, but see the caveat below |
+| Flash Attention | Yes (falls back to SDPA) | Medium | Saves activation memory vs. standard attention |
+| Sequence packing | Yes | Low-Medium | Only for preprocessed `.bin` data |
+| **Mixture-of-Depths (MoD)** | Yes | **None** | The gate is applied *after* the block computes on every token — see below |
+| **Sliding Window Attention (SWA)** | Yes | **None** | Full Q/K/V are still materialized for the whole sequence during training; SWA only shrinks the *inference* KV cache |
+| **Int8 quantization** | Yes | **None** | `torch.ao`'s fake-quantization keeps weights in bf16/fp16 throughout; it simulates QAT numerics, it doesn't reduce memory |
+| **FP8 quantization** | Yes | High, if used | `QuantizedLinear` is wired into attention/FFN/MoE-expert/MLA projections (see `model.quantization` in configs) but requires `transformer-engine` or `torchao` installed |
+| Mamba (chunked scan) | Yes | N/A (speed, not memory) | O(seq_len/chunk_size) sequential steps, not O(seq_len) — see below |
+| Tensor Parallelism | **No** | Critical for 70B | Not implemented — see below |
+| Pipeline Parallelism | **No** | Critical for 70B | Not implemented — see below |
+| 8-bit optimizers (bitsandbytes) | **No** | High | Not implemented |
+| ZeRO-Offload (CPU offload) | **No** | High | Not implemented |
+
+**MoD in detail:** `ats/model/mod.py`'s gate decides which tokens' outputs
+get *used*, but `self.block(x, ...)` still runs on the full sequence first —
+the mask is applied to the result, not used to skip computation. This makes
+MoD here a regularizer (via its load-balancing aux loss) and, if you build
+inference-time gather/scatter around it yourself, a decode-time speedup —
+but it is not a training-time compute or memory optimization as currently
+implemented. Doing that properly means gathering only the selected tokens
+*before* running the block and scattering the result back, which interacts
+non-trivially with gradient checkpointing and DeepSpeed's ZeRO sharding;
+that rewrite isn't attempted here rather than risk an under-tested version
+of it.
+
+**Gradient checkpointing formula:** `ats/utils/memory.py`'s pre-flight
+estimator uses a constant ~3x reduction factor for activation memory when
+`gradient_checkpointing` is enabled, based on commonly-reported practical
+figures for full (every-layer) checkpointing — not a precise theoretical
+bound (the theoretical O(sqrt(num_layers)) bound from Chen et al. 2016
+applies to a different, *selective* checkpointing strategy this boolean
+flag doesn't implement). Treat the estimator's numbers as a rough pre-flight
+warning, not an exact prediction.
+
+**No Tensor or Pipeline Parallelism:** the only parallelism strategies here
+are ZeRO-0 through ZeRO-3 (data-parallel-with-sharding) and DeepSpeed's MoE
+expert parallelism. For genuinely large (~70B+) dense models, ZeRO-3 alone
+means every forward pass all-gathers the full parameter set across every
+GPU in the job — at that scale the communication volume becomes the
+bottleneck, which is exactly why frameworks built for that regime (Megatron-
+LM, NeMo) combine tensor and pipeline parallelism with data parallelism.
+**This is a deliberate scope boundary, not an oversight:** ats-v2 is meant
+for the sub-~14B regime where ZeRO-3 is sufficient on its own. Models larger
+than that are intended to be handled by a separate wrapper (planned, not
+part of this repository) that would plug into ats-v2's config/checkpoint/
+data interfaces rather than ats-v2 reimplementing Megatron-style 3D
+parallelism itself. Unlike the Mamba scan or the memory-formula fix above —
+both correctness properties that could be verified through careful numerical
+reasoning without a GPU — tensor/pipeline parallelism's correctness
+fundamentally depends on real multi-GPU collective communication (NCCL
+all-reduce/all-gather/scatter across process groups, pipeline bubble
+scheduling). There's no way to establish confidence in that kind of
+implementation through arithmetic verification the way the fixes above were
+checked; attempting it without hardware to actually run it on would trade a
+disclosed gap for undisclosed, hard-to-detect correctness bugs in
+distributed training, which is a worse outcome. Given you've already said
+you're building this as a separate Megatron-based wrapper, that's also the
+right place for it.
+
+**Int8 "quantization-aware training" not saving training memory is by
+design, not an unfinished fix:** `QuantizedLinear`'s int8 path
+(`torch.ao.quantization.FakeQuantize`) exists specifically to simulate int8
+rounding numerics during training via a straight-through estimator, while
+keeping weights in bf16/fp16 so gradients can flow — that's what QAT means.
+Making int8 training actually reduce memory would mean a different
+technique entirely (storing and updating genuinely low-precision weights
+with specialized gradient handling, e.g. what dedicated 8-bit-optimizer
+libraries implement), not a bug fix to the QAT path that's already here. A
+separate, genuinely memory-reducing feature — post-training quantization for
+*inference* (storing real int8 weights in an exported checkpoint, no
+training involved) — is not implemented and would be a reasonable, lower-risk
+addition if useful; it's a different feature from what `model.quantization`
+currently does.
+
+**Mamba uses a chunked parallel scan, not a Python loop over every
+timestep:** `ats/model/mamba.py`'s selective scan solves the recurrence in
+chunks of `mamba_chunk_size` (default 32) positions via a batched matmul
+against a log-space lower-triangular decay matrix, dropping sequential
+Python-level steps from O(seq_len) to O(seq_len / chunk_size). This is
+mathematically exact (not an approximation) — verified numerically against
+a plain sequential-loop reference at both small scale (exact match to
+float64 precision) and realistic scale (seq_len=4096, extreme decay-rate
+range, ~1e-7 relative error in float32) before being written, and the
+shipped code has its own regression test comparing against a sequential
+reference built from the same intermediate tensors. `chunk_size` trades
+memory for speed: the per-chunk decay tensor is
+`[batch, chunk_size, chunk_size, d_inner, d_state]`, so larger chunks mean
+fewer sequential steps but quadratically more peak memory per chunk —
+reduce `mamba_chunk_size` if you hit OOM specifically on this tensor.
+Mamba layers still don't support KV-cache-based incremental decoding (see
+Known limitations below) — that's a separate, unrelated limitation from the
+scan algorithm.
+
+**`preprocess.py` streams directly to disk** (writes and discards each
+block as it's produced) rather than accumulating the tokenized corpus in
+memory — verified with a 20,000-document scale test showing flat peak
+memory regardless of corpus size. It still tokenizes with a single Python
+process, so very large corpora will be throughput-bound by that, but won't
+run out of RAM.
+
 ## Known limitations
 
 - **Mamba layers do not support KV-cache-based incremental decoding** in
-  this reference implementation — the sequential scan recomputes over the
+  this reference implementation — the chunked scan recomputes over the
   full sequence each call. Fine for training; not yet wired for
   autoregressive generation with caching.
 - **MoE/MoD/MLA/Mamba/diffusion models cannot be exported to HuggingFace
@@ -240,10 +350,6 @@ callers to use directly.
 - `ats/cli/finetune.py` and `ats/cli/align.py` are placeholder structure —
   they parse arguments and print a clear "not implemented" message, they do
   not train anything.
-- The `preprocess.py` implementation tokenizes the input file fully into
-  memory before writing, which won't scale to very large corpora; a
-  streaming two-pass (count blocks, then write) version would be needed for
-  that.
 - This repository was written and reviewed by eye in a sandboxed environment
   without network access, so most of it **has not been executed here** — no
   `pytest`, no real training run, no `pip install -e .` (the sandbox can't

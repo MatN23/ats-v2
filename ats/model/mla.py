@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ats.model.quantization import make_linear
 from ats.model.rope import RotaryEmbedding, apply_rotary_pos_emb
 
 logger = logging.getLogger("ats.model.mla")
@@ -41,6 +42,7 @@ class MLAAttention(nn.Module):
         rope_theta: float = 10000.0,
         dropout: float = 0.0,
         rope_head_dim: Optional[int] = None,
+        quantization: str = "none",
     ) -> None:
         super().__init__()
         if hidden_size % num_heads != 0:
@@ -64,19 +66,19 @@ class MLAAttention(nn.Module):
             self.rope_head_dim += 1
 
         # Down-projection: hidden_size -> latent_dim. This latent is what's cached.
-        self.w_dkv = nn.Linear(hidden_size, latent_dim, bias=False)
+        self.w_dkv = make_linear(hidden_size, latent_dim, quantization, bias=False)
         # Up-projections from the shared latent to per-head K and V content.
-        self.w_uk = nn.Linear(latent_dim, num_heads * self.head_dim, bias=False)
-        self.w_uv = nn.Linear(latent_dim, num_heads * self.head_dim, bias=False)
+        self.w_uk = make_linear(latent_dim, num_heads * self.head_dim, quantization, bias=False)
+        self.w_uv = make_linear(latent_dim, num_heads * self.head_dim, quantization, bias=False)
         # Query path: its own down/up compression.
-        self.w_dq = nn.Linear(hidden_size, latent_dim, bias=False)
-        self.w_uq = nn.Linear(latent_dim, num_heads * self.head_dim, bias=False)
+        self.w_dq = make_linear(hidden_size, latent_dim, quantization, bias=False)
+        self.w_uq = make_linear(latent_dim, num_heads * self.head_dim, quantization, bias=False)
         # Decoupled RoPE: a small position-aware slice appended to q/k content,
         # computed directly from x so no position info enters the cached latent.
-        self.w_qr = nn.Linear(hidden_size, num_heads * self.rope_head_dim, bias=False)
-        self.w_kr = nn.Linear(hidden_size, self.rope_head_dim, bias=False)  # shared across heads
+        self.w_qr = make_linear(hidden_size, num_heads * self.rope_head_dim, quantization, bias=False)
+        self.w_kr = make_linear(hidden_size, self.rope_head_dim, quantization, bias=False)  # shared across heads
 
-        self.o_proj = nn.Linear(num_heads * self.head_dim, hidden_size, bias=False)
+        self.o_proj = make_linear(num_heads * self.head_dim, hidden_size, quantization, bias=False)
         self.rotary_emb = RotaryEmbedding(self.rope_head_dim, max_seq_len, rope_theta)
 
     def forward(

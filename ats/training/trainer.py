@@ -165,6 +165,7 @@ class Trainer:
             loss=float(ce_loss.detach().item()),
             grad_norm=grad_norm,
             learning_rate=self.optimizer.param_groups[0]["lr"],
+            expert_utilization=output.expert_utilization,
         )
 
         action = self.adaptive_controller.step(metrics)

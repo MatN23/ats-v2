@@ -211,3 +211,45 @@ def test_checkpoint_save_writes_safetensors(tmp_path):
     loaded_weights = load_model_weights_safetensors(str(ckpt_dir))
     assert torch.allclose(loaded_weights["weight"], model.weight.detach())
     assert torch.allclose(loaded_weights["bias"], model.bias.detach())
+
+
+def test_checkpoint_save_only_rank_zero_writes_files(tmp_path, monkeypatch):
+    """Regression test for a checkpoint I/O race condition: under
+    distributed training (e.g. ZeRO-3, where every rank has the full
+    desharded model), only rank 0 should write model.safetensors,
+    config.yaml, and training_state.json -- otherwise every rank
+    redundantly writes the same (potentially huge) file simultaneously."""
+    monkeypatch.setenv("RANK", "1")  # simulate a non-zero rank
+
+    config = _make_config(tmp_path)
+    model = torch.nn.Linear(8, 8)
+    engine = _TinyModelEngine(model)
+    manager = CheckpointManager(config)
+
+    ckpt_dir = manager.save(engine, global_step=1, epoch=0)
+
+    # _TinyModelEngine.save_checkpoint (DeepSpeed's own path, left untouched)
+    # still writes model.pt/client_state.json/rng_state.pt regardless of
+    # rank in this test double -- but the ADDITIONAL rank-0-only artifacts
+    # ats.training.checkpoint itself is responsible for must NOT appear.
+    assert not (ckpt_dir / "model.safetensors").exists()
+    assert not (ckpt_dir / "config.yaml").exists()
+    assert not (ckpt_dir / "training_state.json").exists()
+
+
+def test_checkpoint_save_rank_zero_writes_files(tmp_path, monkeypatch):
+    """Control test: rank 0 (the default / common single-process case)
+    must still write all three files, proving the rank guard doesn't just
+    always skip writing."""
+    monkeypatch.setenv("RANK", "0")
+
+    config = _make_config(tmp_path)
+    model = torch.nn.Linear(8, 8)
+    engine = _TinyModelEngine(model)
+    manager = CheckpointManager(config)
+
+    ckpt_dir = manager.save(engine, global_step=1, epoch=0)
+
+    assert (ckpt_dir / "model.safetensors").exists()
+    assert (ckpt_dir / "config.yaml").exists()
+    assert (ckpt_dir / "training_state.json").exists()

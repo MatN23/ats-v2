@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -29,6 +29,7 @@ class TransformerOutput:
     aux_loss: torch.Tensor
     past_key_values: Optional[List[Optional[PastKeyValue]]] = None
     mtp_logits: Optional[List[torch.Tensor]] = None
+    expert_utilization: Optional[Dict[int, float]] = None
 
 
 class MambaLayer(nn.Module):
@@ -48,6 +49,7 @@ class MambaLayer(nn.Module):
             d_state=config.mamba_d_state,
             d_conv=config.mamba_d_conv,
             expand=config.mamba_expand,
+            chunk_size=config.mamba_chunk_size,
         )
 
     def forward(
@@ -93,6 +95,7 @@ class TransformerBlock(nn.Module):
                 max_seq_len=config.max_seq_len,
                 rope_theta=config.rope_theta,
                 dropout=config.dropout,
+                quantization=config.quantization,
             )
         else:
             self.attention = GroupedQueryAttention(
@@ -105,6 +108,7 @@ class TransformerBlock(nn.Module):
                 use_flash_attention=config.use_flash_attention,
                 use_swa=config.use_swa,
                 swa_window_size=config.swa_window_size,
+                quantization=config.quantization,
             )
         self.post_attention_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -116,10 +120,14 @@ class TransformerBlock(nn.Module):
                 top_k=config.moe_top_k,
                 capacity_factor=config.moe_capacity_factor,
                 load_balancing_weight=config.moe_load_balancing_weight,
+                quantization=config.quantization,
             )
             self.ffn_is_moe = True
         else:
-            self.ffn = SwiGLU(config.hidden_size, config.intermediate_size, config.dropout)
+            self.ffn = SwiGLU(
+                config.hidden_size, config.intermediate_size, config.dropout,
+                quantization=config.quantization,
+            )
             self.ffn_is_moe = False
 
         init_residual_projection(self.attention.o_proj, config.num_layers)
@@ -271,10 +279,39 @@ class ATSTransformer(nn.Module):
         logits = self.lm_head(x)
 
         mtp_logits = self.mtp_head(x) if self.uses_mtp else None
+        expert_utilization = self._collect_expert_utilization()
 
         return TransformerOutput(
             logits=logits,
             aux_loss=total_aux_loss,
             past_key_values=new_past_key_values if use_cache else None,
             mtp_logits=mtp_logits,
+            expert_utilization=expert_utilization,
         )
+
+    def _collect_expert_utilization(self) -> Optional[Dict[int, float]]:
+        """Averages per-expert utilization across every MoE-enabled layer in
+        the stack (unwrapping MixtureOfDepths where present), so
+        AdaptiveController's expert-collapse detection actually receives a
+        signal for MoE models instead of always getting None. Returns None
+        if the model has no MoE layers (the common case)."""
+        if not self.config.use_moe:
+            return None
+
+        per_layer_utilization = []
+        for layer in self.layers:
+            block = layer.block if isinstance(layer, MixtureOfDepths) else layer
+            if isinstance(block, TransformerBlock) and block.ffn_is_moe:
+                utilization = block.ffn.last_expert_utilization
+                if utilization is not None:
+                    per_layer_utilization.append(utilization)
+
+        if not per_layer_utilization:
+            return None
+
+        num_experts = len(per_layer_utilization[0])
+        averaged = {
+            expert_id: sum(u.get(expert_id, 0.0) for u in per_layer_utilization) / len(per_layer_utilization)
+            for expert_id in range(num_experts)
+        }
+        return averaged

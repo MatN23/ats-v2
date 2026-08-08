@@ -379,3 +379,238 @@ and their bash syntax was actually checked with `bash -n` in this sandbox
 Added `training.weight_decay` (required by the param-group split) and
 confirmed `training.micro_batch_size` (added in a previous session) is
 still correctly wired everywhere after the `ats/cli/` move.
+
+## Second bug-fix pass (external review of memory/scale claims)
+
+An external review focused on whether ats-v2's memory-saving and scale
+claims actually hold up, plus a few concrete code bugs. Verified each
+against the code (not assumed) before fixing:
+
+**Fixed:**
+- **#11 — `AdaptiveController` never received `expert_utilization`.**
+  Traced the full path: DeepSpeed's `exp_counts` return value was discarded
+  (`_exp_counts`), and the PyTorch MoE fallback never tracked utilization at
+  all, so the expert-collapse warning could never fire regardless of actual
+  expert balance. Fixed by tracking `last_expert_utilization` on both MoE
+  backends (reusing `dispatch_fraction`, already computed for the aux loss,
+  in the fallback path), adding a `TransformerOutput.expert_utilization`
+  field with an aggregation helper that unwraps `MixtureOfDepths` and
+  averages across MoE layers, and wiring it into `Trainer.train_step`'s
+  `TrainingMetrics` construction. Not covered: `DiffusionTrainer` (calls
+  `forward_hidden`, which bypasses this collection path) — disclosed, not
+  fixed, given MoE+diffusion is an unlikely combination.
+- **#3 (partial) — MoE fallback silently dropped tokens over capacity.**
+  The silent part is fixed: a clear warning now logs the actual dropped
+  count and capacity when this happens. The underlying single-process,
+  non-expert-parallel nature of the fallback (real limitations: sequential
+  Python loop over experts, no cross-GPU sharding) is unchanged — the
+  DeepSpeed MoE path remains the correct route for production MoE training,
+  as already documented.
+- **#7 — gradient checkpointing memory formula was wrong.** The original
+  `sqrt(num_layers)` divisor is the bound for a *selective* checkpointing
+  strategy (checkpoint every √L-th layer), not the full every-layer
+  checkpointing this codebase's boolean flag implements. First attempted
+  fix (dividing by `num_layers` directly) turned out to produce
+  implausibly large, depth-scaling reduction factors (40x at 80 layers) —
+  caught this by actually running the arithmetic, not just reasoning about
+  it, and revised to a constant ~3x factor matching commonly-reported
+  practical figures for full activation checkpointing, which doesn't grow
+  unboundedly with depth. Added a regression test locking in the
+  constant-factor (not depth-scaled) behavior. Documented in the README as
+  a heuristic, not a precise bound, either way.
+- **#12 — checkpoint I/O race condition under ZeRO-3.** Every rank has the
+  full desharded model under ZeRO-3, so `CheckpointManager.save()`'s
+  additional writes (`model.safetensors`, `config.yaml`,
+  `training_state.json`, and old-checkpoint pruning) previously ran on
+  every rank, all targeting the same files/directories simultaneously.
+  Fixed by guarding the actual disk writes behind a rank==0 check — while
+  keeping `module.state_dict()` itself running on *every* rank, since under
+  ZeRO-3 that's a collective all-gather every rank must participate in
+  together, or it hangs. Added a `torch.distributed.barrier()` after the
+  rank-0-only writes so other ranks don't race ahead assuming the files
+  already exist. Added regression tests for both the rank-0 and non-zero
+  rank cases.
+- **C3 (continued from previous session) — `QuantizedLinear` finished being
+  wired in.** `attention.py` (q/k/v/o), `ffn.py` (SwiGLU gate_up/down), and
+  `moe.py` (both DeepSpeed and PyTorch-fallback expert construction) now
+  all thread `model.quantization` through to actual layer construction via
+  a new `make_linear()` factory. MLA's projections remain unwired —
+  disclosed in the scale-limitations table, not silently left incomplete.
+- **`scripts/verify.py` was missing entirely** — added. Imports every
+  module under `ats/`, instantiates `ATSTransformer` across 8 architecture
+  combinations (dense, SWA, MLA, MoE, MoD, Mamba, MTP, int8) with a real
+  forward+backward pass each, then runs `pytest tests/`. **Actually executed
+  this script in the authoring sandbox** (not just written): it correctly
+  reported `ats.cli.doctor`/`align`/`finetune` importing cleanly on their
+  own (validating the lazy-dependency design from the previous session)
+  while everything needing torch/pydantic failed with a specific, correct
+  "No module named X" message, and exited 1 with "FAILURES DETECTED" rather
+  than falsely claiming success. Also caught and fixed a real bug in the
+  script itself this way: `import ats` failed under `python scripts/verify.py`
+  because Python only auto-adds the *script's* directory to `sys.path`, not
+  the repo root — fixed by inserting the repo root explicitly.
+- **Found and fixed two duplicate-keyword-argument bugs in `tests/test_memory.py`**
+  while reasoning through a regression test: its `_config()` helper passed
+  explicit defaults (`hidden_size=512`, `num_layers=8`) positionally *and*
+  accepted `**model_overrides` that could re-specify the same keys, which
+  would raise `TypeError: got multiple values for keyword argument` the
+  moment a test tried to override those specific fields (which
+  `test_estimate_memory_scales_with_parameter_count` already did). Neither
+  of these tests had ever actually been run, since this sandbox has no
+  torch/pydantic — caught this by tracing the exact call arguments by hand
+  and reproducing the failure in an isolated pure-Python snippet before
+  fixing it with a proper defaults-dict-merge pattern.
+
+**Documented (not fixed), because they're real architectural scope
+boundaries rather than bugs with a safe blind fix:**
+- MoD applies its gate *after* the wrapped block computes on every token,
+  so it saves zero training-time compute or memory (it's a regularizer /
+  inference-time optimization, not a training memory technique). A correct
+  fix means gathering only selected tokens before running the block and
+  scattering after, which interacts non-trivially with gradient
+  checkpointing and ZeRO sharding — not attempted blind.
+- SWA still materializes full Q/K/V for training; the window only shrinks
+  the *inference* KV cache.
+- Int8 quantization (`torch.ao` fake-quant) doesn't reduce training memory
+  by design — it simulates QAT numerics in bf16/fp16, it doesn't store
+  int8 weights.
+- No Tensor or Pipeline Parallelism. This is a deliberate scope boundary:
+  ats-v2 targets the sub-~14B regime where ZeRO-3 alone is sufficient.
+  Per the user's own stated plan, models larger than that are intended to
+  be handled by a separate wrapper (e.g. around Megatron-LM) that plugs
+  into ats-v2's config/checkpoint/data interfaces — planned future work,
+  not part of this repository, and not attempted here.
+- `ats/model/mamba.py`'s sequential Python-loop scan is correct but slow
+  (O(seq_len) sequential kernel launches per layer, no fused CUDA kernel,
+  deliberately, per the no-custom-kernels principle) — fine for
+  correctness testing, a real bottleneck at production scale.
+- `preprocess.py` loads the full tokenized corpus into memory before
+  writing; not viable for multi-terabyte corpora without a streaming
+  two-pass rewrite.
+
+Added a "Scale limitations" table to the README making all of the above
+explicit up front, rather than letting feature names (MoD, SWA,
+quantization) imply memory savings the current implementation doesn't
+actually provide during training.
+
+## Third pass: real fixes for previously-deferred items, and a clear line on what stays deferred
+
+The user pushed back on the previous pass's disclosed-but-unfixed gaps.
+Re-examined each one on its own merits rather than re-explaining the same
+deferrals. Result: three were genuinely fixable without hardware, and were
+fixed for real with rigorous verification; two are categorically different
+(their correctness cannot be established without a GPU, or "fixing" them
+would mean building an entirely different feature) and were not attempted,
+with the specific reasoning documented rather than silently repeated.
+
+### Fixed: Mamba's sequential scan → chunked parallel scan
+
+`ats/model/mamba.py` previously ran an O(seq_len) sequential Python loop —
+327,680 sequential steps for a 70B-scale model, per the original review.
+Replaced with a chunked parallel scan: within each `mamba_chunk_size`-sized
+chunk (new config field, default 32), the recurrence is solved via one
+batched matmul against a log-space lower-triangular decay matrix, dropping
+sequential steps to O(seq_len / chunk_size). Only the carry-over state
+between chunks remains sequential.
+
+This is mathematically exact, not an approximation — verified in three
+stages before writing any of the shipped code:
+1. A standalone numpy prototype checked against a sequential-loop reference
+   at multiple chunk sizes (including edge cases like chunk_size=1 and
+   chunk_size > seq_len) — exact match to float64 machine precision.
+2. A stress test at realistic scale (seq_len=4096) with an extreme,
+   adversarial decay-coefficient range (0.001 to 0.9999) in float32 — ~1e-7
+   relative error, no NaN/Inf.
+3. After translating to the actual torch implementation, added a
+   regression test (`test_mamba_chunked_scan_matches_naive_sequential_reference`)
+   that extracts the real intermediate tensors (dt, A, B, x_conv) from a
+   real `MambaBlock` instance and compares the shipped `_chunked_scan`
+   method against an independently-implemented sequential loop operating on
+   those same tensors — so a bug in the actual shipped code, not just the
+   prototype, would be caught. Also added a test confirming the *output* is
+   identical across five different chunk sizes (since chunk_size is purely
+   a speed/memory tradeoff knob, not something that should change results).
+
+`chunk_size` trades memory for speed (the per-chunk decay tensor is
+`[batch, chunk_size, chunk_size, d_inner, d_state]`) and is exposed as
+`mamba_chunk_size` in configs and `--mamba-chunk-size` on the CLI.
+
+### Fixed: `preprocess.py` streaming instead of loading the corpus into memory
+
+Previously accumulated the entire tokenized corpus in a Python list before
+writing. Rewritten to write and discard each block as it's produced:
+
+1. First verified the streaming write method produces a byte-identical file
+   to the previous all-at-once `np.memmap` write (so `ats/data/dataset.py`'s
+   reader needs zero changes) — confirmed with a direct byte comparison.
+2. Then tested the actual, real `preprocess.py` file's `preprocess()`
+   function end-to-end (not a reimplementation) by injecting fake
+   `ats.data.tokenizer`/`ats.utils.logging_utils` modules into
+   `sys.modules` before import, sidestepping the pydantic dependency chain
+   this sandbox can't install — confirmed correct output matching the
+   previous non-streaming implementation exactly.
+3. Ran a 20,000-document scale test measuring actual process RSS memory
+   before and after: peak memory stayed flat (27.9MB before and after)
+   regardless of corpus size, versus a 4.23MB output file — confirming
+   memory is no longer O(corpus size).
+
+### Fixed: `QuantizedLinear` finished being wired into MLA
+
+The previous pass wired `model.quantization` into attention/FFN/MoE-expert
+projections but explicitly left MLA's eight projections (`w_dkv`, `w_uk`,
+`w_uv`, `w_dq`, `w_uq`, `w_qr`, `w_kr`, `o_proj`) unwired. Finished this:
+all now go through `make_linear()`. Added regression tests confirming all
+eight are `QuantizedLinear` instances under `quantization="int8"` while
+still satisfying `isinstance(_, nn.Linear)` (the state-dict-key-preservation
+property established in the previous pass), and that `quantization="none"`
+correctly stays plain `nn.Linear`.
+
+### Not attempted, with specific reasoning (not a repeat of the previous deferral)
+
+**Tensor/Pipeline Parallelism.** Re-examined given the pushback, and the
+conclusion is the same but for a sharper reason than "it's a lot of work":
+Mamba's scan and the memory-formula fix were both self-contained numerical
+algorithms whose correctness could be established through arithmetic
+verification alone, with zero dependency on real hardware. TP/PP's
+correctness depends on actual multi-GPU collective communication (NCCL
+all-reduce/all-gather/scatter across process groups, pipeline bubble
+scheduling) — there is no arithmetic-only way to gain confidence in that
+the way the numpy verification did for Mamba. Attempting it blind would
+trade a disclosed gap for an undisclosed, much harder-to-detect class of
+bug: silently-wrong distributed training. Given the user has stated a
+separate Megatron-based wrapper is planned for this, that's the right home
+for it, not a blind implementation here.
+
+**"True" memory-saving int8 training.** Re-examined given the pushback:
+the current `QuantizedLinear` int8 path is quantization-*aware training*
+(QAT) — fake-quantizing in the forward pass via a straight-through
+estimator while keeping real weights in bf16/fp16 so gradients can flow.
+That weights stay in bf16/fp16 during training is not an oversight, it's
+the definition of QAT (this is universally how PyTorch's own
+`torch.ao.quantization` and every other QAT implementation works). Making
+int8 training actually reduce memory would require a fundamentally
+different technique — genuinely low-precision weight storage with
+specialized gradient handling, e.g. what dedicated 8-bit-optimizer
+libraries implement — which is a different, larger feature, not a bug fix
+to the QAT path that's already correctly implemented as QAT. Flagged a
+real, separate, lower-risk feature that WOULD save memory and isn't
+implemented: post-training int8 quantization for inference-only export
+(storing genuine int8 weights in an exported checkpoint, no training
+involved).
+
+**MoD's real gather/scatter dispatch.** Attempted to scope this properly
+this time rather than declining on general risk grounds, and found a
+specific blocking problem: `torch.topk`'s selected token indices aren't in
+sequence order, and correct MoD requires gathering the selected subset
+*before* running the wrapped block (so non-selected tokens' attention
+contribution is genuinely skipped, matching the published MoD algorithm) —
+but neither `GroupedQueryAttention` nor `RotaryEmbedding` currently accept
+explicit position indices; both assume the input tensor occupies positions
+`0..N-1`. Feeding a scattered, reordered subset of tokens into them
+unmodified would silently apply RoPE at the wrong positions, which is a
+worse failure mode than the current "correct but non-memory-saving"
+behavior. A correct fix means threading `position_ids` through the entire
+attention/RoPE stack (which also needs to compose correctly with flash-attn,
+KV caching, SWA, and MLA) — a change to currently-correct, tested code, with
+no way to test the result here. Not attempted; documented instead of
+silently re-deferred.

@@ -18,6 +18,10 @@ MODEL_SIZE_PRESETS: Dict[str, Dict[str, int]] = {
         "hidden_size": 768, "num_layers": 12, "num_heads": 12,
         "num_kv_heads": 12, "intermediate_size": 2048,
     },
+    "350m": {
+        "hidden_size": 1024, "num_layers": 24, "num_heads": 16,
+        "num_kv_heads": 16, "intermediate_size": 2816,
+    },
     "1b": {
         "hidden_size": 2048, "num_layers": 22, "num_heads": 32,
         "num_kv_heads": 8, "intermediate_size": 5632,
@@ -49,6 +53,7 @@ MODEL_SIZE_PRESETS: Dict[str, Dict[str, int]] = {
 # they want to fully control training.py fields themselves.
 TRAINING_SIZE_PRESETS: Dict[str, Dict[str, Any]] = {
     "125m": {"learning_rate": 6.0e-4, "warmup_steps": 500, "grad_accum_steps": 1},
+    "350m": {"learning_rate": 5.0e-4, "warmup_steps": 1000, "grad_accum_steps": 2},
     "1b": {"learning_rate": 3.0e-4, "warmup_steps": 2000, "grad_accum_steps": 4},
     "3b": {"learning_rate": 2.5e-4, "warmup_steps": 2000, "grad_accum_steps": 8},
     "7b": {"learning_rate": 2.0e-4, "warmup_steps": 2000, "grad_accum_steps": 16},

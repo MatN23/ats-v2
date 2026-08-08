@@ -108,10 +108,23 @@ def estimate_memory(config: "ATSConfig", target_batch_size: Optional[int] = None
         * _ACTIVATION_BYTES_PER_TOKEN_PER_LAYER_PER_HIDDEN
     )
     if config.model.gradient_checkpointing:
-        # Checkpointing only retains layer-boundary activations, recomputing
-        # the rest during backward; approximate as an O(sqrt(num_layers))
-        # reduction, which is the standard checkpointing memory bound.
-        activation_bytes = activation_bytes / max(1.0, config.model.num_layers ** 0.5)
+        # This flag implements FULL (every-layer) activation checkpointing,
+        # not a selective "checkpoint every sqrt(L)-th layer" scheme, so the
+        # sqrt(num_layers) bound (Chen et al. 2016) does not apply here --
+        # that bound is for the selective strategy specifically.
+        #
+        # The precise full-checkpointing formula is actually
+        # num_layers * (per-layer checkpoint boundary tensor, small) +
+        # (one layer's full recomputation activations, large), which is
+        # dominated by different terms depending on num_layers and hidden
+        # size in ways that are hard to bound tightly as a simple heuristic.
+        # Rather than guess at a scaling law we can't validate without a
+        # GPU, we use the commonly-cited practical figure reported for full
+        # activation checkpointing in production LLM training (roughly a
+        # constant 2-4x memory reduction, not a reduction that keeps
+        # growing with depth) as a documented, conservative estimate.
+        _CHECKPOINTING_REDUCTION_FACTOR = 3.0
+        activation_bytes = activation_bytes / _CHECKPOINTING_REDUCTION_FACTOR
 
     model_gb = (model_bytes + gradient_bytes) / _BYTES_PER_GIB
     optimizer_gb = optimizer_bytes / _BYTES_PER_GIB

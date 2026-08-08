@@ -22,11 +22,19 @@ BASE_LINEAR_STD = 0.02
 def init_weights(module: nn.Module, num_layers: int) -> None:
     """Recursively initialize all parameters of `module`.
 
+    Skips any nn.Linear whose weight was already set by
+    init_residual_projection (marked via the _ats_residual_init attribute
+    below) -- without this check, ATSTransformer's later blanket
+    `self.apply(init_weights)` pass would silently overwrite the
+    depth-scaled residual-projection init (o_proj, down_proj) that
+    TransformerBlock.__init__ sets during construction, replacing it with
+    the generic un-scaled std. The marker makes this correct regardless of
+    which init call happens to run first or last.
+
     Call once, after the full model has been constructed, via
-    `model.apply(functools.partial(init_weights, num_layers=cfg.num_layers))`
-    is NOT how this is invoked (nn.Module.apply passes only the module); see
-    ats.model.transformer.ATSTransformer._init_weights for the actual
-    call site, which closes over num_layers.
+    `model.apply(lambda m: init_weights(m, num_layers=cfg.num_layers))`;
+    see ats.model.transformer.ATSTransformer.__init__ for the actual call
+    site, which closes over num_layers.
     """
     if isinstance(module, nn.Embedding):
         nn.init.normal_(module.weight, mean=0.0, std=EMBEDDING_STD)
@@ -34,6 +42,8 @@ def init_weights(module: nn.Module, num_layers: int) -> None:
             with torch.no_grad():
                 module.weight[module.padding_idx].fill_(0.0)
     elif isinstance(module, nn.Linear):
+        if getattr(module.weight, "_ats_residual_init", False):
+            return  # already correctly initialized by init_residual_projection
         nn.init.normal_(module.weight, mean=0.0, std=BASE_LINEAR_STD)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
@@ -55,3 +65,7 @@ def init_residual_projection(module: nn.Linear, num_layers: int) -> None:
     nn.init.normal_(module.weight, mean=0.0, std=residual_output_std(num_layers))
     if module.bias is not None:
         nn.init.zeros_(module.bias)
+    # Mark this weight tensor so a later blanket init_weights() pass (e.g.
+    # ATSTransformer's `self.apply(...)`) skips it instead of overwriting
+    # this depth-scaled init with the generic one.
+    module.weight._ats_residual_init = True

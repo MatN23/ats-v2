@@ -10,11 +10,11 @@ from ats.utils.memory import estimate_memory
 
 
 def _config(**model_overrides) -> ATSConfig:
-    model = ModelConfig(
+    defaults = dict(
         hidden_size=512, num_layers=8, num_heads=8, num_kv_heads=8,
         intermediate_size=2048, vocab_size=32000, max_seq_len=2048,
-        **model_overrides,
     )
+    model = ModelConfig(**{**defaults, **model_overrides})
     return ATSConfig(
         model=model,
         training=TrainingConfig(max_steps=100, learning_rate=1e-4, warmup_steps=10, micro_batch_size=4),
@@ -92,3 +92,22 @@ def test_estimate_memory_report_has_suggested_fields():
     assert isinstance(report.suggested_grad_accum, int)
     assert report.suggested_grad_accum >= 1
     assert 0 <= report.suggested_zero_stage <= 3
+
+
+def test_estimate_memory_checkpointing_reduction_is_constant_not_depth_scaled():
+    """Regression test for a formula bug: gradient checkpointing's memory
+    reduction factor must be roughly constant regardless of num_layers, not
+    scale with depth (an earlier version divided by sqrt(num_layers), and a
+    since-reverted fix divided by num_layers directly -- both produce
+    reduction factors that grow implausibly with depth; the correct
+    heuristic here is a small constant factor)."""
+    shallow = estimate_memory(_config(gradient_checkpointing=True))
+    shallow_no_ckpt = estimate_memory(_config(gradient_checkpointing=False))
+    deep = estimate_memory(_config(num_layers=64, gradient_checkpointing=True))
+    deep_no_ckpt = estimate_memory(_config(num_layers=64, gradient_checkpointing=False))
+
+    shallow_reduction = shallow_no_ckpt.activation_gb / shallow.activation_gb
+    deep_reduction = deep_no_ckpt.activation_gb / deep.activation_gb
+
+    assert shallow_reduction == pytest.approx(deep_reduction, rel=0.01)
+    assert 2.0 <= shallow_reduction <= 4.0

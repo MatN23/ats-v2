@@ -2,11 +2,21 @@
 is processed by the wrapped block or passed through unchanged. During
 training this uses a straight-through estimator so gradients flow through the
 hard decision; at inference the gate is thresholded directly (no STE needed
-since there is no backward pass)."""
+since there is no backward pass).
+
+The wrapped block (a TransformerBlock or MambaLayer, per
+ats.model.transformer) always returns a 3-tuple
+(hidden_states, aux_loss, past_key_value), matching the calling convention
+ATSTransformer._run_layers uses uniformly for every layer, MoD-wrapped or
+not. MixtureOfDepths.forward must therefore also always return exactly that
+3-tuple shape -- summing the wrapped block's own aux_loss (e.g. from an
+inner MoE FFN) into MoD's load-balancing aux_loss rather than dropping it,
+and passing the wrapped block's past_key_value through unchanged.
+"""
 
 from __future__ import annotations
 
-from typing import Callable, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -24,7 +34,9 @@ class MixtureOfDepths(nn.Module):
         self.capacity_factor = capacity_factor
         self.gate = nn.Linear(hidden_size, 1, bias=True)
 
-    def forward(self, x: torch.Tensor, **block_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, **block_kwargs
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[object]]:
         batch, seq_len, hidden_size = x.shape
         if hidden_size != self.hidden_size:
             raise ValueError(
@@ -50,21 +62,20 @@ class MixtureOfDepths(nn.Module):
             hard_mask = (gate_probs >= threshold).float()
             ste_mask = hard_mask
 
-        block_out = self.block(x, **block_kwargs)
-        if isinstance(block_out, tuple):
-            block_out, extra = block_out[0], block_out[1:]
-        else:
-            extra = ()
+        # The wrapped block is called exactly once. It always returns
+        # (hidden_states, aux_loss, past_key_value) -- the same 3-tuple
+        # convention every layer in ATSTransformer._run_layers uses.
+        block_hidden, block_aux_loss, new_past_key_value = self.block(x, **block_kwargs)
 
         mask = ste_mask.unsqueeze(-1)  # [batch, seq_len, 1]
-        output = mask * block_out + (1.0 - mask) * x
+        output = mask * block_hidden + (1.0 - mask) * x
 
         # Load-balancing aux loss: encourage the mean gate probability to sit
         # near the target capacity_factor, so routing doesn't collapse to
-        # always-on or always-off.
+        # always-on or always-off. Added to (not replacing) the wrapped
+        # block's own aux_loss, e.g. from an inner MoE FFN's routing loss.
         target = torch.full_like(gate_probs.mean(dim=1), self.capacity_factor)
-        aux_loss = torch.nn.functional.mse_loss(gate_probs.mean(dim=1), target)
+        mod_aux_loss = torch.nn.functional.mse_loss(gate_probs.mean(dim=1), target)
+        total_aux_loss = mod_aux_loss + block_aux_loss
 
-        if extra:
-            return (output, aux_loss) + extra
-        return output, aux_loss
+        return output, total_aux_loss, new_past_key_value

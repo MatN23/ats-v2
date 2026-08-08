@@ -2,11 +2,14 @@
 """Entry point: python preprocess.py --input data.jsonl --output-dir ./preprocessed \
     --tokenizer cl100k_base --seq-length 4096 [--packing]
 
-Tokenizes an entire .jsonl dataset offline and writes it as a memory-mapped
-.bin file of fixed-length int32 token blocks, a valid_lengths.npy array
-(how many of each block's tokens are real content vs. padding), and a
-meta.json describing the layout. ats/data/dataset.py's MixedDataset reads
-these directly via np.memmap, with no on-the-fly tokenization.
+Tokenizes a .jsonl dataset offline and streams it directly to disk as a
+memory-mapped-readable .bin file of fixed-length int32 token blocks, a
+valid_lengths.npy array (how many of each block's tokens are real content
+vs. padding), and a meta.json describing the layout. Peak memory is O(one
+block), not O(corpus size): each block's bytes are written to disk and
+discarded immediately, rather than accumulating the whole tokenized corpus
+in memory first. ats/data/dataset.py's MixedDataset reads the result
+directly via np.memmap, with no on-the-fly tokenization.
 
 Without --packing, each input document becomes its own block (truncated if
 too long, padded if too short) -- simple, but wastes space on padding for
@@ -103,7 +106,15 @@ def preprocess(
     input_path: str, output_dir: str, tokenizer_name: str, seq_length: int, packing: bool,
 ) -> int:
     """Runs the full offline preprocessing pipeline. Returns the number of
-    blocks written."""
+    blocks written.
+
+    Streams blocks directly to disk as they're produced, rather than
+    accumulating the whole tokenized corpus in a Python list first: peak
+    memory is O(one block), not O(corpus size). Verified this produces a
+    byte-identical file to writing via np.memmap in one shot (see
+    CHANGES.md for the verification), so ats/data/dataset.py's memmap
+    reader needs no changes.
+    """
     if seq_length <= 0:
         raise ValueError(f"--seq-length must be positive, got {seq_length}.")
 
@@ -115,32 +126,28 @@ def preprocess(
     block_generator = _tokenize_packed(documents, tokenizer, seq_length) if packing \
         else _tokenize_unpacked(documents, tokenizer, seq_length)
 
-    # We don't know num_blocks ahead of time, so tokenize into a temporary
-    # Python list first, then write the final memmap in one shot. This is
-    # simple and correct; for very large corpora a two-pass
-    # (count-then-write) approach would avoid holding everything in memory,
-    # which is a known scalability limit of this implementation.
-    blocks: List[List[int]] = []
+    bin_path = out_path / "tokens.bin"
     valid_lengths: List[int] = []
-    for block in block_generator:
-        valid_len = len(block)
-        if valid_len > seq_length:
-            raise ValueError(
-                f"Internal error: produced a block of length {valid_len} > "
-                f"seq_length {seq_length}."
-            )
-        padded = block + [tokenizer.pad_token_id] * (seq_length - valid_len)
-        blocks.append(padded)
-        valid_lengths.append(valid_len)
+    num_blocks = 0
 
-    if not blocks:
+    with open(bin_path, "wb") as bin_file:
+        for block in block_generator:
+            valid_len = len(block)
+            if valid_len > seq_length:
+                raise ValueError(
+                    f"Internal error: produced a block of length {valid_len} > "
+                    f"seq_length {seq_length}."
+                )
+            padded = block + [tokenizer.pad_token_id] * (seq_length - valid_len)
+            # Write this block's raw bytes immediately and discard it --
+            # only the current block is held in memory, not the whole corpus.
+            bin_file.write(np.asarray(padded, dtype=TOKEN_DTYPE).tobytes())
+            valid_lengths.append(valid_len)
+            num_blocks += 1
+
+    if num_blocks == 0:
+        bin_path.unlink()  # clean up the empty file rather than leaving a stray 0-byte artifact
         raise ValueError(f"No documents were tokenized from {input_path}; is the file empty?")
-
-    num_blocks = len(blocks)
-    tokens_array = np.array(blocks, dtype=TOKEN_DTYPE)
-    memmap = np.memmap(out_path / "tokens.bin", dtype=TOKEN_DTYPE, mode="w+", shape=(num_blocks, seq_length))
-    memmap[:] = tokens_array[:]
-    memmap.flush()
 
     np.save(out_path / "valid_lengths.npy", np.array(valid_lengths, dtype=np.int32))
 

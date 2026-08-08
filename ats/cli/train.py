@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Entry point: python train.py --config configs/7b.yaml [--use-swa] [--use-mla]
-    [--architecture all] [--resume DIR] [--max-train-steps N] ...
+    [--architecture all] [--resume DIR] [--max-steps N] ...
 
 Every CLI flag below actually overrides the loaded ATSConfig before the model
 is constructed; see apply_cli_overrides(). Precedence, highest to lowest:
@@ -61,8 +61,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "config if given; otherwise the resolved config value (YAML, or its "
              "Pydantic default of 1) is used.",
     )
-    parser.add_argument("--max-train-steps", type=int, default=None,
-                         help="Override training.max_steps for this run only (e.g. smoke tests).")
 
     # --- Architecture toggles ---
     _bool_flag(parser, "use-swa", "Enable Sliding Window Attention.")
@@ -89,6 +87,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mamba-d-conv", type=int, default=None)
     parser.add_argument("--mamba-expand", type=int, default=None)
     parser.add_argument("--mamba-every-n-layers", type=int, default=None)
+    parser.add_argument("--mamba-chunk-size", type=int, default=None)
     parser.add_argument("--moe-num-experts", type=int, default=None)
     parser.add_argument("--moe-top-k", type=int, default=None)
     parser.add_argument("--moe-capacity-factor", type=float, default=None)
@@ -197,6 +196,7 @@ def apply_cli_overrides(config: ATSConfig, args: argparse.Namespace) -> ATSConfi
         "mamba_d_conv": args.mamba_d_conv,
         "mamba_expand": args.mamba_expand,
         "mamba_every_n_layers": args.mamba_every_n_layers,
+        "mamba_chunk_size": args.mamba_chunk_size,
         "num_experts": args.moe_num_experts,
         "moe_top_k": args.moe_top_k,
         "moe_capacity_factor": args.moe_capacity_factor,
@@ -359,7 +359,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 1
 
     try:
-        trainer.train(max_steps=args.max_train_steps)
+        trainer.train()
     except TrainingHaltError as exc:
         logger.error("Training halted by AdaptiveController: %s", exc)
         return 1

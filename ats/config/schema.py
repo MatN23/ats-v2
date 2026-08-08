@@ -65,6 +65,7 @@ class ModelConfig(BaseModel):
     use_mamba: bool = False
     mamba_d_state: int = 16
     mamba_d_conv: int = 4
+    mamba_chunk_size: int = 32
     mamba_expand: int = 2
     mamba_every_n_layers: int = 4
 
@@ -115,12 +116,12 @@ class ModelConfig(BaseModel):
             )
         return v
 
-    @field_validator("mamba_d_state", "mamba_d_conv", "mamba_expand", "mamba_every_n_layers")
+    @field_validator("mamba_d_state", "mamba_d_conv", "mamba_expand", "mamba_every_n_layers", "mamba_chunk_size")
     @classmethod
     def _validate_mamba_positive(cls, v: int) -> int:
         if v <= 0:
             raise ConfigError(
-                f"model.mamba_d_state/d_conv/expand/every_n_layers must all be positive, got {v}."
+                f"model.mamba_d_state/d_conv/expand/every_n_layers/chunk_size must all be positive, got {v}."
             )
         return v
 

@@ -124,21 +124,66 @@ def test_moe_layer_forward_uses_real_gating_end_to_end():
 
 def test_mod_respects_capacity(dummy_model_config):
     hidden_size = 32
-    block = torch.nn.Linear(hidden_size, hidden_size)
+    lin = torch.nn.Linear(hidden_size, hidden_size)
 
-    class _Wrap(torch.nn.Module):
+    class _FakeBlock(torch.nn.Module):
+        """Matches the REAL calling convention used by TransformerBlock and
+        MambaLayer: always returns a 3-tuple (hidden, aux_loss, past_kv).
+        A fake that returned fewer items would silently hide bugs in
+        MixtureOfDepths' unpacking, which is exactly what happened before."""
+
         def __init__(self):
             super().__init__()
-            self.lin = block
+            self.lin = lin
 
         def forward(self, x, **kwargs):
-            return self.lin(x), torch.zeros(())
+            return self.lin(x), torch.zeros(()), None
 
-    mod = MixtureOfDepths(hidden_size, _Wrap(), capacity_factor=0.5)
+    mod = MixtureOfDepths(hidden_size, _FakeBlock(), capacity_factor=0.5)
     mod.eval()
     x = torch.randn(1, 10, hidden_size)
-    out, aux_loss = mod(x)
+    out, aux_loss, past_kv = mod(x)
     assert out.shape == x.shape
+    assert aux_loss.dim() == 0
+    assert past_kv is None
+
+
+def test_mod_forward_does_not_crash_wrapping_a_real_transformer_block():
+    """Regression test: MixtureOfDepths previously returned a 4-tuple when
+    wrapping a block that itself returns the real 3-tuple
+    (hidden, aux_loss, past_kv) convention -- e.g. any actual
+    TransformerBlock or MambaLayer -- which crashed
+    ATSTransformer._run_layers' `x, aux_loss, new_kv = layer(...)` unpack.
+    This exercises MoD wrapping a REAL TransformerBlock end-to-end, the way
+    ATSTransformer actually constructs it when model.use_mod=True."""
+    config = ModelConfig(
+        hidden_size=32, num_layers=1, num_heads=4, num_kv_heads=2, intermediate_size=64,
+        vocab_size=50, max_seq_len=32, use_mod=True, mod_capacity_factor=0.5,
+        use_flash_attention=False,
+    )
+    model = ATSTransformer(config)
+    input_ids = torch.randint(0, 50, (1, 8))
+    output = model(input_ids)  # must not raise
+    assert output.logits.shape == (1, 8, 50)
+
+
+def test_mod_aux_loss_includes_wrapped_block_aux_loss():
+    """The wrapped block's own aux_loss (e.g. from an inner MoE FFN) must be
+    summed into MoD's returned aux_loss, not silently dropped."""
+    hidden_size = 16
+    nonzero_block_aux_loss = torch.tensor(3.5)
+
+    class _BlockWithAuxLoss(torch.nn.Module):
+        def forward(self, x, **kwargs):
+            return x, nonzero_block_aux_loss, None
+
+    mod = MixtureOfDepths(hidden_size, _BlockWithAuxLoss(), capacity_factor=0.5)
+    mod.eval()
+    x = torch.randn(1, 6, hidden_size)
+    _out, total_aux_loss, _past_kv = mod(x)
+    # total_aux_loss = mod's own load-balancing loss + the block's 3.5;
+    # since the load-balancing term is a small MSE, total must exceed 3.5.
+    assert total_aux_loss.item() > nonzero_block_aux_loss.item()
 
 
 def test_swa_mask_blocks_beyond_window():
@@ -435,3 +480,299 @@ def test_quantized_linear_fp8_without_backend_raises_import_error():
 
     with pytest.raises(ImportError):
         QuantizedLinear(8, 8, quantization="fp8")
+
+
+# --- Regression tests: initialization double-init bug ---
+
+def test_init_residual_projection_marks_weight_to_prevent_overwrite():
+    from ats.model.initialization import init_residual_projection
+
+    linear = torch.nn.Linear(16, 16, bias=True)
+    init_residual_projection(linear, num_layers=8)
+    assert getattr(linear.weight, "_ats_residual_init", False) is True
+
+
+def test_init_weights_skips_already_residual_initialized_linear():
+    """Regression test: a later blanket init_weights() pass must NOT
+    overwrite a weight already set by init_residual_projection. Verified by
+    setting a distinctive constant value, then confirming init_weights
+    leaves it untouched."""
+    from ats.model.initialization import init_residual_projection, init_weights
+
+    linear = torch.nn.Linear(16, 16, bias=False)
+    init_residual_projection(linear, num_layers=8)
+    marked_weight = linear.weight.detach().clone()
+
+    init_weights(linear, num_layers=8)  # must be a no-op for this weight
+
+    assert torch.equal(linear.weight, marked_weight)
+
+
+def test_transformer_block_residual_projections_survive_full_model_construction():
+    """End-to-end regression test for the double-init bug: build a full
+    ATSTransformer (which internally does exactly what the bug involved --
+    TransformerBlock.__init__ sets a depth-scaled std on o_proj/down_proj,
+    then ATSTransformer.__init__ runs a later blanket self.apply(init_weights)
+    across the whole model) and confirm o_proj's empirical std matches the
+    depth-scaled target, not the generic BASE_LINEAR_STD it would have if
+    silently overwritten."""
+    from ats.model.initialization import residual_output_std
+
+    num_layers = 48  # deep enough that depth-scaled and generic std differ by >10x
+    config = ModelConfig(
+        hidden_size=64, num_layers=num_layers, num_heads=8, num_kv_heads=8,
+        intermediate_size=128, vocab_size=100, max_seq_len=32, use_flash_attention=False,
+    )
+    model = ATSTransformer(config)
+
+    expected_std = residual_output_std(num_layers)
+    generic_std = 0.02
+
+    o_proj_weight = model.layers[0].attention.o_proj.weight
+    empirical_std = o_proj_weight.std().item()
+
+    # The weight matrix is large enough (64*64=4096 elements) for the
+    # empirical std to be a reliable estimator. It must be close to the
+    # depth-scaled target and clearly NOT close to the un-scaled generic std
+    # (which is what the bug produced).
+    assert empirical_std == pytest.approx(expected_std, rel=0.15)
+    assert abs(empirical_std - generic_std) > abs(empirical_std - expected_std)
+
+
+# --- Regression tests: quantization actually wired into the model (C3) ---
+
+def test_quantization_none_produces_plain_linear_everywhere():
+    from ats.model.quantization import QuantizedLinear
+
+    config = ModelConfig(
+        hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2, intermediate_size=64,
+        vocab_size=50, max_seq_len=32, use_flash_attention=False, quantization="none",
+    )
+    model = ATSTransformer(config)
+    block = model.layers[0]
+    assert not isinstance(block.attention.q_proj, QuantizedLinear)
+    assert not isinstance(block.ffn.down_proj, QuantizedLinear)
+
+
+def test_quantization_int8_produces_quantized_linear_in_attention_and_ffn():
+    from ats.model.quantization import QuantizedLinear
+
+    config = ModelConfig(
+        hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2, intermediate_size=64,
+        vocab_size=50, max_seq_len=32, use_flash_attention=False, quantization="int8",
+    )
+    model = ATSTransformer(config)
+    block = model.layers[0]
+    assert isinstance(block.attention.q_proj, QuantizedLinear)
+    assert isinstance(block.attention.k_proj, QuantizedLinear)
+    assert isinstance(block.attention.v_proj, QuantizedLinear)
+    assert isinstance(block.attention.o_proj, QuantizedLinear)
+    assert isinstance(block.ffn.gate_up_proj, QuantizedLinear)
+    assert isinstance(block.ffn.down_proj, QuantizedLinear)
+    # Still an nn.Linear, so state_dict keys and isinstance checks elsewhere
+    # (residual init, HF export) are unaffected.
+    assert isinstance(block.attention.q_proj, torch.nn.Linear)
+
+
+def test_quantization_int8_state_dict_keys_match_plain_linear():
+    """Regression test: QuantizedLinear must expose .weight/.bias at the
+    same state_dict key path as a plain nn.Linear would, or HF export's
+    exact key remapping (ats/export/huggingface.py) would silently break
+    the moment quantization was enabled."""
+    config = ModelConfig(
+        hidden_size=32, num_layers=1, num_heads=4, num_kv_heads=2, intermediate_size=64,
+        vocab_size=50, max_seq_len=32, use_flash_attention=False, quantization="int8",
+    )
+    model = ATSTransformer(config)
+    state_dict_keys = set(model.state_dict().keys())
+    assert "layers.0.attention.q_proj.weight" in state_dict_keys
+    assert "layers.0.ffn.down_proj.weight" in state_dict_keys
+    # Must NOT be nested under a wrapping submodule like ".linear.weight".
+    assert not any(".linear.weight" in k for k in state_dict_keys)
+
+
+def test_quantization_int8_forward_pass_shape(dummy_batch):
+    config = ModelConfig(
+        hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2, intermediate_size=64,
+        vocab_size=100, max_seq_len=32, use_flash_attention=False, quantization="int8",
+    )
+    model = ATSTransformer(config)
+    output = model(dummy_batch["input_ids"])
+    assert output.logits.shape == (dummy_batch["input_ids"].shape[0], dummy_batch["input_ids"].shape[1], 100)
+
+
+def test_quantization_int8_forward_differs_numerically_from_none():
+    """int8 fake-quantization must actually perturb numerics (not silently
+    behave identically to quantization='none')."""
+    torch.manual_seed(0)
+    config_none = ModelConfig(
+        hidden_size=32, num_layers=1, num_heads=4, num_kv_heads=2, intermediate_size=64,
+        vocab_size=50, max_seq_len=32, use_flash_attention=False, quantization="none",
+    )
+    torch.manual_seed(0)
+    config_int8 = ModelConfig(
+        hidden_size=32, num_layers=1, num_heads=4, num_kv_heads=2, intermediate_size=64,
+        vocab_size=50, max_seq_len=32, use_flash_attention=False, quantization="int8",
+    )
+    torch.manual_seed(1)
+    model_none = ATSTransformer(config_none)
+    torch.manual_seed(1)
+    model_int8 = ATSTransformer(config_int8)
+    # Copy weights so the only difference is the forward-pass quantization.
+    model_int8.load_state_dict(model_none.state_dict())
+
+    input_ids = torch.randint(0, 50, (1, 6))
+    out_none = model_none(input_ids).logits
+    out_int8 = model_int8(input_ids).logits
+    assert not torch.allclose(out_none, out_int8, atol=1e-6)
+
+
+def test_moe_expert_uses_quantization():
+    """MoE fallback experts (SwiGLU instances) must also respect
+    model.quantization, since they're the majority of parameters in MoE
+    models."""
+    from ats.model.quantization import QuantizedLinear
+
+    layer = MoELayer(
+        hidden_size=16, intermediate_size=32, num_experts=2, top_k=1, quantization="int8",
+    )
+    if layer.uses_deepspeed:
+        pytest.skip("deepspeed is installed; this test targets the PyTorch fallback experts.")
+    expert = layer.moe.experts[0]
+    assert isinstance(expert.down_proj, QuantizedLinear)
+
+
+# --- Regression test: Mamba chunked scan matches sequential ground truth ---
+
+def test_mamba_chunked_scan_matches_naive_sequential_reference():
+    """MambaBlock now uses a chunked parallel scan instead of a Python loop
+    over every timestep, for speed. This test independently reimplements
+    the naive O(seq_len) sequential recurrence using the exact same
+    intermediate tensors (dt, A, B, C, x_conv) pulled from a real
+    MambaBlock instance, and checks the two numerically agree -- so a bug
+    in the chunked-scan math would be caught here, not just trusted from
+    the standalone numpy prototype used during development."""
+    torch.manual_seed(0)
+    hidden_size, d_state, d_conv, expand = 16, 8, 3, 2
+    block = MambaBlock(hidden_size=hidden_size, d_state=d_state, d_conv=d_conv, expand=expand, chunk_size=5)
+    block.eval()
+
+    batch, seq_len = 2, 23  # not a multiple of chunk_size=5, on purpose
+    x = torch.randn(batch, seq_len, hidden_size)
+
+    # Reproduce the exact same intermediate tensors MambaBlock.forward()
+    # computes, so the sequential reference operates on IDENTICAL inputs.
+    with torch.no_grad():
+        x_and_gate = block.in_proj(x)
+        x_main, gate = x_and_gate.chunk(2, dim=-1)
+        x_conv = block.conv1d(x_main.transpose(1, 2))[..., :seq_len]
+        x_conv = torch.nn.functional.silu(x_conv.transpose(1, 2))
+        proj = block.x_proj(x_conv)
+        B, C, dt_raw = torch.split(proj, [d_state, d_state, 1], dim=-1)
+        dt = torch.nn.functional.softplus(block.dt_proj(dt_raw))
+        A = -torch.exp(block.A_log)
+
+        # Naive sequential reference, operating on the SAME dt/A/B/x_conv.
+        d_inner = expand * hidden_size
+        state = torch.zeros(batch, d_inner, d_state)
+        ys = []
+        for t in range(seq_len):
+            dt_t = dt[:, t, :]
+            dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))
+            dB = dt_t.unsqueeze(-1) * B[:, t, :].unsqueeze(1)
+            state = state * dA + dB * x_conv[:, t, :].unsqueeze(-1)
+            ys.append(torch.einsum("bdn,bn->bd", state, C[:, t, :]))
+        sequential_y = torch.stack(ys, dim=1)
+        sequential_states = None  # not needed; comparing y directly below
+
+        # Now call the actual shipped chunked-scan implementation.
+        chunked_states = block._chunked_scan(dt, A, B, x_conv)
+        chunked_y = torch.einsum("btdn,btn->btd", chunked_states, C)
+
+    assert torch.allclose(sequential_y, chunked_y, atol=1e-4), (
+        f"Chunked scan diverges from sequential reference: "
+        f"max abs diff = {(sequential_y - chunked_y).abs().max().item()}"
+    )
+
+
+def test_mamba_chunked_scan_various_chunk_sizes_agree():
+    """The final output must be independent of chunk_size (it's a pure
+    speed/memory tradeoff, not an approximation) -- check several chunk
+    sizes, including ones that don't evenly divide seq_len, all agree."""
+    torch.manual_seed(1)
+    hidden_size, d_state = 8, 4
+    seq_len = 17
+
+    outputs = {}
+    for chunk_size in [1, 4, 6, 17, 100]:
+        torch.manual_seed(42)  # same weight init every time
+        block = MambaBlock(hidden_size=hidden_size, d_state=d_state, d_conv=2, expand=2, chunk_size=chunk_size)
+        block.eval()
+        torch.manual_seed(7)  # same input every time
+        x = torch.randn(1, seq_len, hidden_size)
+        with torch.no_grad():
+            outputs[chunk_size] = block(x)
+
+    reference = outputs[1]
+    for chunk_size, out in outputs.items():
+        assert torch.allclose(out, reference, atol=1e-4), (
+            f"chunk_size={chunk_size} output diverges from chunk_size=1 reference"
+        )
+
+
+def test_mamba_block_rejects_non_positive_chunk_size():
+    with pytest.raises(ValueError):
+        MambaBlock(hidden_size=16, chunk_size=0)
+
+
+def test_mamba_config_chunk_size_field_wired_through():
+    config = ModelConfig(
+        hidden_size=16, num_layers=2, num_heads=2, num_kv_heads=2, intermediate_size=32,
+        vocab_size=30, max_seq_len=16, use_mamba=True, mamba_every_n_layers=1,
+        mamba_chunk_size=8, use_flash_attention=False,
+    )
+    model = ATSTransformer(config)
+    from ats.model.transformer import MambaLayer
+
+    mamba_layer = model.layers[0]
+    assert isinstance(mamba_layer, MambaLayer)
+    assert mamba_layer.mamba.chunk_size == 8
+
+
+def test_mla_quantization_int8_produces_quantized_linear_everywhere():
+    """MLA's projections (w_dkv, w_uk, w_uv, w_dq, w_uq, w_qr, w_kr, o_proj)
+    must all respect model.quantization -- previously left unwired."""
+    from ats.model.quantization import QuantizedLinear
+
+    config = ModelConfig(
+        hidden_size=32, num_layers=1, num_heads=4, num_kv_heads=4, intermediate_size=64,
+        vocab_size=50, max_seq_len=32, use_mla=True, mla_latent_dim=8, quantization="int8",
+    )
+    model = ATSTransformer(config)
+    attn = model.layers[0].attention
+    for proj_name in ("w_dkv", "w_uk", "w_uv", "w_dq", "w_uq", "w_qr", "w_kr", "o_proj"):
+        proj = getattr(attn, proj_name)
+        assert isinstance(proj, QuantizedLinear), f"{proj_name} was not quantized"
+        assert isinstance(proj, torch.nn.Linear), f"{proj_name} broke the nn.Linear isinstance contract"
+
+
+def test_mla_quantization_none_stays_plain_linear():
+    from ats.model.quantization import QuantizedLinear
+
+    config = ModelConfig(
+        hidden_size=32, num_layers=1, num_heads=4, num_kv_heads=4, intermediate_size=64,
+        vocab_size=50, max_seq_len=32, use_mla=True, mla_latent_dim=8, quantization="none",
+    )
+    model = ATSTransformer(config)
+    attn = model.layers[0].attention
+    assert not isinstance(attn.w_dkv, QuantizedLinear)
+
+
+def test_mla_quantization_forward_pass_shape(dummy_batch):
+    config = ModelConfig(
+        hidden_size=32, num_layers=1, num_heads=4, num_kv_heads=4, intermediate_size=64,
+        vocab_size=100, max_seq_len=32, use_mla=True, mla_latent_dim=8, quantization="int8",
+    )
+    model = ATSTransformer(config)
+    output = model(dummy_batch["input_ids"])
+    assert output.logits.shape[-1] == 100

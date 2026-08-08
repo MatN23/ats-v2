@@ -9,6 +9,7 @@ mismatched config fails loudly instead of silently producing garbage).
 from __future__ import annotations
 
 import json
+import os
 import random
 import shutil
 from pathlib import Path
@@ -27,6 +28,24 @@ logger = get_logger("ats.training.checkpoint")
 
 _TRAINING_STATE_FILENAME = "training_state.json"
 _SAFETENSORS_FILENAME = "model.safetensors"
+
+
+def _current_rank() -> int:
+    """Reads the current process's global rank from the environment (set by
+    DeepSpeed/torchrun launchers), defaulting to 0 for single-process runs."""
+    return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+
+
+def _barrier_if_distributed() -> None:
+    """Synchronizes all ranks if torch.distributed is initialized, so ranks
+    other than 0 don't race ahead assuming files rank 0 just wrote already
+    exist on disk. A no-op in single-process (non-distributed) runs."""
+    try:
+        import torch.distributed as dist
+    except ImportError:
+        return
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
 
 class TrainingHaltError(RuntimeError):
@@ -84,6 +103,7 @@ class CheckpointManager:
     def save(self, model_engine: Any, global_step: int, epoch: int) -> Path:
         tag = self._tag(global_step)
         ckpt_dir = self.output_dir / tag
+        rank = _current_rank()
 
         client_state = {
             "global_step": global_step,
@@ -91,39 +111,51 @@ class CheckpointManager:
             "config_hash": self.config.config_hash(),
             "rng_state": _capture_rng_state(),
         }
+        # DeepSpeed's own save_checkpoint() already coordinates correctly
+        # across ranks for its ZeRO-sharded optimizer/model checkpoint --
+        # that rank coordination is DeepSpeed's responsibility and is left
+        # untouched here.
         model_engine.save_checkpoint(
             str(self.output_dir), tag=tag,
             client_state=client_state, save_latest=True,
         )
 
-        state_path = ckpt_dir / _TRAINING_STATE_FILENAME
-        with open(state_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {"global_step": global_step, "epoch": epoch, "config_hash": self.config.config_hash()},
-                f, indent=2,
-            )
-
-        # Write a copy of the resolved config alongside the checkpoint so
-        # export.py (and manual inspection) can find it without requiring
-        # --config to be passed explicitly every time.
-        config_path = ckpt_dir / "config.yaml"
-        with open(config_path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(self.config.model_dump(), f, sort_keys=False)
-
-        # Write a plain safetensors snapshot of the model weights alongside
-        # DeepSpeed's own checkpoint. DeepSpeed's save_checkpoint() above
-        # already handles full ZeRO-sharded optimizer/model resume (that's
-        # DeepSpeed's own internal format, not something ats controls or
-        # should reimplement) -- this safetensors copy is an ADDITIONAL,
-        # de-sharded, pickle-free artifact for fast loading / HF export /
-        # manual inspection, matching the .safetensors benefits (fast I/O,
-        # no arbitrary-code-execution risk on load, HF-standard format).
+        # module.state_dict() must be called on EVERY rank even though only
+        # rank 0 will write it to disk: under ZeRO-3, gathering the full
+        # (desharded) state dict is a collective operation that every rank
+        # must participate in together, or it will hang waiting for ranks
+        # that never call it.
         module = model_engine.module if hasattr(model_engine, "module") else model_engine
         state_dict = {k: v.detach().cpu().contiguous() for k, v in module.state_dict().items()}
-        safetensors_save_file(state_dict, str(ckpt_dir / _SAFETENSORS_FILENAME))
 
-        logger.info("Saved checkpoint at step %d to %s", global_step, ckpt_dir)
-        self._prune_old_checkpoints()
+        if rank == 0:
+            state_path = ckpt_dir / _TRAINING_STATE_FILENAME
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"global_step": global_step, "epoch": epoch, "config_hash": self.config.config_hash()},
+                    f, indent=2,
+                )
+
+            # Write a copy of the resolved config alongside the checkpoint so
+            # export.py (and manual inspection) can find it without requiring
+            # --config to be passed explicitly every time.
+            config_path = ckpt_dir / "config.yaml"
+            with open(config_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(self.config.model_dump(), f, sort_keys=False)
+
+            # Write a plain safetensors snapshot of the model weights alongside
+            # DeepSpeed's own checkpoint (an ADDITIONAL, de-sharded,
+            # pickle-free artifact for fast loading / HF export / manual
+            # inspection). Only rank 0 writes it -- without this guard, every
+            # rank under ZeRO-3 would redundantly write the same
+            # potentially-huge file simultaneously, corrupting it or
+            # serializing via filesystem locks.
+            safetensors_save_file(state_dict, str(ckpt_dir / _SAFETENSORS_FILENAME))
+
+            logger.info("Saved checkpoint at step %d to %s", global_step, ckpt_dir)
+            self._prune_old_checkpoints()
+
+        _barrier_if_distributed()
         return ckpt_dir
 
     def load(self, model_engine: Any, checkpoint_dir: str) -> Dict[str, Any]:

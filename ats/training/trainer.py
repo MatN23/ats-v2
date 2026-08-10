@@ -167,21 +167,24 @@ class Trainer:
         total_loss = ce_loss + output.aux_loss
 
         self.model_engine.backward(total_loss)
+        # Measure grad norm before step(): DeepSpeed clears/zeros gradients
+        # internally as part of completing the optimizer update at ZeRO
+        # stage 0, so anything measured after step() sees already-cleared
+        # (or near-zero residual) grads instead of the real ones from
+        # backward(). max_norm=inf means this only measures and never
+        # clips -- clipping already happens inside model_engine.step() via
+        # the gradient_clipping value in the DeepSpeed config.
+        pre_step_grad_norm = float(
+            torch.nn.utils.clip_grad_norm_(self.model_engine.parameters(), max_norm=float("inf"))
+        )
         self.model_engine.step()
 
+        # Prefer DeepSpeed's own accounting when it's actually populated
+        # (e.g. under ZeRO stage 2/3 with a mixed-precision optimizer
+        # wrapper); fall back to the value measured above otherwise.
         grad_norm = float(self.model_engine.get_global_grad_norm() or 0.0)
         if grad_norm == 0.0:
-            # get_global_grad_norm() only returns a real value when DeepSpeed
-            # wraps the optimizer in one of its ZeRO/mixed-precision
-            # optimizer classes; under ZeRO stage 0 + fp32 there is no such
-            # wrapper, so the accessor silently returns None here. Fall back
-            # to computing it directly. max_norm=inf means this only
-            # measures the norm and never clips -- clipping already happened
-            # inside model_engine.step() via the gradient_clipping value in
-            # the DeepSpeed config.
-            grad_norm = float(
-                torch.nn.utils.clip_grad_norm_(self.model_engine.parameters(), max_norm=float("inf"))
-            )
+            grad_norm = pre_step_grad_norm
         scheduled_lr = self.scheduler.get_lr(self.global_step)
         self._set_lr(scheduled_lr)
 
@@ -359,15 +362,15 @@ class DiffusionTrainer:
         mse_loss = output.loss  # DiffusionOutput.loss, computed via MSE in DiffusionLM.forward
 
         self.model_engine.backward(mse_loss)
+        # See Trainer.train_step: measure before step() clears gradients.
+        pre_step_grad_norm = float(
+            torch.nn.utils.clip_grad_norm_(self.model_engine.parameters(), max_norm=float("inf"))
+        )
         self.model_engine.step()
 
         grad_norm = float(self.model_engine.get_global_grad_norm() or 0.0)
         if grad_norm == 0.0:
-            # See Trainer.train_step for why this fallback is needed under
-            # ZeRO stage 0 + fp32.
-            grad_norm = float(
-                torch.nn.utils.clip_grad_norm_(self.model_engine.parameters(), max_norm=float("inf"))
-            )
+            grad_norm = pre_step_grad_norm
         scheduled_lr = self.scheduler.get_lr(self.global_step)
         self._set_lr(scheduled_lr)
 

@@ -287,3 +287,67 @@ def test_preprocessed_source_seq_length_mismatch_raises(tmp_path):
     )
     with pytest.raises(ConfigError):
         list(dataset)
+
+
+def test_build_dataloader_does_not_vary_seed_by_rank():
+    """Regression test for a real correctness/efficiency bug: build_dataloader
+    previously passed seed=seed+rank to MixedDataset, giving each rank an
+    independently different random stream -- which then got ADDITIONALLY
+    modulo-sharded by _TorchMixedDataset, compounding into each rank
+    discarding most of its own already-unique stream (confirmed: at
+    world_size=8, only 12.5% throughput). Every rank must now construct
+    MixedDataset with the SAME seed, so the modulo-based sharding in
+    _TorchMixedDataset.__iter__ can correctly partition one shared
+    deterministic stream instead of over-shrinking N different ones."""
+    import inspect
+
+    from ats.data.dataloader import build_dataloader
+
+    source = inspect.getsource(build_dataloader)
+    assert "seed=seed + rank" not in source and "seed=seed+rank" not in source, (
+        "build_dataloader must not vary MixedDataset's seed by rank -- this "
+        "breaks the modulo-based sharding in _TorchMixedDataset, which "
+        "requires every rank to see the same underlying stream."
+    )
+    assert "seed=seed," in source or "seed=seed)" in source
+
+
+def test_dataloader_rank_sharding_gives_full_coverage_no_duplicates():
+    """End-to-end version of the fix: build _TorchMixedDataset directly
+    (bypassing tokenization) with the SAME underlying stream for every
+    rank, confirm the union across all ranks covers every example exactly
+    once -- no duplication, no silently-discarded data."""
+    import ats.data.dataloader as dataloader_module
+
+    class _FixedStream:
+        def __iter__(self):
+            return iter(range(200))
+
+    world_size = 4
+    all_seen = []
+    for rank in range(world_size):
+        ds = dataloader_module._TorchMixedDataset(_FixedStream(), rank=rank, world_size=world_size)
+        all_seen.extend(list(ds))
+
+    assert len(all_seen) == 200
+    assert len(set(all_seen)) == 200
+    assert sorted(all_seen) == list(range(200))
+
+
+@pytest.mark.skipif(not _TIKTOKEN_AVAILABLE, reason="tiktoken not installed in this environment")
+def test_tokenizer_decode_filters_negative_ids():
+    """Regression test: decode() previously only filtered ids >= vocab_size,
+    not negative ids -- so passing a labels array (which legitimately
+    contains -100 at masked/padded positions) would crash the underlying
+    decoder instead of gracefully skipping those positions."""
+    from ats.data.tokenizer import Tokenizer
+
+    tok = Tokenizer("tiktoken:cl100k_base")
+    text = "hello world"
+    ids = tok.encode(text)
+
+    # Simulate a labels array with some positions masked out (-100), as
+    # ats.data.dataset.MixedDataset actually produces for padded blocks.
+    labels_with_masking = ids[:3] + [-100, -100] + ids[3:]
+    decoded = tok.decode(labels_with_masking)  # must not raise
+    assert decoded == text  # masked positions contribute nothing to the output

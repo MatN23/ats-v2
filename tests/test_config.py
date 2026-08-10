@@ -232,3 +232,75 @@ def test_all_size_configs_load_without_error():
     for path in sorted(pathlib.Path("configs").glob("*.yaml")):
         config = load_config(str(path))
         assert config.model.is_resolved(), f"{path}: model config did not resolve"
+
+
+def test_training_config_rejects_zero_keep_last_n_checkpoints():
+    """Regression test: keep_last_n_checkpoints previously had no validator
+    at all. A value of 0 (or negative) would cause
+    CheckpointManager._prune_old_checkpoints() to delete every checkpoint,
+    including the one just saved in the same save() call."""
+    with pytest.raises(ValidationError):
+        TrainingConfig(max_steps=10, learning_rate=1e-4, warmup_steps=1, keep_last_n_checkpoints=0)
+
+
+def test_training_config_rejects_negative_keep_last_n_checkpoints():
+    with pytest.raises(ValidationError):
+        TrainingConfig(max_steps=10, learning_rate=1e-4, warmup_steps=1, keep_last_n_checkpoints=-1)
+
+
+def test_training_config_accepts_valid_keep_last_n_checkpoints():
+    training = TrainingConfig(max_steps=10, learning_rate=1e-4, warmup_steps=1, keep_last_n_checkpoints=1)
+    assert training.keep_last_n_checkpoints == 1
+
+
+# --- Regression tests: previously-unvalidated fields that could crash with
+# confusing low-level errors instead of a clear ConfigError ---
+
+def test_model_config_rejects_non_positive_vocab_size():
+    with pytest.raises(ValidationError):
+        ModelConfig(hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2, intermediate_size=128, vocab_size=0)
+
+
+def test_model_config_rejects_non_positive_max_seq_len():
+    with pytest.raises(ValidationError):
+        ModelConfig(
+            hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
+            intermediate_size=128, max_seq_len=0,
+        )
+
+
+def test_model_config_rejects_non_positive_num_experts():
+    with pytest.raises(ValidationError):
+        ModelConfig(
+            hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
+            intermediate_size=128, num_experts=0,
+        )
+
+
+def test_model_config_rejects_non_positive_moe_capacity_factor():
+    with pytest.raises(ValidationError):
+        ModelConfig(
+            hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
+            intermediate_size=128, moe_capacity_factor=0.0,
+        )
+
+
+def test_model_config_rejects_negative_moe_load_balancing_weight():
+    with pytest.raises(ValidationError):
+        ModelConfig(
+            hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
+            intermediate_size=128, moe_load_balancing_weight=-0.01,
+        )
+
+
+def test_model_config_rejects_out_of_range_mod_capacity_factor():
+    with pytest.raises(ValidationError):
+        ModelConfig(
+            hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
+            intermediate_size=128, mod_capacity_factor=1.5,
+        )
+    with pytest.raises(ValidationError):
+        ModelConfig(
+            hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
+            intermediate_size=128, mod_capacity_factor=0.0,
+        )

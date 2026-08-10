@@ -614,3 +614,125 @@ attention/RoPE stack (which also needs to compose correctly with flash-attn,
 KV caching, SWA, and MLA) — a change to currently-correct, tested code, with
 no way to test the result here. Not attempted; documented instead of
 silently re-deferred.
+
+## Fourth pass: proactive self-audit (not responding to an external review)
+
+Went through the codebase systematically hunting for bugs rather than
+reacting to another external review. Found and fixed 9 real issues, ranging
+from a serious data-loading correctness/throughput bug to several
+config-validation gaps. Every fix below includes what was verified and how.
+
+### Serious: dataloader seed/sharding compounding into ~87.5% data loss at scale
+
+`ats/data/dataloader.py::build_dataloader` passed `seed=seed+rank` to
+`MixedDataset`, giving each distributed rank an independently different
+random stream. But `_TorchMixedDataset.__iter__` *also* shards via modulo
+filtering (`i % effective_total == effective_id`) — a mechanism that
+requires every rank to see the *same* underlying stream to partition
+correctly (this is documented in its own docstring). The two mechanisms
+compounded: each rank's already-unique stream got further chopped to
+1/(world_size × num_workers) of itself. Verified the magnitude directly:
+at world_size=8, each rank kept only 12.5% of its own stream — 87.5% of
+the intended training data silently never seen by any rank. Fixed by using
+the same seed across all ranks, relying entirely on the (correct, tested)
+modulo-based sharding. Verified the fix gives 100% coverage with zero
+duplication across ranks via direct simulation.
+
+### Real: incorrect (non-causal) attention masking for multi-token cache continuation
+
+Both `GroupedQueryAttention` and `MLAAttention` computed
+`is_causal = past_key_value is None and ...`, meaning whenever a cache
+already existed, `is_causal` was always `False` — correct for single-token
+decode (nothing to hide from with only one query), but wrong for **multi**-
+token continuation: with no explicit mask and `is_causal=False`, new tokens
+could attend to each other non-causally, including tokens that come later
+in the sequence. Added `build_incremental_causal_mask()` (shared between
+both attention implementations): new tokens always see the full cache
+(all strictly earlier) and are causal only among themselves, with optional
+window support for SWA composition. Verified the mask arithmetic
+numerically for both the plain and windowed cases before wiring it in, then
+added behavioral regression tests for both attention types: perturbing a
+*later* new token must leave an *earlier* new token's output completely
+unchanged (proving causality), while perturbing the cached prefix must
+change every new token's output (proving the cache is still fully visible).
+This bug wasn't exercised by the training loop itself (training never uses
+`use_cache=True`), but would silently corrupt any inference/generation code
+built on top of this KV cache support.
+
+### Real: MoE experts never got the depth-scaled residual-projection init
+
+`TransformerBlock.__init__` calls `init_residual_projection` on the dense
+FFN's `down_proj` (giving it the correct depth-scaled std, per
+`ats/model/initialization.py`), but explicitly skipped this for MoE
+(`if not self.ffn_is_moe: ...`), since `MoELayer` doesn't expose a single
+`.down_proj` to call it on externally. The consequence: MoE expert FFN
+`down_proj` layers silently got the generic (non-depth-scaled) init instead
+— an inconsistency that exists purely because of how `MoELayer` happens to
+be structured, not by design. Fixed by having `MoELayer`/`_PyTorchMoEFallback`
+apply the correct init to each of their own experts internally (for the
+DeepSpeed backend, applied to the expert template before construction,
+since DeepSpeed's per-expert copies are created from it). Added regression
+tests confirming the empirical weight std on MoE experts now matches the
+depth-scaled target, both for a standalone `MoELayer` and through the full
+`ATSTransformer` construction path.
+
+### Real: two MoE backends reported expert_utilization on different scales
+
+The DeepSpeed backend's `expert_utilization` (from `exp_counts`) was
+normalized to sum to 1.0; the PyTorch fallback's (`dispatch_fraction`) was
+not, and summed to `top_k` instead (e.g. 2.0 for top_k=2) — the same
+metric, same consumer (`AdaptiveController`'s expert-collapse check),
+reported on two different scales depending on which backend happened to be
+active. Fixed by normalizing the fallback's utilization separately from the
+(intentionally unnormalized) value the aux-loss formula needs, so both
+backends now sum to 1.0. Verified the discrepancy numerically before fixing.
+
+### Real: `estimate_param_count` used the wrong formula for MLA models
+
+Applied the GQA attention parameter formula unconditionally, even to MLA
+models, which have a completely different (compressed-latent) parameter
+structure — feeding an incorrect parameter count into both parallelism
+strategy selection and the memory pre-flight estimator. Verified the
+magnitude (~11% overestimate for a typical config) before fixing. Added an
+MLA-specific branch mirroring `ats/model/mla.py`'s actual layer definitions.
+Also fixed the MoE gate/router's own parameters being omitted entirely
+(small in magnitude, but a real, if minor, undercounting). Added a new
+`tests/test_parallelism.py` (no prior dedicated test file existed for
+`ats.parallelism.auto_parallel`) covering both fixes plus general strategy-
+resolution behavior.
+
+### Real: `training.keep_last_n_checkpoints` had no validator
+
+A value of 0 or negative would cause `CheckpointManager._prune_old_checkpoints()`
+to delete every checkpoint, **including the one just saved in the same
+`save()` call** — confirmed the exact failure mode by reproducing the
+pruning arithmetic directly. Added a validator requiring `>= 1`.
+
+### Real: several other config fields had no validation at all
+
+`model.vocab_size`, `model.max_seq_len`, `model.num_experts`,
+`model.moe_capacity_factor`, and `model.moe_load_balancing_weight` had no
+`field_validator` at all — a non-positive `vocab_size`, for example, would
+crash deep inside an `nn.Embedding` lookup with a confusing low-level torch
+error instead of ats-v2's own clear `ConfigError`, violating the "fail
+loudly with helpful messages" design principle. `model.mod_capacity_factor`
+was validated, but only inside `MixtureOfDepths.__init__` — failing late at
+model-construction time instead of at config-load time. Added proper
+`field_validator`s for all of these, with regression tests for each.
+
+### Minor: `Tokenizer.decode()` didn't filter negative ids
+
+Only filtered ids `>= vocab_size`, not negative ones — meaning a `labels`
+array (which legitimately contains `-100` at masked/padded positions, the
+`IGNORE_INDEX` sentinel used throughout `ats/data/dataset.py`) would crash
+the underlying tiktoken/HF decoder if ever passed to `decode()` directly.
+Not currently triggered by any production call site (nothing in `ats/`
+calls `.decode()` on a labels array), but a real latent gap worth a
+one-line fix given how cheap it was. Added a regression test.
+
+### Cleanup (not a bug): dead code in `ATSTransformer._run_layers`
+
+An `if isinstance(layer, MixtureOfDepths): ... else: ...` branch where both
+branches were identical — a leftover from before `MixtureOfDepths`' return
+signature was unified with every other layer type (see the earlier
+critical mod.py fix). Removed for clarity; no behavior change.

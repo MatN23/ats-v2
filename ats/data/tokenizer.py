@@ -72,7 +72,12 @@ class Tokenizer:
         return self._hf_tok.encode(text, add_special_tokens=False)
 
     def decode(self, token_ids: List[int]) -> str:
-        real_ids = [t for t in token_ids if t < self.vocab_size]
+        # Filters both out-of-range-high ids AND negative ids: the latter
+        # matters because label arrays (which legitimately contain -100 at
+        # masked/padded positions, see IGNORE_INDEX in ats.data.dataset)
+        # could otherwise be passed here directly and crash the underlying
+        # tiktoken/HF decoder instead of gracefully skipping those positions.
+        real_ids = [t for t in token_ids if 0 <= t < self.vocab_size]
         if self._backend == "tiktoken":
             return self._enc.decode(real_ids)
         return self._hf_tok.decode(real_ids, skip_special_tokens=True)

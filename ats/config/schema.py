@@ -76,6 +76,70 @@ class ModelConfig(BaseModel):
     diffusion_num_timesteps: int = 1000
     quantization: Literal["none", "int8", "fp8"] = "none"
 
+    @field_validator("vocab_size")
+    @classmethod
+    def _validate_vocab_size(cls, v: int) -> int:
+        if v <= 0:
+            raise ConfigError(
+                f"model.vocab_size must be positive, got {v}. "
+                f"Fix: set model.vocab_size to match your tokenizer's vocabulary size."
+            )
+        return v
+
+    @field_validator("max_seq_len")
+    @classmethod
+    def _validate_max_seq_len(cls, v: int) -> int:
+        if v <= 0:
+            raise ConfigError(
+                f"model.max_seq_len must be positive, got {v}. "
+                f"Fix: set model.max_seq_len to a positive integer, e.g. 4096."
+            )
+        return v
+
+    @field_validator("num_experts")
+    @classmethod
+    def _validate_num_experts(cls, v: int) -> int:
+        if v < 1:
+            raise ConfigError(
+                f"model.num_experts must be >= 1, got {v}. "
+                f"Fix: set model.num_experts to a positive integer, e.g. 8."
+            )
+        return v
+
+    @field_validator("moe_capacity_factor")
+    @classmethod
+    def _validate_moe_capacity_factor(cls, v: float) -> float:
+        if v <= 0:
+            raise ConfigError(
+                f"model.moe_capacity_factor must be positive, got {v}. "
+                f"Fix: set model.moe_capacity_factor to a positive float, e.g. 1.25."
+            )
+        return v
+
+    @field_validator("moe_load_balancing_weight")
+    @classmethod
+    def _validate_moe_load_balancing_weight(cls, v: float) -> float:
+        if v < 0:
+            raise ConfigError(
+                f"model.moe_load_balancing_weight must be >= 0, got {v}. "
+                f"A negative value would flip the sign of the load-balancing "
+                f"gradient, actively encouraging expert collapse instead of "
+                f"discouraging it. Fix: use a small non-negative float, e.g. 0.01."
+            )
+        return v
+
+    @field_validator("mod_capacity_factor")
+    @classmethod
+    def _validate_mod_capacity_factor(cls, v: float) -> float:
+        if not 0.0 < v <= 1.0:
+            raise ConfigError(
+                f"model.mod_capacity_factor must be in (0.0, 1.0], got {v}. "
+                f"Fix: use a value like 0.5. (Previously this was only validated "
+                f"inside MixtureOfDepths.__init__, failing late at model "
+                f"construction instead of at config load time.)"
+            )
+        return v
+
     @field_validator("dropout")
     @classmethod
     def _validate_dropout(cls, v: float) -> float:
@@ -210,6 +274,19 @@ class TrainingConfig(BaseModel):
     keep_last_n_checkpoints: int = 3
     mixed_precision: Literal["bf16", "fp16", "fp32"] = "bf16"
     seed: int = 42
+
+    @field_validator("keep_last_n_checkpoints")
+    @classmethod
+    def _validate_keep_last_n_checkpoints(cls, v: int) -> int:
+        if v < 1:
+            raise ConfigError(
+                f"training.keep_last_n_checkpoints must be >= 1, got {v}. "
+                f"A value of 0 or less would cause CheckpointManager to delete "
+                f"every checkpoint -- including the one just saved in the same "
+                f"save() call. Fix: set training.keep_last_n_checkpoints to a "
+                f"positive integer, e.g. 3."
+            )
+        return v
 
     @field_validator("weight_decay")
     @classmethod

@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ats.model.ffn import SwiGLU
+from ats.model.initialization import init_residual_projection
 
 logger = logging.getLogger("ats.model.moe")
 
@@ -38,7 +39,7 @@ class _PyTorchMoEFallback(nn.Module):
     def __init__(
         self, hidden_size: int, intermediate_size: int, num_experts: int,
         top_k: int, capacity_factor: float, load_balancing_weight: float,
-        quantization: str = "none",
+        num_layers: int, quantization: str = "none",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -50,6 +51,12 @@ class _PyTorchMoEFallback(nn.Module):
         self.experts = nn.ModuleList(
             [SwiGLU(hidden_size, intermediate_size, quantization=quantization) for _ in range(num_experts)]
         )
+        # Each expert's down_proj writes directly into the residual stream,
+        # exactly like the dense FFN path's down_proj -- it needs the same
+        # depth-scaled init (see ats.model.initialization), not the generic
+        # one a later blanket init_weights() pass would otherwise give it.
+        for expert in self.experts:
+            init_residual_projection(expert.down_proj, num_layers)
         self.last_expert_utilization: Optional[Dict[int, float]] = None
 
     def compute_routing(self, flat_x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -114,12 +121,20 @@ class _PyTorchMoEFallback(nn.Module):
         aux_loss = self.num_experts * torch.sum(router_prob_mean * dispatch_fraction)
         aux_loss = aux_loss * self.load_balancing_weight
 
-        # Expose per-expert utilization (fraction of token-slots each expert
-        # received) so callers (MoELayer -> ATSTransformer -> Trainer) can
-        # surface it to AdaptiveController's expert-collapse detection,
-        # which otherwise never receives this signal.
+        # Expose per-expert utilization (fraction of tokens dispatched to
+        # each expert, normalized to sum to 1.0) so callers (MoELayer ->
+        # ATSTransformer -> Trainer) can surface it to AdaptiveController's
+        # expert-collapse detection, which otherwise never receives this
+        # signal. Normalized separately from aux_loss's dispatch_fraction
+        # (which is intentionally NOT sum-to-1 -- it's the raw per-token
+        # mean dispatch indicator the Switch Transformer aux-loss formula
+        # expects) so that this fallback backend reports utilization on the
+        # same 0..1-summing-to-1 scale as the DeepSpeed backend's
+        # counts/total normalization, rather than two backends silently
+        # reporting the same metric on different scales.
+        normalized_utilization = dispatch_fraction / dispatch_fraction.sum().clamp(min=1e-8)
         self.last_expert_utilization = {
-            i: float(dispatch_fraction[i].item()) for i in range(self.num_experts)
+            i: float(normalized_utilization[i].item()) for i in range(self.num_experts)
         }
 
         return output.reshape(batch, seq_len, hidden_size), aux_loss
@@ -134,6 +149,7 @@ class MoELayer(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         num_experts: int,
+        num_layers: int,
         top_k: int = 2,
         capacity_factor: float = 1.25,
         load_balancing_weight: float = 0.01,
@@ -147,6 +163,11 @@ class MoELayer(nn.Module):
 
         if self.uses_deepspeed:
             expert = SwiGLU(hidden_size, intermediate_size, quantization=quantization)
+            # Applied to the template BEFORE DeepSpeedMoE constructs its
+            # per-expert copies, so every expert inherits the correct
+            # depth-scaled residual-projection init on down_proj (matching
+            # the dense FFN path) rather than the generic one.
+            init_residual_projection(expert.down_proj, num_layers)
             self.moe = DeepSpeedMoE(
                 hidden_size=hidden_size,
                 expert=expert,
@@ -164,7 +185,7 @@ class MoELayer(nn.Module):
             )
             self.moe = _PyTorchMoEFallback(
                 hidden_size, intermediate_size, num_experts, top_k,
-                capacity_factor, load_balancing_weight, quantization=quantization,
+                capacity_factor, load_balancing_weight, num_layers=num_layers, quantization=quantization,
             )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

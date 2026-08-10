@@ -37,7 +37,7 @@ class MambaLayer(nn.Module):
     use_cache) -> (x, aux_loss, new_past_key_value) call signature used by
     TransformerBlock, so ATSTransformer can mix the two freely. This
     reference implementation does not support KV-cache-based incremental
-    decoding (the sequential scan is recomputed over the full sequence each
+    decoding (the chunked scan is recomputed over the full sequence each
     call); attention_mask/past_key_value/use_cache are accepted for
     interface compatibility but past_key_value must be None."""
 
@@ -117,6 +117,7 @@ class TransformerBlock(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 num_experts=config.num_experts,
+                num_layers=config.num_layers,
                 top_k=config.moe_top_k,
                 capacity_factor=config.moe_capacity_factor,
                 load_balancing_weight=config.moe_load_balancing_weight,
@@ -133,6 +134,9 @@ class TransformerBlock(nn.Module):
         init_residual_projection(self.attention.o_proj, config.num_layers)
         if not self.ffn_is_moe:
             init_residual_projection(self.ffn.down_proj, config.num_layers)
+        # (MoE's own experts get the same depth-scaled residual-projection
+        # init applied inside MoELayer.__init__ instead, since MoELayer
+        # doesn't expose a single .down_proj -- see ats.model.moe.)
 
     def forward(
         self,
@@ -220,14 +224,13 @@ class ATSTransformer(nn.Module):
 
         for layer_idx, layer in enumerate(self.layers):
             past_kv = past_key_values[layer_idx] if past_key_values is not None else None
-            if isinstance(layer, MixtureOfDepths):
-                x, aux_loss, new_kv = layer(
-                    x, attention_mask=attention_mask, past_key_value=past_kv, use_cache=use_cache,
-                )
-            else:
-                x, aux_loss, new_kv = layer(
-                    x, attention_mask=attention_mask, past_key_value=past_kv, use_cache=use_cache,
-                )
+            # Every layer type (TransformerBlock, MambaLayer, and
+            # MixtureOfDepths wrapping either) returns the same
+            # (hidden_states, aux_loss, past_key_value) 3-tuple, so no
+            # branching by layer type is needed here.
+            x, aux_loss, new_kv = layer(
+                x, attention_mask=attention_mask, past_key_value=past_kv, use_cache=use_cache,
+            )
             total_aux_loss = total_aux_loss + aux_loss
             new_past_key_values.append(new_kv)
 

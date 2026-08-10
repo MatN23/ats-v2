@@ -84,9 +84,19 @@ def build_dataloader(
         raise ConfigError(f"batch_size must be positive, got {batch_size}.")
 
     tokenizer = Tokenizer(data_config.tokenizer_name)
+    # IMPORTANT: seed is NOT varied by rank here. _TorchMixedDataset.__iter__
+    # shards by filtering a deterministic stream via `i % effective_total ==
+    # effective_id`, which requires every rank's MixedDataset to produce the
+    # SAME underlying stream (same seed) so the modulo filter partitions it
+    # correctly. Varying the seed by rank here used to compound with that
+    # filtering: each rank would get its own already-different stream, THEN
+    # modulo-filter that down further, discarding most of it unnecessarily
+    # (confirmed: at world_size=8, only 12.5% of each rank's already-unique
+    # stream survived, for an effective 87.5% data loss). Use the same seed
+    # for every rank and let the modulo-based sharding do all the work.
     mixed_dataset = MixedDataset(
         sources=data_config.sources, tokenizer=tokenizer,
-        seq_length=data_config.seq_length, seed=seed + rank,
+        seq_length=data_config.seq_length, seed=seed,
     )
     torch_dataset = _TorchMixedDataset(mixed_dataset, rank=rank, world_size=world_size)
 

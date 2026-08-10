@@ -28,6 +28,34 @@ except ImportError:
 PastKeyValue = Tuple[torch.Tensor, torch.Tensor]
 
 
+def build_incremental_causal_mask(
+    seq_len: int, past_len: int, device: torch.device, window_size: Optional[int] = None,
+) -> torch.Tensor:
+    """Mask for attending `seq_len` new query positions against a KV cache
+    of `past_len` prior positions plus the `seq_len` new key/value positions
+    (total_len = past_len + seq_len). New tokens attend to cached/new
+    positions strictly at or before their own absolute position (causal),
+    additionally restricted to the last `window_size` positions if given.
+    Returns a boolean [seq_len, total_len] mask (True = attend), matching
+    torch.nn.functional.scaled_dot_product_attention's convention.
+
+    Neither is_causal=True nor is_causal=False expresses this pattern:
+    is_causal=True assumes query position i and key position i are the SAME
+    absolute position (wrong here, since queries start at past_len, not 0);
+    is_causal=False would incorrectly let new tokens attend to each other
+    non-causally (including "future" new tokens), leaking information
+    during multi-token continuation decoding.
+    """
+    total_len = past_len + seq_len
+    query_positions = torch.arange(past_len, total_len, device=device).unsqueeze(1)  # [seq_len, 1]
+    key_positions = torch.arange(total_len, device=device).unsqueeze(0)  # [1, total_len]
+    distance = query_positions - key_positions  # [seq_len, total_len]
+    mask = distance >= 0  # causal: key at or before query's absolute position
+    if window_size is not None:
+        mask = mask & (distance < window_size)
+    return mask
+
+
 class GroupedQueryAttention(nn.Module):
     def __init__(
         self,
@@ -128,7 +156,29 @@ class GroupedQueryAttention(nn.Module):
         is_causal = past_key_value is None and attention_mask is None and seq_len > 1
         apply_swa = self.use_swa and not force_full_attention
 
-        if self.use_flash_attention and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16):
+        # Multi-token continuation against an existing KV cache (seq_len>1
+        # with past_key_value set) needs an explicit mask: new tokens must
+        # always see every cached position, and be causal only among
+        # themselves. Neither is_causal=True (assumes queries start at
+        # position 0) nor is_causal=False (would let new tokens see each
+        # other non-causally) expresses this correctly, and flash_attn's
+        # causal/window_size flags can't express it either, so this case
+        # always uses SDPA with an explicit mask regardless of
+        # use_flash_attention.
+        needs_incremental_mask = (
+            past_key_value is not None and seq_len > 1 and attention_mask is None
+        )
+
+        if needs_incremental_mask:
+            incremental_mask = build_incremental_causal_mask(
+                seq_len, past_len, x.device, window_size=self.swa_window_size if apply_swa else None,
+            )
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=incremental_mask,
+                dropout_p=self.dropout_p if self.training else 0.0, is_causal=False,
+            )
+            attn_out = attn_out.transpose(1, 2).reshape(batch, seq_len, self.num_heads * self.head_dim)
+        elif self.use_flash_attention and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16):
             q_bshd = q.transpose(1, 2)
             k_bshd = k.transpose(1, 2)
             v_bshd = v.transpose(1, 2)

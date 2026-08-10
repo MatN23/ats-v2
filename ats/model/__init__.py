@@ -2,7 +2,7 @@
 quantization, diffusion, FFN, norm, RoPE, init."""
 
 from ats.model.transformer import ATSTransformer, MambaLayer, TransformerBlock, TransformerOutput
-from ats.model.attention import GroupedQueryAttention
+from ats.model.attention import GroupedQueryAttention, build_incremental_causal_mask
 from ats.model.diffusion import DiffusionLM, DiffusionOutput
 from ats.model.ffn import SwiGLU
 from ats.model.mamba import MambaBlock
@@ -21,6 +21,7 @@ __all__ = [
     "MambaLayer",
     "TransformerOutput",
     "GroupedQueryAttention",
+    "build_incremental_causal_mask",
     "MLAAttention",
     "MambaBlock",
     "MultiTokenPredictionHead",

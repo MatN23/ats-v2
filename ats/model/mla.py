@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ats.model.attention import build_incremental_causal_mask
 from ats.model.quantization import make_linear
 from ats.model.rope import RotaryEmbedding, apply_rotary_pos_emb
 
@@ -134,9 +135,20 @@ class MLAAttention(nn.Module):
         q = torch.cat([q_content, q_rope_rotated], dim=-1)
         k = torch.cat([k_content, k_rope_rotated], dim=-1)
 
-        is_causal = past_key_value is None and attention_mask is None and seq_len > 1
+        # Multi-token continuation against an existing KV cache needs an
+        # explicit mask (see ats.model.attention.build_incremental_causal_mask
+        # for the full rationale: neither is_causal=True nor False correctly
+        # expresses "new tokens see all cached positions, causal among
+        # themselves" when past_key_value is set and seq_len > 1).
+        if past_key_value is not None and seq_len > 1 and attention_mask is None:
+            attn_mask = build_incremental_causal_mask(seq_len, past_len, x.device)
+            is_causal = False
+        else:
+            attn_mask = attention_mask
+            is_causal = past_key_value is None and attention_mask is None and seq_len > 1
+
         attn_out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attention_mask,
+            q, k, v, attn_mask=attn_mask,
             dropout_p=self.dropout_p if self.training else 0.0,
             is_causal=is_causal,
         )

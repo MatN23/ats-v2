@@ -75,7 +75,7 @@ def test_rmsnorm_rejects_wrong_last_dim():
 
 
 def test_moe_fallback_output_shape_and_aux_loss():
-    layer = MoELayer(hidden_size=32, intermediate_size=64, num_experts=4, top_k=2)
+    layer = MoELayer(hidden_size=32, intermediate_size=64, num_experts=4, num_layers=2, top_k=2)
     x = torch.randn(2, 5, 32)
     out, aux_loss = layer(x)
     assert out.shape == x.shape
@@ -87,7 +87,7 @@ def test_moe_gating_weights_sum_to_one():
     """Exercises the REAL MoELayer's routing math (via compute_routing on its
     fallback module), not a standalone reimplementation, so a bug in the
     actual gating normalization would be caught here."""
-    layer = MoELayer(hidden_size=16, intermediate_size=32, num_experts=4, top_k=2)
+    layer = MoELayer(hidden_size=16, intermediate_size=32, num_experts=4, num_layers=2, top_k=2)
     if layer.uses_deepspeed:
         pytest.skip("deepspeed is installed; this test targets the PyTorch fallback router.")
 
@@ -111,9 +111,9 @@ def test_moe_layer_forward_uses_real_gating_end_to_end():
     via distinct random seeds producing different gate weights) produces
     different outputs, i.e. the gate isn't a no-op."""
     torch.manual_seed(1)
-    layer_a = MoELayer(hidden_size=16, intermediate_size=32, num_experts=4, top_k=2)
+    layer_a = MoELayer(hidden_size=16, intermediate_size=32, num_experts=4, num_layers=2, top_k=2)
     torch.manual_seed(2)
-    layer_b = MoELayer(hidden_size=16, intermediate_size=32, num_experts=4, top_k=2)
+    layer_b = MoELayer(hidden_size=16, intermediate_size=32, num_experts=4, num_layers=2, top_k=2)
 
     x = torch.randn(1, 3, 16)
     out_a, _ = layer_a(x)
@@ -634,7 +634,7 @@ def test_moe_expert_uses_quantization():
     from ats.model.quantization import QuantizedLinear
 
     layer = MoELayer(
-        hidden_size=16, intermediate_size=32, num_experts=2, top_k=1, quantization="int8",
+        hidden_size=16, intermediate_size=32, num_experts=2, num_layers=2, top_k=1, quantization="int8",
     )
     if layer.uses_deepspeed:
         pytest.skip("deepspeed is installed; this test targets the PyTorch fallback experts.")
@@ -776,3 +776,175 @@ def test_mla_quantization_forward_pass_shape(dummy_batch):
     model = ATSTransformer(config)
     output = model(dummy_batch["input_ids"])
     assert output.logits.shape[-1] == 100
+
+
+def test_moe_fallback_expert_utilization_sums_to_one():
+    """Regression test: the PyTorch fallback's last_expert_utilization
+    previously summed to top_k (not 1.0), inconsistent with the DeepSpeed
+    backend's counts/total normalization -- the same metric reported on
+    two different scales depending on which backend happened to be active."""
+    layer = MoELayer(hidden_size=16, intermediate_size=32, num_experts=4, num_layers=2, top_k=2)
+    if layer.uses_deepspeed:
+        pytest.skip("deepspeed is installed; this test targets the PyTorch fallback.")
+
+    x = torch.randn(2, 5, 16)
+    layer(x)
+    assert layer.last_expert_utilization is not None
+    total = sum(layer.last_expert_utilization.values())
+    assert total == pytest.approx(1.0, abs=1e-5)
+
+
+# --- Regression tests: incremental (multi-token, with-cache) causal masking ---
+
+def test_build_incremental_causal_mask_basic_pattern():
+    from ats.model.attention import build_incremental_causal_mask
+
+    mask = build_incremental_causal_mask(seq_len=3, past_len=5, device=torch.device("cpu"))
+    assert mask.shape == (3, 8)
+    expected = torch.tensor([
+        [1, 1, 1, 1, 1, 1, 0, 0],
+        [1, 1, 1, 1, 1, 1, 1, 0],
+        [1, 1, 1, 1, 1, 1, 1, 1],
+    ], dtype=torch.bool)
+    assert torch.equal(mask, expected)
+
+
+def test_build_incremental_causal_mask_with_window():
+    from ats.model.attention import build_incremental_causal_mask
+
+    mask = build_incremental_causal_mask(
+        seq_len=3, past_len=5, device=torch.device("cpu"), window_size=3,
+    )
+    expected = torch.tensor([
+        [0, 0, 0, 1, 1, 1, 0, 0],
+        [0, 0, 0, 0, 1, 1, 1, 0],
+        [0, 0, 0, 0, 0, 1, 1, 1],
+    ], dtype=torch.bool)
+    assert torch.equal(mask, expected)
+
+
+def test_gqa_multi_token_continuation_with_cache_does_not_leak_future_tokens():
+    """Regression test for a real correctness bug: previously, feeding
+    multiple new tokens against an existing KV cache used is_causal=False
+    with no explicit mask, letting new tokens attend to each other
+    non-causally (including tokens that come after them). Verified by
+    perturbing a LATER new token and confirming an EARLIER new token's
+    output is unaffected (which would only hold under correct causal
+    masking)."""
+    torch.manual_seed(0)
+    attn = GroupedQueryAttention(
+        hidden_size=32, num_heads=4, num_kv_heads=2, max_seq_len=64, use_flash_attention=False,
+    )
+    attn.eval()
+
+    prefix = torch.randn(1, 5, 32)
+    _, past_kv = attn(prefix, use_cache=True)
+
+    new_tokens = torch.randn(1, 3, 32)
+    out_a, _ = attn(new_tokens, past_key_value=past_kv, use_cache=False)
+
+    perturbed = new_tokens.clone()
+    perturbed[:, 2, :] += 100.0  # perturb the LAST (latest) new token heavily
+    out_b, _ = attn(perturbed, past_key_value=past_kv, use_cache=False)
+
+    # Earlier new-token positions (0, 1) must be COMPLETELY unaffected by a
+    # perturbation to a later new-token position (2), since position 2 comes
+    # after them and causal attention must not let them see it.
+    assert torch.allclose(out_a[:, 0, :], out_b[:, 0, :], atol=1e-5)
+    assert torch.allclose(out_a[:, 1, :], out_b[:, 1, :], atol=1e-5)
+    # Sanity: position 2 itself (which WAS perturbed) must change, or this
+    # whole comparison is vacuous.
+    assert not torch.allclose(out_a[:, 2, :], out_b[:, 2, :], atol=1e-5)
+
+
+def test_gqa_multi_token_continuation_still_sees_full_cache():
+    """Control test: new tokens must still fully attend to the cached
+    prefix (not just causally among themselves) -- perturbing the cached
+    prefix must change every new token's output."""
+    torch.manual_seed(0)
+    attn = GroupedQueryAttention(
+        hidden_size=32, num_heads=4, num_kv_heads=2, max_seq_len=64, use_flash_attention=False,
+    )
+    attn.eval()
+
+    prefix = torch.randn(1, 5, 32)
+    _, past_kv_a = attn(prefix, use_cache=True)
+    perturbed_prefix = prefix.clone()
+    perturbed_prefix[:, 0, :] += 100.0
+    _, past_kv_b = attn(perturbed_prefix, use_cache=True)
+
+    new_tokens = torch.randn(1, 3, 32)
+    out_a, _ = attn(new_tokens, past_key_value=past_kv_a, use_cache=False)
+    out_b, _ = attn(new_tokens, past_key_value=past_kv_b, use_cache=False)
+
+    assert not torch.allclose(out_a, out_b, atol=1e-5)
+
+
+def test_mla_multi_token_continuation_with_cache_does_not_leak_future_tokens():
+    """Same regression test as GQA's, applied to MLAAttention."""
+    torch.manual_seed(0)
+    mla = MLAAttention(hidden_size=32, num_heads=4, latent_dim=8, max_seq_len=64)
+    mla.eval()
+
+    prefix = torch.randn(1, 5, 32)
+    _, past_kv = mla(prefix, use_cache=True)
+
+    new_tokens = torch.randn(1, 3, 32)
+    out_a, _ = mla(new_tokens, past_key_value=past_kv, use_cache=False)
+
+    perturbed = new_tokens.clone()
+    perturbed[:, 2, :] += 100.0
+    out_b, _ = mla(perturbed, past_key_value=past_kv, use_cache=False)
+
+    assert torch.allclose(out_a[:, 0, :], out_b[:, 0, :], atol=1e-5)
+    assert torch.allclose(out_a[:, 1, :], out_b[:, 1, :], atol=1e-5)
+    assert not torch.allclose(out_a[:, 2, :], out_b[:, 2, :], atol=1e-5)
+
+
+def test_moe_expert_down_proj_gets_depth_scaled_residual_init():
+    """Regression test: MoE expert FFN down_proj layers previously never
+    received the depth-scaled residual-projection init that dense FFN
+    down_proj layers get (the `if not self.ffn_is_moe` guard in
+    TransformerBlock.__init__ skipped it entirely, since MoELayer has no
+    single .down_proj attribute to call init_residual_projection on
+    externally) -- silently leaving MoE experts on the generic,
+    non-depth-scaled init instead."""
+    from ats.model.initialization import residual_output_std
+
+    num_layers = 32
+    layer = MoELayer(
+        hidden_size=64, intermediate_size=128, num_experts=4, num_layers=num_layers, top_k=2,
+    )
+    if layer.uses_deepspeed:
+        pytest.skip("deepspeed is installed; this test targets the PyTorch fallback experts.")
+
+    expected_std = residual_output_std(num_layers)
+    for expert in layer.moe.experts:
+        empirical_std = expert.down_proj.weight.std().item()
+        assert empirical_std == pytest.approx(expected_std, rel=0.2), (
+            f"expert down_proj std {empirical_std} does not match depth-scaled "
+            f"target {expected_std} -- MoE experts are not getting the same "
+            f"residual-projection init dense FFN layers get."
+        )
+
+
+def test_moe_layer_transformer_block_experts_get_residual_init():
+    """End-to-end version: build a full ATSTransformer with use_moe=True and
+    confirm the same property holds through the real construction path
+    (TransformerBlock -> MoELayer), not just a standalone MoELayer."""
+    from ats.model.initialization import residual_output_std
+
+    num_layers = 24
+    config = ModelConfig(
+        hidden_size=32, num_layers=num_layers, num_heads=4, num_kv_heads=2, intermediate_size=64,
+        vocab_size=50, max_seq_len=32, use_moe=True, num_experts=4, moe_top_k=2,
+        use_flash_attention=False,
+    )
+    model = ATSTransformer(config)
+    moe_layer = model.layers[0].ffn
+    if moe_layer.uses_deepspeed:
+        pytest.skip("deepspeed is installed; this test targets the PyTorch fallback experts.")
+
+    expected_std = residual_output_std(num_layers)
+    empirical_std = moe_layer.moe.experts[0].down_proj.weight.std().item()
+    assert empirical_std == pytest.approx(expected_std, rel=0.3)

@@ -48,7 +48,12 @@ class Monitor:
         if self._time_at_last_log is not None:
             elapsed = now - self._time_at_last_log
             if elapsed > 0:
-                tokens_per_sec = tokens_per_step * self.config.log_every / elapsed
+                # log() is called every step (the log_every gate below only
+                # controls whether this prints), so elapsed is already the
+                # duration of a single step and tokens_per_step is already
+                # that step's token count -- multiplying by log_every here
+                # inflated the result by that factor.
+                tokens_per_sec = tokens_per_step / elapsed
         self._time_at_last_log = now
 
         full_metrics = dict(metrics)
@@ -61,11 +66,11 @@ class Monitor:
             formatted = " | ".join(f"{k}={v:.4g}" for k, v in full_metrics.items())
             logger.info("step=%d | %s", step, formatted)
 
-            if self._tb_writer is not None:
-                for key, value in full_metrics.items():
-                    self._tb_writer.add_scalar(key, value, global_step=step)
-            if self._wandb is not None:
-                self._wandb.log(full_metrics, step=step)
+        if self._tb_writer is not None:
+            for key, value in full_metrics.items():
+                self._tb_writer.add_scalar(key, value, global_step=step)
+        if self._wandb is not None:
+            self._wandb.log(full_metrics, step=step)
 
     def close(self) -> None:
         if self._tb_writer is not None:

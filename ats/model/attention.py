@@ -56,6 +56,25 @@ def build_incremental_causal_mask(
     return mask
 
 
+def build_padding_causal_mask(
+    attention_mask: torch.Tensor, seq_len: int, is_causal: bool, device: torch.device,
+) -> torch.Tensor:
+    """Combines a [batch, seq_len] padding mask (1 = attend, 0 = pad) with an
+    optional causal mask into the [batch, 1, seq_len, seq_len] boolean shape
+    SDPA expects for attn_mask (True = attend). Passing attention_mask to
+    SDPA on its own -- as a raw key-only mask -- silently drops causality:
+    SDPA does not add causal masking on its own just because a mask is
+    present, so without this the model would attend to future positions
+    whenever a padding mask is supplied, with no error to signal it."""
+    batch = attention_mask.shape[0]
+    key_mask = attention_mask.to(device=device, dtype=torch.bool)[:, None, None, :]  # [batch,1,1,seq_len]
+    mask = key_mask.expand(batch, 1, seq_len, seq_len)
+    if is_causal:
+        causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+        mask = mask & causal
+    return mask
+
+
 class GroupedQueryAttention(nn.Module):
     def __init__(
         self,
@@ -208,13 +227,24 @@ class GroupedQueryAttention(nn.Module):
                 attn_out = flash_attn_func(q_bshd, k_bshd, v_bshd, **flash_kwargs)
             attn_out = attn_out.reshape(batch, seq_len, self.num_heads * self.head_dim)
         else:
-            attn_mask = attention_mask
+            attn_mask = None
             use_is_causal = is_causal
+            if attention_mask is not None:
+                # attention_mask is a [batch, seq_len] padding mask (long or
+                # bool, 1 = attend / 0 = pad) straight from the dataloader.
+                # SDPA rejects long dtype outright, and -- independent of
+                # dtype -- passing a key-only mask on its own silently drops
+                # causal masking (is_causal above was already forced False
+                # the moment attention_mask is not None), so the causal
+                # component has to be folded back in here explicitly.
+                attn_mask = build_padding_causal_mask(
+                    attention_mask, seq_len, is_causal=(past_key_value is None and seq_len > 1),
+                    device=x.device,
+                )
+                use_is_causal = False
             if apply_swa and past_key_value is None:
                 swa_mask = generate_swa_mask(seq_len, self.swa_window_size, x.device)
-                if attn_mask is not None:
-                    swa_mask = swa_mask & attn_mask.bool()
-                attn_mask = swa_mask
+                attn_mask = swa_mask if attn_mask is None else (attn_mask & swa_mask)
                 use_is_causal = False
             attn_out = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask,

@@ -82,6 +82,18 @@ def _log_oom_and_reraise(
     raise exc
 
 
+def _move_batch_to_device(batch: Any, device: Any) -> Any:
+    """Moves every tensor value in a batch dict onto the given device,
+    leaving non-tensor values untouched. Without this, batches produced by
+    a CPU dataloader stay on CPU while the model (wrapped in a DeepSpeed
+    engine) lives on the GPU, and the first embedding lookup raises
+    RuntimeError: Expected all tensors to be on the same device."""
+    return {
+        key: (value.to(device) if torch.is_tensor(value) else value)
+        for key, value in batch.items()
+    }
+
+
 class Trainer:
     def __init__(
         self,
@@ -144,6 +156,7 @@ class Trainer:
             )
 
     def train_step(self, batch: Any) -> TrainingMetrics:
+        batch = _move_batch_to_device(batch, self.model_engine.local_rank)
         output = self.model_engine(batch["input_ids"], attention_mask=batch.get("attention_mask"))
         shift_logits = output.logits[..., :-1, :].contiguous()
         shift_labels = batch["labels"][..., 1:].contiguous()
@@ -157,6 +170,18 @@ class Trainer:
         self.model_engine.step()
 
         grad_norm = float(self.model_engine.get_global_grad_norm() or 0.0)
+        if grad_norm == 0.0:
+            # get_global_grad_norm() only returns a real value when DeepSpeed
+            # wraps the optimizer in one of its ZeRO/mixed-precision
+            # optimizer classes; under ZeRO stage 0 + fp32 there is no such
+            # wrapper, so the accessor silently returns None here. Fall back
+            # to computing it directly. max_norm=inf means this only
+            # measures the norm and never clips -- clipping already happened
+            # inside model_engine.step() via the gradient_clipping value in
+            # the DeepSpeed config.
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(self.model_engine.parameters(), max_norm=float("inf"))
+            )
         scheduled_lr = self.scheduler.get_lr(self.global_step)
         self._set_lr(scheduled_lr)
 
@@ -221,6 +246,7 @@ class Trainer:
         total_tokens = 0
         with torch.no_grad():
             for batch in self.eval_dataloader:
+                batch = _move_batch_to_device(batch, self.model_engine.local_rank)
                 output = self.model_engine(batch["input_ids"], attention_mask=batch.get("attention_mask"))
                 shift_logits = output.logits[..., :-1, :].contiguous()
                 shift_labels = batch["labels"][..., 1:].contiguous()
@@ -328,6 +354,7 @@ class DiffusionTrainer:
             )
 
     def train_step(self, batch: Any) -> TrainingMetrics:
+        batch = _move_batch_to_device(batch, self.model_engine.local_rank)
         output = self.model_engine(batch["input_ids"], embed_tokens=self._embed_tokens)
         mse_loss = output.loss  # DiffusionOutput.loss, computed via MSE in DiffusionLM.forward
 
@@ -335,6 +362,12 @@ class DiffusionTrainer:
         self.model_engine.step()
 
         grad_norm = float(self.model_engine.get_global_grad_norm() or 0.0)
+        if grad_norm == 0.0:
+            # See Trainer.train_step for why this fallback is needed under
+            # ZeRO stage 0 + fp32.
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(self.model_engine.parameters(), max_norm=float("inf"))
+            )
         scheduled_lr = self.scheduler.get_lr(self.global_step)
         self._set_lr(scheduled_lr)
 
@@ -398,6 +431,7 @@ class DiffusionTrainer:
         num_batches = 0
         with torch.no_grad():
             for batch in self.eval_dataloader:
+                batch = _move_batch_to_device(batch, self.model_engine.local_rank)
                 output = self.model_engine(batch["input_ids"], embed_tokens=self._embed_tokens)
                 total_loss += float(output.loss.item())
                 num_batches += 1

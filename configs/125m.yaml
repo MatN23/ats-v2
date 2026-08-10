@@ -17,7 +17,7 @@ model:
   model_type: autoregressive
   quantization: none
   dropout: 0.0
-  use_flash_attention: true
+  use_flash_attention: false
   gradient_checkpointing: true
 
 training:
@@ -31,27 +31,27 @@ training:
   eval_every: 1000
   save_every: 1000
   keep_last_n_checkpoints: 3
-  mixed_precision: bf16
+  mixed_precision: fp16
   seed: 42
 
 data:
   sources:
     - path: ./data/train.jsonl
-      weight: 1.0
+  weight: 1.0
   seq_length: 4096
   tokenizer_name: "tiktoken:cl100k_base"
   streaming: true
 
 parallelism:
   strategy: auto
-  gpus: 8
+  gpus: 1
   nodes: 1
 
 logging:
   project_name: ats-125m
   use_wandb: false
   use_tensorboard: true
-  log_every: 10
+  log_every: 50
 
 checkpoint:
   output_dir: ./checkpoints/125m

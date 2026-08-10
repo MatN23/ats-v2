@@ -5,7 +5,7 @@
 model:
   name: ats_1b
   size: "1b"
-  vocab_size: 50304
+  vocab_size: 100352
   max_seq_len: 4096
   tie_word_embeddings: true
   use_moe: false

@@ -133,7 +133,17 @@ class Trainer:
         self.epoch = client_state["epoch"]
 
     def _set_lr(self, lr: float) -> None:
-        for param_group in self.optimizer.param_groups:
+        # Write through model_engine.optimizer, not the separately-returned
+        # self.optimizer reference from initialize_engine() -- under bf16,
+        # DeepSpeed wraps the base optimizer, and there is no guarantee that
+        # reference stays in sync with the object model_engine actually
+        # calls .step() on internally. If it doesn't, LR changes here would
+        # silently never reach the real optimizer step -- which would look
+        # exactly like warmup never happening -- while the logged LR value
+        # still reports the intended schedule. All LR reads elsewhere in
+        # this class go through the same model_engine.optimizer reference
+        # for the same reason.
+        for param_group in self.model_engine.optimizer.param_groups:
             param_group["lr"] = lr
 
     def _apply_adaptive_action(self, action) -> None:
@@ -147,7 +157,7 @@ class Trainer:
                 f"Fix: lower training.learning_rate and resume from the last good checkpoint."
             )
         if action.type in ("emergency_lr_cut", "loss_spike_lr_cut", "plateau_lr_boost"):
-            current_lr = self.optimizer.param_groups[0]["lr"]
+            current_lr = self.model_engine.optimizer.param_groups[0]["lr"]
             new_lr = max(current_lr * action.params["factor"], action.params["min_lr"])
             self._set_lr(new_lr)
             logger.warning(
@@ -192,7 +202,7 @@ class Trainer:
             step=self.global_step,
             loss=float(ce_loss.detach().item()),
             grad_norm=grad_norm,
-            learning_rate=self.optimizer.param_groups[0]["lr"],
+            learning_rate=self.model_engine.optimizer.param_groups[0]["lr"],
             expert_utilization=output.expert_utilization,
         )
 
@@ -335,7 +345,7 @@ class DiffusionTrainer:
         self.epoch = client_state["epoch"]
 
     def _set_lr(self, lr: float) -> None:
-        for param_group in self.optimizer.param_groups:
+        for param_group in self.model_engine.optimizer.param_groups:
             param_group["lr"] = lr
 
     def _apply_adaptive_action(self, action) -> None:
@@ -348,7 +358,7 @@ class DiffusionTrainer:
                 f"Fix: lower training.learning_rate and resume from the last good checkpoint."
             )
         if action.type in ("emergency_lr_cut", "loss_spike_lr_cut", "plateau_lr_boost"):
-            current_lr = self.optimizer.param_groups[0]["lr"]
+            current_lr = self.model_engine.optimizer.param_groups[0]["lr"]
             new_lr = max(current_lr * action.params["factor"], action.params["min_lr"])
             self._set_lr(new_lr)
             logger.warning(
@@ -378,7 +388,7 @@ class DiffusionTrainer:
             step=self.global_step,
             loss=float(mse_loss.detach().item()),
             grad_norm=grad_norm,
-            learning_rate=self.optimizer.param_groups[0]["lr"],
+            learning_rate=self.model_engine.optimizer.param_groups[0]["lr"],
         )
 
         action = self.adaptive_controller.step(metrics)

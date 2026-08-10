@@ -7,7 +7,7 @@ model:
   num_kv_heads: 4
   intermediate_size: 512
   max_seq_len: 512
-  vocab_size: 50304
+  vocab_size: 100352
   tie_word_embeddings: true
   use_moe: false
   use_mod: false

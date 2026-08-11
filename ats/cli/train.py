@@ -107,7 +107,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rms-norm-eps", type=float, default=None)
     parser.add_argument("--rope-theta", type=float, default=None)
     _bool_flag(parser, "use-flash-attention", "Use flash-attn where available.")
-    _bool_flag(parser, "gradient-checkpointing", "Enable activation checkpointing.")
+    parser.add_argument(
+        "--checkpoint-every-n-layers", type=int, default=None,
+        help="Apply activation checkpointing every Nth transformer layer (1 = every "
+             "layer, matching the old --gradient-checkpointing flag). Omit to leave "
+             "checkpointing disabled/as configured.",
+    )
+    _bool_flag(
+        parser, "gradient-checkpointing",
+        "Deprecated alias for --checkpoint-every-n-layers 1 / --no-checkpoint-every-n-layers. "
+        "Use --checkpoint-every-n-layers instead.",
+    )
 
     # --- Training overrides ---
     parser.add_argument("--max-steps", type=int, default=None)
@@ -122,6 +132,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep-last-n-checkpoints", type=int, default=None)
     parser.add_argument("--mixed-precision", choices=["bf16", "fp16", "fp32"], default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--optimizer-bits", type=int, choices=[32, 8], default=None,
+        help="Optimizer precision. 8 uses bitsandbytes 8-bit Adam (requires the "
+             "'8bit' extra) instead of torch AdamW, trading a small amount of "
+             "precision for roughly 4x less optimizer-state memory.",
+    )
 
     # --- Data overrides ---
     parser.add_argument("--seq-length", type=int, default=None)
@@ -214,11 +230,22 @@ def apply_cli_overrides(config: ATSConfig, args: argparse.Namespace) -> ATSConfi
         "rms_norm_eps": args.rms_norm_eps,
         "rope_theta": args.rope_theta,
         "use_flash_attention": args.use_flash_attention,
-        "gradient_checkpointing": args.gradient_checkpointing,
     }
     for field, value in numeric_model_fields.items():
         if value is not None:
             model_updates[field] = value
+
+    # --checkpoint-every-n-layers takes precedence; --gradient-checkpointing
+    # is a deprecated boolean alias for it (True -> 1, False -> None), kept
+    # so existing scripts using the old flag don't break.
+    if args.checkpoint_every_n_layers is not None:
+        model_updates["checkpoint_every_n_layers"] = args.checkpoint_every_n_layers
+    elif args.gradient_checkpointing is not None:
+        logger.warning(
+            "--gradient-checkpointing is deprecated; use --checkpoint-every-n-layers "
+            "instead (1 = every layer, matching --gradient-checkpointing)."
+        )
+        model_updates["checkpoint_every_n_layers"] = 1 if args.gradient_checkpointing else None
 
     if model_updates:
         config = config.model_copy(update={"model": config.model.model_copy(update=model_updates)})
@@ -241,6 +268,12 @@ def apply_cli_overrides(config: ATSConfig, args: argparse.Namespace) -> ATSConfi
     training_updates = {k: v for k, v in training_fields.items() if v is not None}
     if training_updates:
         config = config.model_copy(update={"training": config.training.model_copy(update=training_updates)})
+
+    optimizer_updates = {k: v for k, v in {"bits": args.optimizer_bits}.items() if v is not None}
+    if optimizer_updates:
+        config = config.model_copy(
+            update={"optimizer": config.optimizer.model_copy(update=optimizer_updates)}
+        )
 
     data_fields = {
         "seq_length": args.seq_length,

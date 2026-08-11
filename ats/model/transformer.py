@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 
 from ats.config.schema import ModelConfig
 from ats.model.attention import GroupedQueryAttention, PastKeyValue
@@ -222,15 +223,29 @@ class ATSTransformer(nn.Module):
         total_aux_loss = torch.zeros((), device=x.device, dtype=torch.float32)
         new_past_key_values: List[Optional[PastKeyValue]] = []
 
+        # Activation checkpointing only makes sense during training (it
+        # trades recompute for memory on the backward pass) and is
+        # incompatible with KV caching (checkpoint() recomputes the forward
+        # pass from scratch on backward, which would silently produce a
+        # stale/duplicated cache). checkpoint_every_n_layers of None or 0
+        # disables it entirely.
+        n = self.config.checkpoint_every_n_layers
+        use_checkpointing = self.training and not use_cache and bool(n)
+
         for layer_idx, layer in enumerate(self.layers):
             past_kv = past_key_values[layer_idx] if past_key_values is not None else None
             # Every layer type (TransformerBlock, MambaLayer, and
             # MixtureOfDepths wrapping either) returns the same
             # (hidden_states, aux_loss, past_key_value) 3-tuple, so no
             # branching by layer type is needed here.
-            x, aux_loss, new_kv = layer(
-                x, attention_mask=attention_mask, past_key_value=past_kv, use_cache=use_cache,
-            )
+            if use_checkpointing and layer_idx % n == 0:
+                x, aux_loss, new_kv = torch.utils.checkpoint.checkpoint(
+                    layer, x, attention_mask, past_kv, use_cache, use_reentrant=False,
+                )
+            else:
+                x, aux_loss, new_kv = layer(
+                    x, attention_mask=attention_mask, past_key_value=past_kv, use_cache=use_cache,
+                )
             total_aux_loss = total_aux_loss + aux_loss
             new_past_key_values.append(new_kv)
 

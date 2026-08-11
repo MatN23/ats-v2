@@ -94,25 +94,31 @@ def build_deepspeed_config(config: ATSConfig, micro_batch_size: int) -> Dict[str
         ds_config["fp16"] = {"enabled": True, "auto_cast": True}
     # fp32 -> no precision block; DeepSpeed defaults to fp32.
 
-    if config.model.gradient_checkpointing:
+    if config.model.checkpoint_every_n_layers:
         ds_config["activation_checkpointing"] = {
             "partition_activations": zero_stage == 3,
             "contiguous_memory_optimization": True,
             "cpu_checkpointing": False,
         }
 
-    ds_config["optimizer"] = {
-        "type": "AdamW",
-        "params": {
-            "lr": config.training.learning_rate,
-            "betas": [0.9, 0.95],
-            "eps": 1e-8,
-            # weight_decay is intentionally omitted here: it's set per
-            # parameter-group instead (see get_param_groups), so biases and
-            # norm weights get weight_decay=0.0 while projection matrices
-            # get the real value.
-        },
-    }
+    if config.optimizer.bits == 32:
+        # Unchanged path: DeepSpeed builds torch.optim.AdamW itself from this
+        # config block. For bits=8, no "optimizer" key is set here -- see
+        # initialize_engine, which instead constructs a bitsandbytes
+        # Adam8bit instance client-side and passes it directly to
+        # deepspeed.initialize(optimizer=...).
+        ds_config["optimizer"] = {
+            "type": "AdamW",
+            "params": {
+                "lr": config.training.learning_rate,
+                "betas": [0.9, 0.95],
+                "eps": 1e-8,
+                # weight_decay is intentionally omitted here: it's set per
+                # parameter-group instead (see get_param_groups), so biases and
+                # norm weights get weight_decay=0.0 while projection matrices
+                # get the real value.
+            },
+        }
 
     if strategy == "deepspeed_moe" or config.model.use_moe:
         ds_config["moe"] = {
@@ -128,6 +134,27 @@ def build_deepspeed_config(config: ATSConfig, micro_batch_size: int) -> Dict[str
     return ds_config
 
 
+def _build_bitsandbytes_optimizer(config: ATSConfig, param_groups: List[Dict[str, Any]]) -> Any:
+    """Builds a bitsandbytes 8-bit Adam optimizer over `param_groups`. Raises
+    ConfigError with an actionable message if bitsandbytes is not installed,
+    rather than silently falling back to fp32 AdamW."""
+    try:
+        import bitsandbytes as bnb
+    except ImportError as exc:
+        raise ConfigError(
+            "optimizer.bits=8 requires the 'bitsandbytes' package, which is not "
+            "installed. Fix: pip install 'ats-v2[8bit]' (or `pip install "
+            "bitsandbytes` directly)."
+        ) from exc
+
+    return bnb.optim.Adam8bit(
+        param_groups,
+        lr=config.training.learning_rate,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+    )
+
+
 def initialize_engine(
     model: nn.Module, config: ATSConfig, micro_batch_size: int,
 ) -> Tuple[Any, Any, Any, Any]:
@@ -138,6 +165,14 @@ def initialize_engine(
     not installed, rather than silently falling back (parallelism.strategy is
     mandatory per ats-v2's design, unlike model-level MoE which has a
     single-process fallback).
+
+    When config.optimizer.bits == 8, a bitsandbytes Adam8bit instance is
+    constructed client-side over the same weight-decay/no-decay param groups
+    used for the default fp32 path, and handed to deepspeed.initialize() as
+    the `optimizer` kwarg -- DeepSpeed then wraps/shards that instance
+    (ZeRO, mixed precision, etc.) exactly as it would its own AdamW, instead
+    of building an optimizer from the "optimizer" key of the DeepSpeed JSON
+    config (which build_deepspeed_config leaves unset for bits=8).
     """
     try:
         import deepspeed
@@ -154,9 +189,15 @@ def initialize_engine(
     param_groups = get_param_groups(
         model, lr=config.training.learning_rate, weight_decay=config.training.weight_decay,
     )
+
+    client_optimizer = (
+        _build_bitsandbytes_optimizer(config, param_groups) if config.optimizer.bits == 8 else None
+    )
+
     model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
         model=model,
-        model_parameters=param_groups,
+        model_parameters=param_groups if client_optimizer is None else None,
+        optimizer=client_optimizer,
         config=ds_config,
     )
     return model_engine, optimizer, _, lr_scheduler

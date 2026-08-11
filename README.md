@@ -5,20 +5,6 @@ file controls model size, architecture (dense / SWA / MLA / MoE / MoD),
 parallelism strategy, and training hyperparameters — no Python edits required
 for standard runs.
 
-> **Status note:** this repository was written and reviewed by eye in a
-> sandboxed environment without network access, so most of it has **not**
-> been executed end-to-end here (no `pytest`, no real training run, no
-> `pip install -e .` — the sandbox can't reach PyPI to install torch,
-> deepspeed, or pydantic). A few pieces *were* actually run and verified in
-> this sandbox specifically because they don't require those packages: the
-> `ats-doctor` command was executed directly and correctly detected this
-> sandbox's real (missing) PyTorch/DeepSpeed/Triton/GPU state; the core
-> sequence-packing + memmap read/write logic used by `preprocess.py` and the
-> preprocessed-data reader was run standalone and round-tripped correctly.
-> Everything else — training, the Triton kernels in particular — is
-> unverified. Run the verification commands below yourself before relying
-> on this.
-
 ## Installation
 
 ```bash
@@ -28,10 +14,12 @@ pip install -e .
 Installs ats-v2 (via `pyproject.toml`) and its dependencies (torch,
 deepspeed, pydantic, tiktoken, transformers, safetensors, etc — see
 `requirements.txt` for exact pins), plus five console scripts:
-`ats-train`, `ats-eval`, `ats-export`, `ats-doctor`, and the not-yet-
-implemented `ats-finetune`/`ats-align` placeholders. Optional extras:
+`ats-train`, `ats-eval`, `ats-export`, `ats-doctor`, `ats-finetune`, and the
+not-yet-implemented `ats-align` placeholder. Optional extras:
 `pip install -e ".[eval]"` for lm-evaluation-harness,
-`pip install -e ".[triton]"` for the Triton kernels (GPU only).
+`pip install -e ".[triton]"` for the Triton kernels (GPU only),
+`pip install -e ".[8bit]"` for bitsandbytes 8-bit Adam (`--optimizer-bits 8`),
+`pip install -e ".[finetune]"` for `peft` (required by `ats-finetune`).
 
 Check your environment before training:
 
@@ -113,6 +101,30 @@ NUM_NODES=1 GPUS_PER_NODE=8 scripts/launch.sh --config configs/7b.yaml --use-moe
 sbatch scripts/slurm_submit.sh
 ```
 
+## Memory-saving flags: 8-bit optimizer and selective checkpointing
+
+```bash
+# bitsandbytes 8-bit Adam instead of fp32 AdamW: ~4x less optimizer-state
+# memory, at a small numerical precision cost. Requires `pip install
+# bitsandbytes` (or the `[8bit]` extra).
+python -m ats.cli.train --config configs/7b.yaml --optimizer-bits 8
+
+# Activation checkpointing every Nth layer instead of every layer: trades
+# less memory savings for less recompute. 1 = every layer (the strongest
+# memory saving); omit/0 disables checkpointing entirely.
+python -m ats.cli.train --config configs/7b.yaml --checkpoint-every-n-layers 1
+python -m ats.cli.train --config configs/7b.yaml --checkpoint-every-n-layers 3
+```
+
+Both are also settable directly in a config's `optimizer.bits` and
+`model.checkpoint_every_n_layers` fields. `--checkpoint-every-n-layers`
+replaces the old boolean `--gradient-checkpointing` flag (still accepted as a
+deprecated alias: `true`/unset maps to `1`/disabled). `ats-doctor --config`'s
+memory estimate reflects both: 8-bit Adam roughly quarters the reported
+optimizer-state memory, and the activation-memory reduction from
+checkpointing scales down from ~3x at `checkpoint_every_n_layers=1` toward 1x
+(no reduction) as `n` grows, since fewer layers get recomputed.
+
 ## Offline preprocessing
 
 For large corpora, tokenize once and read via memory-mapped files instead of
@@ -169,6 +181,32 @@ checkpoints, which can't be exported — pass `--config` instead of `--tasks`:
 ```bash
 python -m ats.cli.evaluate --config configs/1b.yaml --checkpoint checkpoints/1b/step_5000
 ```
+
+## LoRA fine-tuning
+
+```bash
+python -m ats.cli.finetune --config configs/7b.yaml \
+    --checkpoint checkpoints/7b/step_50000 \
+    --lora-r 16 --lora-alpha 32 --target-modules q_proj,v_proj,o_proj \
+    --output-dir ./lora-run
+```
+
+Requires `pip install peft` (or the `[finetune]` extra). `ats-finetune` loads
+the base checkpoint's weights (freezing them), injects LoRA adapters via
+`peft.LoraConfig`/`get_peft_model`, and reuses the same `Trainer` and
+dataloader as `ats-train` — only the LoRA adapter parameters end up with
+`requires_grad=True`, so the optimizer only ever updates those. It writes two
+outputs under `--output-dir`: `lora_adapter/` (just the adapter weights, via
+`peft`'s own `save_pretrained`) and `merged/` (the adapter merged back into
+the base weights and exported through the same HuggingFace export path as
+`ats-export`, so it's a standard, adapter-free checkpoint). Like
+`ats-export`, only dense and SWA autoregressive checkpoints are supported —
+MoE/MoD, MLA, Mamba, and diffusion checkpoints have no merged-export path and
+are rejected immediately with a clear error rather than after a full run.
+
+Defaults come from a config's `peft:` block (`enabled`, `lora_r`,
+`lora_alpha`, `lora_dropout`, `target_modules`); the CLI flags above override
+it the same way `ats-train`'s `--use-moe`-style flags override `model:`.
 
 ## Export to HuggingFace
 
@@ -249,13 +287,19 @@ non-trivially with gradient checkpointing and DeepSpeed's ZeRO sharding;
 that rewrite isn't attempted here rather than risk an under-tested version
 of it.
 
-**Gradient checkpointing formula:** `ats/utils/memory.py`'s pre-flight
-estimator uses a constant ~3x reduction factor for activation memory when
-`gradient_checkpointing` is enabled, based on commonly-reported practical
-figures for full (every-layer) checkpointing — not a precise theoretical
-bound (the theoretical O(sqrt(num_layers)) bound from Chen et al. 2016
-applies to a different, *selective* checkpointing strategy this boolean
-flag doesn't implement). Treat the estimator's numbers as a rough pre-flight
+**Selective checkpointing formula:** `ats/utils/memory.py`'s pre-flight
+estimator uses a `reduction_factor = 1 + 2 / checkpoint_every_n_layers`
+heuristic for activation memory: `checkpoint_every_n_layers=1` (checkpoint
+every layer) gives the same constant ~3x reduction the old boolean
+`gradient_checkpointing=True` flag used, based on commonly-reported
+practical figures for full (every-layer) checkpointing — not a precise
+theoretical bound. `checkpoint_every_n_layers > 1` (checkpoint every Nth
+layer) scales that reduction down toward 1x (no savings) as `n` grows, since
+DeepSpeed/`torch.utils.checkpoint` only trades recompute for memory on the
+layers actually checkpointed. This is still a simple heuristic, not the
+theoretical O(sqrt(num_layers)) bound from Chen et al. 2016 (that bound
+assumes checkpointing exactly every sqrt(num_layers)-th layer specifically,
+not an arbitrary N). Treat the estimator's numbers as a rough pre-flight
 warning, not an exact prediction.
 
 **No Tensor or Pipeline Parallelism:** the only parallelism strategies here
@@ -347,9 +391,33 @@ run out of RAM.
   MLA KV decompression) are also only *partially* fused, by design — see the
   docstring in each file for exactly what is and isn't fused, rather than
   taking "Triton kernel" to mean the whole pipeline is.
-- `ats/cli/finetune.py` and `ats/cli/align.py` are placeholder structure —
-  they parse arguments and print a clear "not implemented" message, they do
-  not train anything.
+- `ats/cli/align.py` is placeholder structure — it parses arguments and
+  prints a clear "not implemented" message, it does not train anything.
+  `ats/cli/finetune.py` (LoRA fine-tuning via `peft`) is implemented and was
+  run end-to-end in this sandbox against a tiny model with a stubbed-out
+  DeepSpeed engine (real `deepspeed` isn't installable here either): base
+  checkpoint load → LoRA injection → a short training loop → adapter save →
+  merge → HuggingFace export, producing a valid `LlamaForCausalLM.
+  from_pretrained`-loadable checkpoint. It has **not** been run against a
+  real multi-GPU DeepSpeed engine or a non-trivial model size. One rough
+  edge found via that testing and worked around: `peft`'s
+  `merge_and_unload()` runs a tied-embeddings check that expects
+  `model.config` to be a dict-like HuggingFace `PretrainedConfig`
+  (`model_config.get("tie_word_embeddings")`), which `ats-v2`'s own
+  `ModelConfig` (a Pydantic model, no `.get()`) doesn't satisfy;
+  `ats/cli/finetune.py` temporarily swaps in a two-key dict shim around that
+  one call and restores the real config immediately after, rather than
+  changing `ATSTransformer.config`'s type everywhere else it's used.
+- 8-bit Adam (`--optimizer-bits 8`) was verified for CLI/config plumbing and
+  the DeepSpeed client-optimizer wiring (`initialize_engine` passing a
+  constructed `bitsandbytes.optim.Adam8bit` via `deepspeed.initialize
+  (optimizer=...)` instead of the JSON `optimizer` block); the `bitsandbytes`
+  package itself isn't installed in this sandbox, so the actual 8-bit
+  optimizer math has not been run.
+- Selective activation checkpointing (`checkpoint_every_n_layers`) was
+  verified directly: `torch.utils.checkpoint.checkpoint()` fires exactly on
+  layers where `layer_idx % n == 0` during training, and not at all when
+  disabled or when `use_cache=True` (incremental decoding).
 - This repository was written and reviewed by eye in a sandboxed environment
   without network access, so most of it **has not been executed here** — no
   `pytest`, no real training run, no `pip install -e .` (the sandbox can't

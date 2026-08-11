@@ -52,7 +52,7 @@ def _preflight_memory_check(config: ATSConfig, micro_batch_size: int) -> None:
         logger.warning(
             "Estimated memory (%.1fGB) exceeds 80%% of available GPU memory (%.1fGB). "
             "Suggested fix: --micro-batch-size %d --grad-accum-steps %d, or "
-            "--parallelism-strategy deepspeed_zero%d, or --gradient-checkpointing.",
+            "--parallelism-strategy deepspeed_zero%d, or --checkpoint-every-n-layers 1.",
             report.total_gb, report.available_gb,
             report.suggested_batch_size, report.suggested_grad_accum, report.suggested_zero_stage,
         )
@@ -74,7 +74,7 @@ def _log_oom_and_reraise(
         "CUDA OOM at step %d.\n"
         "Model: ~%.1f GB | Optimizer: ~%.1f GB | Activations: ~%.1f GB\n"
         "Try: --micro-batch-size %d --grad-accum-steps %d\n"
-        "Or:  --gradient-checkpointing\n"
+        "Or:  --checkpoint-every-n-layers 1\n"
         "Or:  --parallelism-strategy deepspeed_zero3",
         step, model_gb, opt_gb, act_gb,
         max(1, micro_batch_size // 2), grad_accum_steps * 2,

@@ -107,24 +107,23 @@ def estimate_memory(config: "ATSConfig", target_batch_size: Optional[int] = None
         batch_size * seq_len * config.model.num_layers * config.model.hidden_size
         * _ACTIVATION_BYTES_PER_TOKEN_PER_LAYER_PER_HIDDEN
     )
-    if config.model.gradient_checkpointing:
-        # This flag implements FULL (every-layer) activation checkpointing,
-        # not a selective "checkpoint every sqrt(L)-th layer" scheme, so the
-        # sqrt(num_layers) bound (Chen et al. 2016) does not apply here --
-        # that bound is for the selective strategy specifically.
+    if config.model.checkpoint_every_n_layers:
+        # checkpoint_every_n_layers == 1 checkpoints every layer (the old
+        # gradient_checkpointing=True behavior), which we still treat as a
+        # constant ~3x reduction using the same commonly-cited practical
+        # figure reported for full activation checkpointing in production
+        # LLM training -- not a sqrt(num_layers)-scaling estimate (Chen et
+        # al. 2016's bound is for the selective strategy specifically, and
+        # even then isn't a simple formula we can validate without a GPU).
         #
-        # The precise full-checkpointing formula is actually
-        # num_layers * (per-layer checkpoint boundary tensor, small) +
-        # (one layer's full recomputation activations, large), which is
-        # dominated by different terms depending on num_layers and hidden
-        # size in ways that are hard to bound tightly as a simple heuristic.
-        # Rather than guess at a scaling law we can't validate without a
-        # GPU, we use the commonly-cited practical figure reported for full
-        # activation checkpointing in production LLM training (roughly a
-        # constant 2-4x memory reduction, not a reduction that keeps
-        # growing with depth) as a documented, conservative estimate.
-        _CHECKPOINTING_REDUCTION_FACTOR = 3.0
-        activation_bytes = activation_bytes / _CHECKPOINTING_REDUCTION_FACTOR
+        # For n > 1 (checkpointing only every Nth layer), fewer layers are
+        # recomputed, so less activation memory is saved. We scale the
+        # reduction factor down from the every-layer figure with a simple
+        # heuristic: reduction_factor = 1 + 2 / n. n=1 -> 3x (unchanged from
+        # the old flag), n=2 -> 2x, n=3 -> 1.67x, and so on toward 1x
+        # (no reduction) as n grows.
+        reduction_factor = 1.0 + 2.0 / config.model.checkpoint_every_n_layers
+        activation_bytes = activation_bytes / reduction_factor
 
     model_gb = (model_bytes + gradient_bytes) / _BYTES_PER_GIB
     optimizer_gb = optimizer_bytes / _BYTES_PER_GIB
@@ -206,7 +205,7 @@ def find_max_batch_size(
     if not _fits(min_batch_size):
         raise RuntimeError(
             f"Even the minimum batch size ({min_batch_size}) does not fit in memory. "
-            f"Fix: reduce model size, enable gradient_checkpointing, or use a higher "
+            f"Fix: reduce model size, set checkpoint_every_n_layers, or use a higher "
             f"ZeRO stage / more GPUs."
         )
 

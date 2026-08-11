@@ -8,7 +8,8 @@ training code.
 
 from __future__ import annotations
 
-from typing import Dict, List, Literal, Optional
+import warnings
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -52,7 +53,12 @@ class ModelConfig(BaseModel):
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
     use_flash_attention: bool = True
-    gradient_checkpointing: bool = False
+    # Selective activation checkpointing: torch.utils.checkpoint.checkpoint()
+    # is applied to every layer_idx where `layer_idx % checkpoint_every_n_layers
+    # == 0`. 1 checkpoints every layer (equivalent to the old
+    # gradient_checkpointing=True); None or 0 disables checkpointing entirely
+    # (equivalent to the old gradient_checkpointing=False, and the default).
+    checkpoint_every_n_layers: Optional[int] = None
 
     use_swa: bool = False
     swa_window_size: int = 4096
@@ -75,6 +81,43 @@ class ModelConfig(BaseModel):
     model_type: Literal["autoregressive", "diffusion"] = "autoregressive"
     diffusion_num_timesteps: int = 1000
     quantization: Literal["none", "int8", "fp8"] = "none"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_legacy_gradient_checkpointing(cls, data: Any) -> Any:
+        """Backward compatibility for the old `gradient_checkpointing: bool`
+        field, replaced by `checkpoint_every_n_layers: Optional[int]`. Maps
+        True -> 1 (checkpoint every layer, the old True behavior) and
+        False -> None (disabled, the old False behavior/default). Only
+        applied when the new field wasn't also given explicitly, so an
+        explicit checkpoint_every_n_layers always wins."""
+        if isinstance(data, dict) and "gradient_checkpointing" in data:
+            data = dict(data)
+            legacy_value = data.pop("gradient_checkpointing")
+            if "checkpoint_every_n_layers" not in data:
+                warnings.warn(
+                    "model.gradient_checkpointing is deprecated; use "
+                    "model.checkpoint_every_n_layers instead (1 = every layer, "
+                    "matching gradient_checkpointing=True; omit/None to disable, "
+                    "matching gradient_checkpointing=False). Mapping "
+                    f"gradient_checkpointing={legacy_value!r} -> "
+                    f"checkpoint_every_n_layers={1 if legacy_value else None!r}.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                data["checkpoint_every_n_layers"] = 1 if legacy_value else None
+        return data
+
+    @field_validator("checkpoint_every_n_layers")
+    @classmethod
+    def _validate_checkpoint_every_n_layers(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ConfigError(
+                f"model.checkpoint_every_n_layers must be a positive integer or None, "
+                f"got {v}. Fix: use a positive integer (1 = every layer), or omit/null "
+                f"to disable checkpointing."
+            )
+        return v
 
     @field_validator("vocab_size")
     @classmethod
@@ -350,6 +393,61 @@ class TrainingConfig(BaseModel):
         return self
 
 
+class OptimizerConfig(BaseModel):
+    """Optimizer selection, kept separate from TrainingConfig's hyperparameters
+    (lr/warmup/weight_decay/etc.) since those apply regardless of which
+    optimizer implementation runs underneath them."""
+
+    bits: Literal[32, 8] = 32
+
+    @field_validator("bits")
+    @classmethod
+    def _validate_bits(cls, v: int) -> int:
+        if v not in (32, 8):
+            raise ConfigError(
+                f"optimizer.bits must be 32 or 8, got {v}. "
+                f"Fix: set optimizer.bits to 32 (default, torch AdamW) or 8 "
+                f"(bitsandbytes 8-bit Adam, requires the '8bit' extra)."
+            )
+        return v
+
+
+class PeftConfig(BaseModel):
+    """LoRA fine-tuning configuration, consumed by ats.cli.finetune. Ignored
+    entirely by ats-train; `enabled` gates whether ats-finetune injects LoRA
+    adapters at all."""
+
+    enabled: bool = False
+    lora_r: int = 8
+    lora_alpha: int = 16
+    target_modules: List[str] = Field(default_factory=lambda: ["q_proj", "v_proj"])
+    lora_dropout: float = 0.05
+
+    @field_validator("lora_r", "lora_alpha")
+    @classmethod
+    def _validate_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ConfigError(f"peft.lora_r and peft.lora_alpha must be positive, got {v}.")
+        return v
+
+    @field_validator("target_modules")
+    @classmethod
+    def _validate_target_modules(cls, v: List[str]) -> List[str]:
+        if not v:
+            raise ConfigError(
+                "peft.target_modules must contain at least one module name, e.g. "
+                "['q_proj', 'v_proj']."
+            )
+        return v
+
+    @field_validator("lora_dropout")
+    @classmethod
+    def _validate_lora_dropout(cls, v: float) -> float:
+        if not 0.0 <= v < 1.0:
+            raise ConfigError(f"peft.lora_dropout must be in [0.0, 1.0), got {v}.")
+        return v
+
+
 class DataSource(BaseModel):
     path: str
     weight: float = 1.0
@@ -481,6 +579,8 @@ class ATSConfig(BaseModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
     adaptive: AdaptiveConfig = Field(default_factory=AdaptiveConfig)
+    optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
+    peft: PeftConfig = Field(default_factory=PeftConfig)
 
     @model_validator(mode="after")
     def _check_moe_mod_consistency(self) -> "ATSConfig":

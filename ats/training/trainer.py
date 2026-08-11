@@ -82,6 +82,49 @@ def _log_oom_and_reraise(
     raise exc
 
 
+def _preflight_chinchilla_check(model: nn.Module, config: ATSConfig, micro_batch_size: int) -> None:
+    """Logs the configured total training-token budget against the
+    Chinchilla-optimal ratio of ~20 tokens per parameter (Hoffmann et al.
+    2022), warning if it's off by more than 2x in either direction. This is
+    a compute-efficiency heuristic, not a hard requirement -- a smaller
+    token budget trades final loss for cheaper training, and a larger one
+    trades compute for a model that's cheaper to run at inference; either
+    can be the right call depending on what the run is actually for."""
+    num_params = sum(p.numel() for p in model.parameters())
+    if num_params == 0:
+        return
+
+    total_tokens = (
+        config.training.max_steps
+        * config.training.grad_accum_steps
+        * micro_batch_size
+        * config.parallelism.gpus
+        * config.parallelism.nodes
+        * config.data.seq_length
+    )
+    chinchilla_optimal_tokens = 20 * num_params
+    ratio = total_tokens / chinchilla_optimal_tokens
+
+    logger.info(
+        "Chinchilla check: %.1fM params, %.2fB configured training tokens "
+        "(%.2fx the ~20 tok/param Chinchilla-optimal budget of %.2fB tokens).",
+        num_params / 1e6, total_tokens / 1e9, ratio, chinchilla_optimal_tokens / 1e9,
+    )
+    if ratio < 0.5 or ratio > 2.0:
+        logger.warning(
+            "Configured token budget is %.2fx the Chinchilla-optimal ratio for this "
+            "model's %.1fM parameters. %s "
+            "Fix: adjust training.max_steps (or grad_accum_steps / micro_batch_size / "
+            "parallelism.gpus) to change the token budget, if this wasn't intentional.",
+            ratio, num_params / 1e6,
+            "This significantly under-trains the model relative to its size."
+            if ratio < 0.5 else
+            "This significantly over-trains the model relative to its size "
+            "(diminishing returns on loss, though it can still be worthwhile for a "
+            "smaller model that's cheaper to run at inference).",
+        )
+
+
 def _move_batch_to_device(batch: Any, device: Any) -> Any:
     """Moves every tensor value in a batch dict onto the given device,
     leaving non-tensor values untouched. Without this, batches produced by
@@ -109,6 +152,7 @@ class Trainer:
         self.micro_batch_size = micro_batch_size
 
         _preflight_memory_check(config, micro_batch_size)
+        _preflight_chinchilla_check(model, config, micro_batch_size)
 
         self.model_engine, self.optimizer, _, _ = initialize_engine(
             model, config, micro_batch_size
@@ -195,6 +239,26 @@ class Trainer:
         grad_norm = float(self.model_engine.get_global_grad_norm() or 0.0)
         if grad_norm == 0.0:
             grad_norm = pre_step_grad_norm
+
+        # fp16 (unlike bf16) uses dynamic loss scaling: DeepSpeed scales the
+        # loss up before backward() and unscales before the real optimizer
+        # update, and silently SKIPS the optimizer step (no parameter
+        # update, just a scale-halving) whenever it detects an overflow.
+        # That would look exactly like a plateau in the logged loss/step
+        # curve without any error being raised. Surfacing loss scale and
+        # overflow status here so a run of skipped steps is visible instead
+        # of invisible. Attribute names vary across DeepSpeed versions, so
+        # this degrades to a no-op rather than crashing if unavailable.
+        if self.global_step % self.config.logging.log_every == 0:
+            fp16_opt = self.model_engine.optimizer
+            cur_scale = getattr(fp16_opt, "cur_scale", getattr(fp16_opt, "loss_scale", None))
+            overflow = getattr(fp16_opt, "overflow", None)
+            if cur_scale is not None:
+                logger.info(
+                    "fp16 loss scale at step %d: cur_scale=%s overflow_this_step=%s",
+                    self.global_step, cur_scale, overflow,
+                )
+
         scheduled_lr = self.scheduler.get_lr(self.global_step)
         self._set_lr(scheduled_lr)
 

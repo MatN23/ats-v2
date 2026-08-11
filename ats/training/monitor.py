@@ -63,7 +63,18 @@ class Monitor:
         full_metrics["gpu_mem_reserved_gib"] = mem["reserved_gib"]
 
         if step % self.config.log_every == 0:
-            formatted = " | ".join(f"{k}={v:.4g}" for k, v in full_metrics.items())
+            # "lr" is forced to scientific notation always: %.4g only
+            # switches to scientific when the exponent is below -4, so a
+            # value like the common 3e-4 target LR (exponent exactly -4)
+            # would otherwise print as a plain decimal "0.0003" instead of
+            # staying consistent with smaller values like "1.5e-07".
+            parts = []
+            for key, value in full_metrics.items():
+                if key == "lr":
+                    parts.append(f"{key}={value:.4e}")
+                else:
+                    parts.append(f"{key}={value:.4g}")
+            formatted = " | ".join(parts)
             logger.info("step=%d | %s", step, formatted)
 
         if self._tb_writer is not None:

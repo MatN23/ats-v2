@@ -47,6 +47,15 @@ class AdaptiveController:
         self._last_lr_adjust_step = -1_000_000
         self._consecutive_emergency_cuts = 0
 
+        # How many plateau_lr_boost actions have fired back-to-back with no
+        # intervening emergency/spike cut. Without a cap here, a model that
+        # sits with genuinely low loss variance (e.g. because it has
+        # converged, not because it's stuck) gets boosted every time the
+        # cooldown clears, forever, with nothing to ever bring it back down
+        # -- see _make_action / max_consecutive_plateau_boosts below for how
+        # this is used.
+        self._consecutive_plateau_boosts = 0
+
     def step(self, metrics: TrainingMetrics) -> Optional[AdaptiveAction]:
         if not self.enabled:
             return None
@@ -60,6 +69,7 @@ class AdaptiveController:
         if metrics.grad_norm > cfg.grad_norm_threshold:
             action = self._make_action("emergency_lr_cut", factor=0.1, cooldown=100)
             if action is not None:
+                self._consecutive_plateau_boosts = 0
                 return action
 
         # 2. Loss spike detection: compare the mean of the most recent
@@ -73,18 +83,53 @@ class AdaptiveController:
             if older_avg > 0 and recent_avg > older_avg * cfg.spike_ratio:
                 action = self._make_action("loss_spike_lr_cut", factor=0.5, cooldown=50)
                 if action is not None:
+                    self._consecutive_plateau_boosts = 0
                     return action
 
-        # 3. Plateau detection: relative std of the loss over a longer window
-        #    below a small threshold suggests LR could be boosted.
+        # 3. Plateau detection: relative std of the loss over a window below
+        #    a small threshold used to be treated as "stuck, boost LR" on
+        #    its own. That's not a valid stagnation signal by itself -- a
+        #    loss that is smoothly, healthily decreasing can easily have low
+        #    relative std within a short window too, and a model that has
+        #    genuinely converged looks *identical* to one that's actually
+        #    stuck. Both cases previously got the same 1.5x LR boost, which
+        #    is actively harmful for a converged model and does nothing to
+        #    help a genuinely stuck one distinguish itself.
+        #
+        #    Fix: require BOTH low relative std (flat right now) AND a lack
+        #    of real improvement across the window (comparing its first half
+        #    to its second half). A converged model still shows ~0
+        #    improvement, so it still won't get repeatedly boosted forever
+        #    -- but a healthily-declining loss with low short-window std no
+        #    longer triggers on flatness alone. A hard cap on consecutive
+        #    boosts (below) is the backstop for the converged case.
         if len(self.history) >= cfg.plateau_window:
             window = [m.loss for m in list(self.history)[-cfg.plateau_window:]]
             mean_loss = float(np.mean(window))
             if mean_loss > 0:
                 rel_std = float(np.std(window)) / mean_loss
-                if rel_std < cfg.plateau_rel_std:
+
+                half = max(1, cfg.plateau_window // 2)
+                first_half_mean = float(np.mean(window[:half]))
+                second_half_mean = float(np.mean(window[-half:]))
+                relative_improvement = (
+                    (first_half_mean - second_half_mean) / max(abs(first_half_mean), 1e-8)
+                )
+                min_improvement = getattr(cfg, "plateau_min_improvement", 0.01)
+                is_stagnant = relative_improvement < min_improvement
+
+                max_consecutive_boosts = getattr(cfg, "max_consecutive_plateau_boosts", 3)
+
+                if rel_std < cfg.plateau_rel_std and is_stagnant:
+                    if self._consecutive_plateau_boosts >= max_consecutive_boosts:
+                        # Already boosted several times in a row with no
+                        # spike/cut in between to indicate the boosts are
+                        # actually doing anything. Stop -- this is far more
+                        # likely a converged model than a stuck one.
+                        return None
                     action = self._make_action("plateau_lr_boost", factor=1.5, cooldown=200)
                     if action is not None:
+                        self._consecutive_plateau_boosts += 1
                         return action
 
         # 4. MoE expert collapse: informational only, never auto-applied.

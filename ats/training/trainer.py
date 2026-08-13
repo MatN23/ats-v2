@@ -168,6 +168,23 @@ class Trainer:
         self.monitor = Monitor(config.logging)
         self.adaptive_controller = AdaptiveController(config.adaptive)
 
+        # The AdaptiveController used to communicate purely via an absolute
+        # LR value written directly into the optimizer. That value got
+        # unconditionally overwritten by the next call to
+        # scheduler.get_lr(global_step) on the very next step (get_lr is a
+        # pure function of the step count -- it has no memory of adaptive
+        # adjustments), so any boost/cut only ever affected a single
+        # optimizer step before vanishing. Instead, the controller now
+        # adjusts a persistent multiplier that's applied on top of the
+        # schedule every step (effective_lr = scheduled_lr * multiplier),
+        # decays back toward 1.0 over time, and is clamped so repeated
+        # plateau boosts can't compound the LR arbitrarily high. See
+        # _apply_adaptive_action and train_step.
+        self._adaptive_lr_multiplier = 1.0
+        self._max_adaptive_multiplier = getattr(config.adaptive, "max_lr_multiplier", 2.0)
+        self._min_adaptive_multiplier = getattr(config.adaptive, "min_lr_multiplier", 0.05)
+        self._adaptive_multiplier_decay = getattr(config.adaptive, "lr_multiplier_decay", 0.995)
+
         self.global_step = 0
         self.epoch = 0
 
@@ -201,12 +218,25 @@ class Trainer:
                 f"Fix: lower training.learning_rate and resume from the last good checkpoint."
             )
         if action.type in ("emergency_lr_cut", "loss_spike_lr_cut", "plateau_lr_boost"):
-            current_lr = self.model_engine.optimizer.param_groups[0]["lr"]
-            new_lr = max(current_lr * action.params["factor"], action.params["min_lr"])
+            factor = action.params["factor"]
+            prev_multiplier = self._adaptive_lr_multiplier
+            new_multiplier = prev_multiplier * factor
+            # Clamp so repeated plateau boosts can't compound the effective
+            # LR arbitrarily far above the schedule, and so repeated cuts
+            # can't collapse it to (near) zero either.
+            new_multiplier = min(new_multiplier, self._max_adaptive_multiplier)
+            new_multiplier = max(new_multiplier, self._min_adaptive_multiplier)
+            self._adaptive_lr_multiplier = new_multiplier
+
+            scheduled_lr = self.scheduler.get_lr(self.global_step)
+            old_lr = self.model_engine.optimizer.param_groups[0]["lr"]
+            new_lr = max(scheduled_lr * new_multiplier, action.params["min_lr"])
             self._set_lr(new_lr)
             logger.warning(
-                "AdaptiveController applied %s at step %d: lr %.3e -> %.3e",
-                action.type, self.global_step, current_lr, new_lr,
+                "AdaptiveController applied %s at step %d: lr %.3e -> %.3e "
+                "(multiplier %.3f -> %.3f)",
+                action.type, self.global_step, old_lr, new_lr,
+                prev_multiplier, new_multiplier,
             )
 
     def train_step(self, batch: Any) -> TrainingMetrics:
@@ -231,6 +261,24 @@ class Trainer:
         pre_step_grad_norm = float(
             torch.nn.utils.clip_grad_norm_(self.model_engine.parameters(), max_norm=float("inf"))
         )
+
+        # Let any active adaptive multiplier from a previous step relax a
+        # little toward 1.0 before computing this step's LR, so a past
+        # boost/cut fades out gradually instead of persisting forever.
+        self._adaptive_lr_multiplier = (
+            1.0 + (self._adaptive_lr_multiplier - 1.0) * self._adaptive_multiplier_decay
+        )
+
+        # Set the LR *before* stepping the optimizer, not after -- setting
+        # it after step() means this step's update actually uses whatever
+        # LR was left over from the end of the *previous* step (one-step
+        # lag), and for adaptive actions specifically it meant the schedule
+        # would immediately overwrite them again next step, before the
+        # optimizer ever took a step at the intended value. See the
+        # AdaptiveController-related comment in __init__.
+        scheduled_lr = self.scheduler.get_lr(self.global_step) * self._adaptive_lr_multiplier
+        self._set_lr(scheduled_lr)
+
         self.model_engine.step()
 
         # Prefer DeepSpeed's own accounting when it's actually populated
@@ -259,9 +307,6 @@ class Trainer:
                     self.global_step, cur_scale, overflow,
                 )
 
-        scheduled_lr = self.scheduler.get_lr(self.global_step)
-        self._set_lr(scheduled_lr)
-
         metrics = TrainingMetrics(
             step=self.global_step,
             loss=float(ce_loss.detach().item()),
@@ -270,6 +315,11 @@ class Trainer:
             expert_utilization=output.expert_utilization,
         )
 
+        # Runs *after* this step's optimizer update. Any action it returns
+        # adjusts self._adaptive_lr_multiplier, which takes effect starting
+        # with the LR computed at the top of the *next* train_step call --
+        # it deliberately does not retroactively change the update that was
+        # just applied.
         action = self.adaptive_controller.step(metrics)
         self._apply_adaptive_action(action)
 
@@ -400,6 +450,14 @@ class DiffusionTrainer:
         self.monitor = Monitor(config.logging)
         self.adaptive_controller = AdaptiveController(config.adaptive)
 
+        # See the matching comment in Trainer.__init__ -- same fix, applied
+        # here so DiffusionTrainer's LR handling stays consistent with the
+        # autoregressive Trainer instead of re-diverging.
+        self._adaptive_lr_multiplier = 1.0
+        self._max_adaptive_multiplier = getattr(config.adaptive, "max_lr_multiplier", 2.0)
+        self._min_adaptive_multiplier = getattr(config.adaptive, "min_lr_multiplier", 0.05)
+        self._adaptive_multiplier_decay = getattr(config.adaptive, "lr_multiplier_decay", 0.995)
+
         self.global_step = 0
         self.epoch = 0
 
@@ -422,12 +480,22 @@ class DiffusionTrainer:
                 f"Fix: lower training.learning_rate and resume from the last good checkpoint."
             )
         if action.type in ("emergency_lr_cut", "loss_spike_lr_cut", "plateau_lr_boost"):
-            current_lr = self.model_engine.optimizer.param_groups[0]["lr"]
-            new_lr = max(current_lr * action.params["factor"], action.params["min_lr"])
+            factor = action.params["factor"]
+            prev_multiplier = self._adaptive_lr_multiplier
+            new_multiplier = prev_multiplier * factor
+            new_multiplier = min(new_multiplier, self._max_adaptive_multiplier)
+            new_multiplier = max(new_multiplier, self._min_adaptive_multiplier)
+            self._adaptive_lr_multiplier = new_multiplier
+
+            scheduled_lr = self.scheduler.get_lr(self.global_step)
+            old_lr = self.model_engine.optimizer.param_groups[0]["lr"]
+            new_lr = max(scheduled_lr * new_multiplier, action.params["min_lr"])
             self._set_lr(new_lr)
             logger.warning(
-                "AdaptiveController applied %s at step %d: lr %.3e -> %.3e",
-                action.type, self.global_step, current_lr, new_lr,
+                "AdaptiveController applied %s at step %d: lr %.3e -> %.3e "
+                "(multiplier %.3f -> %.3f)",
+                action.type, self.global_step, old_lr, new_lr,
+                prev_multiplier, new_multiplier,
             )
 
     def train_step(self, batch: Any) -> TrainingMetrics:
@@ -440,13 +508,21 @@ class DiffusionTrainer:
         pre_step_grad_norm = float(
             torch.nn.utils.clip_grad_norm_(self.model_engine.parameters(), max_norm=float("inf"))
         )
+
+        self._adaptive_lr_multiplier = (
+            1.0 + (self._adaptive_lr_multiplier - 1.0) * self._adaptive_multiplier_decay
+        )
+
+        # See Trainer.train_step: LR must be set before step(), not after,
+        # so this step's update actually uses it.
+        scheduled_lr = self.scheduler.get_lr(self.global_step) * self._adaptive_lr_multiplier
+        self._set_lr(scheduled_lr)
+
         self.model_engine.step()
 
         grad_norm = float(self.model_engine.get_global_grad_norm() or 0.0)
         if grad_norm == 0.0:
             grad_norm = pre_step_grad_norm
-        scheduled_lr = self.scheduler.get_lr(self.global_step)
-        self._set_lr(scheduled_lr)
 
         metrics = TrainingMetrics(
             step=self.global_step,

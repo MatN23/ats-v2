@@ -553,6 +553,38 @@ class AdaptiveConfig(BaseModel):
     expert_collapse_threshold: float = 0.01
     min_lr: float = 1e-6
 
+    # --- Plateau-detection stagnation check ---
+    # Low relative std over plateau_window alone doesn't distinguish "stuck"
+    # from "healthily converging" or "already converged" -- both look flat.
+    # A plateau is only treated as a real stagnation signal (eligible for an
+    # LR boost) when relative std is below plateau_rel_std AND the loss has
+    # improved less than plateau_min_improvement (relative) between the
+    # first and second half of the window.
+    plateau_min_improvement: float = 0.01
+
+    # Hard cap on back-to-back plateau_lr_boost actions with no intervening
+    # emergency/spike cut to reset the count. Without this, a model that has
+    # genuinely converged (which also shows near-zero improvement, so it can
+    # still pass the stagnation check above) would otherwise get boosted
+    # forever, every time the cooldown clears.
+    max_consecutive_plateau_boosts: int = 3
+
+    # --- LR multiplier bounds, applied on top of the schedule ---
+    # AdaptiveController actions (emergency cuts, spike cuts, plateau
+    # boosts) adjust a persistent multiplier applied as
+    # effective_lr = scheduler.get_lr(step) * multiplier, rather than
+    # overwriting the LR outright. This keeps repeated boosts from
+    # compounding the effective LR arbitrarily high, and keeps repeated cuts
+    # from collapsing it arbitrarily low.
+    max_lr_multiplier: float = 2.0
+    min_lr_multiplier: float = 0.05
+
+    # Per-step decay applied to the multiplier's distance from 1.0
+    # (new_multiplier = 1.0 + (old_multiplier - 1.0) * lr_multiplier_decay),
+    # so a past boost/cut fades back toward the scheduled LR gradually
+    # instead of persisting indefinitely.
+    lr_multiplier_decay: float = 0.995
+
     @model_validator(mode="after")
     def _check_windows(self) -> "AdaptiveConfig":
         if self.history_size < 2 * self.spike_window:
@@ -567,6 +599,70 @@ class AdaptiveConfig(BaseModel):
                 f"adaptive.history_size ({self.history_size}) must be at least "
                 f"adaptive.plateau_window ({self.plateau_window}). "
                 f"Fix: increase adaptive.history_size or decrease plateau_window."
+            )
+        return self
+
+    @field_validator("plateau_min_improvement")
+    @classmethod
+    def _validate_plateau_min_improvement(cls, v: float) -> float:
+        if v < 0:
+            raise ConfigError(
+                f"adaptive.plateau_min_improvement must be >= 0, got {v}. "
+                f"Fix: use a small non-negative float, e.g. 0.01 (1% relative "
+                f"improvement required across the plateau window to NOT count "
+                f"as stagnant)."
+            )
+        return v
+
+    @field_validator("max_consecutive_plateau_boosts")
+    @classmethod
+    def _validate_max_consecutive_plateau_boosts(cls, v: int) -> int:
+        if v < 1:
+            raise ConfigError(
+                f"adaptive.max_consecutive_plateau_boosts must be >= 1, got {v}. "
+                f"Fix: use a positive integer, e.g. 3."
+            )
+        return v
+
+    @field_validator("max_lr_multiplier")
+    @classmethod
+    def _validate_max_lr_multiplier(cls, v: float) -> float:
+        if v <= 1.0:
+            raise ConfigError(
+                f"adaptive.max_lr_multiplier must be > 1.0, got {v}. "
+                f"A value <= 1.0 would prevent plateau_lr_boost from ever having "
+                f"any effect. Fix: use a value like 2.0."
+            )
+        return v
+
+    @field_validator("min_lr_multiplier")
+    @classmethod
+    def _validate_min_lr_multiplier(cls, v: float) -> float:
+        if not 0.0 < v < 1.0:
+            raise ConfigError(
+                f"adaptive.min_lr_multiplier must be in (0.0, 1.0), got {v}. "
+                f"Fix: use a value like 0.05."
+            )
+        return v
+
+    @field_validator("lr_multiplier_decay")
+    @classmethod
+    def _validate_lr_multiplier_decay(cls, v: float) -> float:
+        if not 0.0 <= v < 1.0:
+            raise ConfigError(
+                f"adaptive.lr_multiplier_decay must be in [0.0, 1.0), got {v}. "
+                f"A value of 1.0 would mean the multiplier never decays back "
+                f"toward the schedule. Fix: use a value like 0.995."
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _check_multiplier_bounds(self) -> "AdaptiveConfig":
+        if self.min_lr_multiplier >= self.max_lr_multiplier:
+            raise ConfigError(
+                f"adaptive.min_lr_multiplier ({self.min_lr_multiplier}) must be less "
+                f"than adaptive.max_lr_multiplier ({self.max_lr_multiplier}). "
+                f"Fix: lower min_lr_multiplier or raise max_lr_multiplier."
             )
         return self
 

@@ -177,13 +177,14 @@ class Trainer:
         # optimizer step before vanishing. Instead, the controller now
         # adjusts a persistent multiplier that's applied on top of the
         # schedule every step (effective_lr = scheduled_lr * multiplier),
-        # decays back toward 1.0 over time, and is clamped so repeated
+        # decays back toward 1.0 over time, and is clamped (via
+        # adaptive.max_lr_multiplier / min_lr_multiplier) so repeated
         # plateau boosts can't compound the LR arbitrarily high. See
         # _apply_adaptive_action and train_step.
         self._adaptive_lr_multiplier = 1.0
-        self._max_adaptive_multiplier = getattr(config.adaptive, "max_lr_multiplier", 2.0)
-        self._min_adaptive_multiplier = getattr(config.adaptive, "min_lr_multiplier", 0.05)
-        self._adaptive_multiplier_decay = getattr(config.adaptive, "lr_multiplier_decay", 0.995)
+        self._max_adaptive_multiplier = config.adaptive.max_lr_multiplier
+        self._min_adaptive_multiplier = config.adaptive.min_lr_multiplier
+        self._adaptive_multiplier_decay = config.adaptive.lr_multiplier_decay
 
         self.global_step = 0
         self.epoch = 0
@@ -454,9 +455,9 @@ class DiffusionTrainer:
         # here so DiffusionTrainer's LR handling stays consistent with the
         # autoregressive Trainer instead of re-diverging.
         self._adaptive_lr_multiplier = 1.0
-        self._max_adaptive_multiplier = getattr(config.adaptive, "max_lr_multiplier", 2.0)
-        self._min_adaptive_multiplier = getattr(config.adaptive, "min_lr_multiplier", 0.05)
-        self._adaptive_multiplier_decay = getattr(config.adaptive, "lr_multiplier_decay", 0.995)
+        self._max_adaptive_multiplier = config.adaptive.max_lr_multiplier
+        self._min_adaptive_multiplier = config.adaptive.min_lr_multiplier
+        self._adaptive_multiplier_decay = config.adaptive.lr_multiplier_decay
 
         self.global_step = 0
         self.epoch = 0

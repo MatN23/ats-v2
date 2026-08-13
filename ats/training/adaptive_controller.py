@@ -115,13 +115,10 @@ class AdaptiveController:
                 relative_improvement = (
                     (first_half_mean - second_half_mean) / max(abs(first_half_mean), 1e-8)
                 )
-                min_improvement = getattr(cfg, "plateau_min_improvement", 0.01)
-                is_stagnant = relative_improvement < min_improvement
-
-                max_consecutive_boosts = getattr(cfg, "max_consecutive_plateau_boosts", 3)
+                is_stagnant = relative_improvement < cfg.plateau_min_improvement
 
                 if rel_std < cfg.plateau_rel_std and is_stagnant:
-                    if self._consecutive_plateau_boosts >= max_consecutive_boosts:
+                    if self._consecutive_plateau_boosts >= cfg.max_consecutive_plateau_boosts:
                         # Already boosted several times in a row with no
                         # spike/cut in between to indicate the boosts are
                         # actually doing anything. Stop -- this is far more

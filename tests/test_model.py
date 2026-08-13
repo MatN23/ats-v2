@@ -10,6 +10,7 @@ import torch
 
 from ats.config.schema import ModelConfig
 from ats.model.attention import GroupedQueryAttention
+from ats.model.mamba import MambaBlock
 from ats.model.mla import MLAAttention
 from ats.model.moe import MoELayer
 from ats.model.mod import MixtureOfDepths
@@ -454,7 +455,11 @@ def test_quantized_linear_int8_changes_numerics():
     torch.manual_seed(0)
     plain = QuantizedLinear(8, 8, quantization="none")
     quantized = QuantizedLinear(8, 8, quantization="int8")
-    quantized.linear.weight.data.copy_(plain.linear.weight.data)
+    # QuantizedLinear subclasses nn.Linear directly (it does not wrap one as
+    # a `.linear` submodule -- see the module docstring on why: this keeps
+    # its state_dict keys identical to a plain nn.Linear's, which matters
+    # for export/checkpoint compatibility), so the weight lives at `.weight`.
+    quantized.weight.data.copy_(plain.weight.data)
 
     x = torch.randn(4, 8)
     out_plain = plain(x)
@@ -619,7 +624,12 @@ def test_quantization_int8_forward_differs_numerically_from_none():
     torch.manual_seed(1)
     model_int8 = ATSTransformer(config_int8)
     # Copy weights so the only difference is the forward-pass quantization.
-    model_int8.load_state_dict(model_none.state_dict())
+    # strict=False: the int8 model has extra FakeQuantize observer buffers
+    # (e.g. `.*.activation_post_process.*`) that model_none's state_dict
+    # doesn't have any entry for -- those aren't real weights to copy, just
+    # quantization bookkeeping, so a strict load would fail on missing keys
+    # that were never expected to be present in the source state_dict.
+    model_int8.load_state_dict(model_none.state_dict(), strict=False)
 
     input_ids = torch.randint(0, 50, (1, 6))
     out_none = model_none(input_ids).logits

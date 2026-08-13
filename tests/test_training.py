@@ -46,8 +46,18 @@ def test_adaptive_controller_detects_loss_spike():
     assert action is None  # stable loss, nothing fires
 
     # Now inject a spike: recent losses much higher than the prior window.
+    # The controller correctly fires loss_spike_lr_cut on the FIRST step
+    # where the spike becomes detectable, then its cooldown (50 steps)
+    # correctly suppresses re-firing on every subsequent step in this loop
+    # (by design -- see AdaptiveController._make_action's docstring on
+    # preventing oscillation). So the action to check is whichever one
+    # fired first, not just whatever the last iteration happened to return
+    # (which is None here, since it's inside the cooldown window).
+    action = None
     for step in range(10, 15):
-        action = controller.step(_metrics(step, loss=10.0))
+        result = controller.step(_metrics(step, loss=10.0))
+        if action is None:
+            action = result
     assert action is not None
     assert action.type == "loss_spike_lr_cut"
     assert action.apply is True
@@ -117,10 +127,21 @@ class _TinyModelEngine:
         import os
 
         ckpt_dir = os.path.join(load_dir, tag)
-        self.module.load_state_dict(torch.load(os.path.join(ckpt_dir, "model.pt")))
+        # weights_only=False: this checkpoint's client_state (specifically
+        # the numpy RNG state tuple CheckpointManager stores) isn't
+        # loadable under PyTorch 2.6+'s weights_only=True default (numpy's
+        # pickled reconstruction globals aren't on torch's default safe
+        # list). Real DeepSpeed's own TorchCheckpointEngine.load already
+        # passes weights_only=False explicitly for the same reason -- this
+        # fake engine needs to match that to be a faithful stand-in.
+        self.module.load_state_dict(
+            torch.load(os.path.join(ckpt_dir, "model.pt"), weights_only=False)
+        )
         with open(os.path.join(ckpt_dir, "client_state.json")) as f:
             client_state = json.load(f)
-        client_state["rng_state"] = torch.load(os.path.join(ckpt_dir, "rng_state.pt"))
+        client_state["rng_state"] = torch.load(
+            os.path.join(ckpt_dir, "rng_state.pt"), weights_only=False
+        )
         return self.module, client_state
 
 

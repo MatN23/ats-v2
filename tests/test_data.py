@@ -19,6 +19,27 @@ except ImportError:
     _TIKTOKEN_AVAILABLE = False
 
 
+def _tiktoken_usable() -> bool:
+    """tiktoken being importable doesn't mean it's usable: on first use it
+    downloads its encoding's BPE merge file from a remote CDN
+    (openaipublic.blob.core.windows.net), which fails in any
+    network-restricted environment (many CI runners and sandboxes block
+    egress to arbitrary hosts) even though the package itself is installed.
+    Actually attempting the fetch here means the four tests below correctly
+    skip with a clear reason in that case, instead of failing with a raw
+    requests.exceptions.HTTPError that looks like a code bug."""
+    if not _TIKTOKEN_AVAILABLE:
+        return False
+    try:
+        tiktoken.get_encoding("cl100k_base")
+        return True
+    except Exception:
+        return False
+
+
+_TIKTOKEN_USABLE = _tiktoken_usable()
+
+
 class _FakeTokenizer:
     """Deterministic character-level fake tokenizer so tests don't require
     tiktoken/transformers to be installed to check MixedDataset's chunking
@@ -42,7 +63,7 @@ def test_fake_tokenizer_round_trip():
     assert tok.decode(ids) == text
 
 
-@pytest.mark.skipif(not _TIKTOKEN_AVAILABLE, reason="tiktoken not installed in this environment")
+@pytest.mark.skipif(not _TIKTOKEN_USABLE, reason="tiktoken cl100k_base encoding not usable (not installed, or its data file could not be downloaded -- e.g. no network/blocked egress)")
 def test_real_tokenizer_round_trip():
     from ats.data.tokenizer import Tokenizer
 
@@ -123,7 +144,7 @@ def test_collate_rejects_inconsistent_lengths():
 
 # --- Regression tests for reported bugs ---
 
-@pytest.mark.skipif(not _TIKTOKEN_AVAILABLE, reason="tiktoken not installed in this environment")
+@pytest.mark.skipif(not _TIKTOKEN_USABLE, reason="tiktoken cl100k_base encoding not usable (not installed, or its data file could not be downloaded -- e.g. no network/blocked egress)")
 def test_tiktoken_pad_and_eos_ids_are_in_range():
     """Regression test: pad_token_id/eos_token_id must be < vocab_size, or
     nn.Embedding(vocab_size, hidden_size) raises IndexError the moment a
@@ -137,7 +158,7 @@ def test_tiktoken_pad_and_eos_ids_are_in_range():
     assert tok.pad_token_id >= 0
 
 
-@pytest.mark.skipif(not _TIKTOKEN_AVAILABLE, reason="tiktoken not installed in this environment")
+@pytest.mark.skipif(not _TIKTOKEN_USABLE, reason="tiktoken cl100k_base encoding not usable (not installed, or its data file could not be downloaded -- e.g. no network/blocked egress)")
 def test_tiktoken_middle_truncation_marker_is_in_range():
     """'middle' truncation inserts self.eos_token_id as a marker; this must
     also be a valid embedding index."""
@@ -334,7 +355,7 @@ def test_dataloader_rank_sharding_gives_full_coverage_no_duplicates():
     assert sorted(all_seen) == list(range(200))
 
 
-@pytest.mark.skipif(not _TIKTOKEN_AVAILABLE, reason="tiktoken not installed in this environment")
+@pytest.mark.skipif(not _TIKTOKEN_USABLE, reason="tiktoken cl100k_base encoding not usable (not installed, or its data file could not be downloaded -- e.g. no network/blocked egress)")
 def test_tokenizer_decode_filters_negative_ids():
     """Regression test: decode() previously only filtered ids >= vocab_size,
     not negative ids -- so passing a labels array (which legitimately

@@ -160,6 +160,11 @@ class MoELayer(nn.Module):
         self.hidden_size = hidden_size
         self.uses_deepspeed = _DEEPSPEED_MOE_AVAILABLE
         self.last_expert_utilization: Optional[Dict[int, float]] = None
+        # Only used on the DeepSpeed path (the fallback scales its own
+        # aux_loss internally) -- see the load_balancing_weight comment in
+        # forward() for why this is applied here rather than passed into
+        # DeepSpeedMoE's constructor.
+        self.load_balancing_weight = load_balancing_weight
 
         if self.uses_deepspeed:
             expert = SwiGLU(hidden_size, intermediate_size, quantization=quantization)
@@ -168,6 +173,13 @@ class MoELayer(nn.Module):
             # depth-scaled residual-projection init on down_proj (matching
             # the dense FFN path) rather than the generic one.
             init_residual_projection(expert.down_proj, num_layers)
+            # NOTE: deepspeed.moe.layer.MoE's constructor does not accept a
+            # load_balancing_weight kwarg (checked against deepspeed>=0.12.0
+            # through 0.19.x) -- it was never part of MoE.__init__'s API in
+            # any version this project targets. MoE.forward() returns the
+            # raw, unscaled load-balancing loss as l_aux; the weighting is
+            # applied by this class's forward() instead, matching how
+            # _PyTorchMoEFallback already scales its own aux_loss.
             self.moe = DeepSpeedMoE(
                 hidden_size=hidden_size,
                 expert=expert,
@@ -175,7 +187,6 @@ class MoELayer(nn.Module):
                 ep_size=ep_size,
                 k=top_k,
                 capacity_factor=capacity_factor,
-                load_balancing_weight=load_balancing_weight,
             )
         else:
             logger.warning(
@@ -222,7 +233,10 @@ class MoELayer(nn.Module):
                     "(got %r): %s. Expert-collapse detection will be skipped this step.",
                     type(exp_counts).__name__, exc,
                 )
-            return output, aux_loss
+            # DeepSpeedMoE.forward() returns the raw, unscaled load-balancing
+            # loss (see the constructor comment on why load_balancing_weight
+            # is applied here rather than passed into DeepSpeedMoE's ctor).
+            return output, aux_loss * self.load_balancing_weight
         output, aux_loss = self.moe(x)
         self.last_expert_utilization = self.moe.last_expert_utilization
         return output, aux_loss

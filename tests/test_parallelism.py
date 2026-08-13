@@ -33,8 +33,22 @@ def test_estimate_param_count_requires_resolved_config():
 
 
 def test_estimate_param_count_positive_and_scales_with_layers():
-    small = estimate_param_count(_model_config(num_layers=4))
-    large = estimate_param_count(_model_config(num_layers=8))
+    # NB: this deliberately does NOT use _model_config()'s default
+    # hidden_size=512/vocab_size=32000 -- at that ratio, the embedding
+    # (vocab_size * hidden_size, tied by default) contributes ~16.4M params,
+    # which is a huge, constant (non-layer-scaling) fraction of a model that
+    # small (33.2M total at 4 layers), so doubling num_layers only takes the
+    # total from 33.2M to 49.9M (1.5x, not ~2x) -- estimate_param_count's
+    # arithmetic is correct, but that combination just doesn't make "total
+    # params roughly doubles when layers double" true. Using a hidden_size
+    # large enough that the fixed embedding term is small relative to the
+    # per-layer term (realistic for actual large models, e.g. Llama-70B-style
+    # proportions) makes that approximation hold. This has no runtime cost:
+    # estimate_param_count is pure arithmetic on config fields, it never
+    # constructs an actual model.
+    kwargs = dict(hidden_size=8192, num_heads=64, num_kv_heads=8, intermediate_size=28672)
+    small = estimate_param_count(_model_config(num_layers=4, **kwargs))
+    large = estimate_param_count(_model_config(num_layers=8, **kwargs))
     assert small > 0
     assert large > small
     assert large == pytest.approx(2 * small, rel=0.05)

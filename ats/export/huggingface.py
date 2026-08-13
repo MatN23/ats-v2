@@ -49,12 +49,22 @@ def _build_hf_config(model_config: ModelConfig) -> Dict:
     return hf_config
 
 
-def _remap_state_dict(ats_state_dict: Dict[str, torch.Tensor], num_layers: int) -> Dict[str, torch.Tensor]:
+def _remap_state_dict(
+    ats_state_dict: Dict[str, torch.Tensor], num_layers: int, tie_word_embeddings: bool,
+) -> Dict[str, torch.Tensor]:
     """ats.model.transformer naming -> HF LlamaForCausalLM naming."""
     hf_state_dict: Dict[str, torch.Tensor] = {}
     hf_state_dict["model.embed_tokens.weight"] = ats_state_dict["embed_tokens.weight"]
     hf_state_dict["model.norm.weight"] = ats_state_dict["final_norm.weight"]
-    hf_state_dict["lm_head.weight"] = ats_state_dict["lm_head.weight"]
+    # When tied, ats.model.transformer.ATSTransformer makes lm_head.weight literally
+    # the same tensor storage as embed_tokens.weight (see ATSTransformer.__init__).
+    # safetensors.torch.save_file refuses to write two keys that share memory (it
+    # would silently duplicate the data on disk and risk them diverging on reload),
+    # so follow the standard HF convention instead: omit lm_head.weight entirely
+    # when tied and let the loader re-tie it from model.embed_tokens.weight based
+    # on config.json's tie_word_embeddings, exactly like real Llama checkpoints do.
+    if not tie_word_embeddings:
+        hf_state_dict["lm_head.weight"] = ats_state_dict["lm_head.weight"]
 
     per_layer_map = {
         "input_norm.weight": "input_layernorm.weight",
@@ -184,7 +194,7 @@ def export_to_huggingface(
     out_path.mkdir(parents=True, exist_ok=True)
 
     ats_state_dict = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
-    hf_state_dict = _remap_state_dict(ats_state_dict, model_config.num_layers)
+    hf_state_dict = _remap_state_dict(ats_state_dict, model_config.num_layers, model_config.tie_word_embeddings)
 
     save_file(hf_state_dict, str(out_path / "model.safetensors"))
 

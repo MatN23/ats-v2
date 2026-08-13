@@ -94,12 +94,25 @@ def build_deepspeed_config(config: ATSConfig, micro_batch_size: int) -> Dict[str
         ds_config["fp16"] = {"enabled": True, "auto_cast": True}
     # fp32 -> no precision block; DeepSpeed defaults to fp32.
 
-    if config.model.checkpoint_every_n_layers:
-        ds_config["activation_checkpointing"] = {
-            "partition_activations": zero_stage == 3,
-            "contiguous_memory_optimization": True,
-            "cpu_checkpointing": False,
-        }
+    # NOTE: activation checkpointing is intentionally NOT configured here via
+    # DeepSpeed's own "activation_checkpointing" JSON block. That block (and
+    # its partition_activations / cpu_checkpointing / contiguous_memory_
+    # optimization sub-options) only takes effect for code that explicitly
+    # calls deepspeed.checkpointing.checkpoint(...); it has zero effect on
+    # plain torch.utils.checkpoint.checkpoint(...), which is what
+    # ats.model.transformer.ATSTransformer._run_layers actually uses
+    # (controlled purely by model.checkpoint_every_n_layers). A previous
+    # version of this function set this block whenever
+    # config.model.checkpoint_every_n_layers was truthy, which did nothing
+    # DeepSpeed-side (dead configuration) and, on top of that,
+    # partition_activations specifically requires a model-parallel `mpu`
+    # object (deepspeed.checkpointing.configure(mpu, ...)) to have any memory
+    # effect at all -- ats-v2 has no tensor/model parallelism, so it would
+    # have been a no-op even if the checkpointing calls did go through
+    # DeepSpeed's API. If DeepSpeed-native CPU-offloaded checkpointing is
+    # wanted in the future, ATSTransformer's checkpoint() calls need to be
+    # switched to deepspeed.checkpointing.checkpoint (with an mpu configured
+    # via deepspeed.checkpointing.configure) for this JSON block to matter.
 
     if config.optimizer.bits == 32:
         # Unchanged path: DeepSpeed builds torch.optim.AdamW itself from this

@@ -5,8 +5,11 @@
   pass using torch.ao.quantization's fake-quant primitives, so gradients
   still flow through a straight-through estimator. This actually changes
   numerics during training, it does not silently no-op.
-- "fp8": requires transformer_engine or torchao. If neither is importable,
-  this raises ImportError immediately rather than silently falling back to
+- "fp8": requires torchao (the only backend actually integrated right now;
+  see _resolve_fp8_backend for why transformer_engine, even when installed,
+  is deliberately rejected with an explanatory error instead of silently
+  running at full precision). If no usable backend is importable, this
+  raises ImportError immediately rather than silently falling back to
   bf16/fp16, per the design brief.
 
 QuantizedLinear subclasses nn.Linear (rather than wrapping one as a
@@ -73,19 +76,51 @@ class QuantizedLinear(nn.Linear):
 
     @staticmethod
     def _resolve_fp8_backend() -> str:
-        try:
-            import transformer_engine.pytorch  # noqa: F401
-            return "transformer_engine"
-        except ImportError:
-            pass
+        # torchao is preferred (and currently the ONLY backend this class
+        # actually integrates with correctly): convert_to_float8_training()
+        # converts this specific nn.Linear instance in place, so the real
+        # fp8 GEMM path is used on every subsequent forward() call.
         try:
             import torchao  # noqa: F401
             return "torchao"
         except ImportError:
             pass
+
+        # transformer_engine's fp8_autocast() context manager only affects
+        # ops performed by transformer_engine.pytorch's OWN modules (te.Linear,
+        # te.LayerNorm, te.TransformerLayer, ...) -- it does nothing to a
+        # plain torch.nn.functional.linear call over a standard nn.Parameter,
+        # which is exactly what QuantizedLinear.forward() would otherwise do.
+        # Previously this backend was selected and forward() wrapped a plain
+        # F.linear call in te.fp8_autocast(), which silently trained at full
+        # precision while appearing to use fp8 -- no error, no speedup, no
+        # memory savings. Detect transformer_engine here only to give an
+        # actionable error instead of letting it silently no-op; real support
+        # would require rebuilding QuantizedLinear around te.Linear directly
+        # (a bigger change, since te.Linear is not an nn.Linear subclass and
+        # doesn't share nn.Linear's state_dict layout -- see the module
+        # docstring on why state_dict compatibility matters here).
+        try:
+            import transformer_engine.pytorch  # noqa: F401
+            te_installed = True
+        except ImportError:
+            te_installed = False
+
+        if te_installed:
+            raise ImportError(
+                "transformer_engine is installed, but ats-v2's QuantizedLinear does "
+                "not correctly integrate with it: wrapping a plain nn.Linear forward "
+                "pass in te.fp8_autocast() has no effect, since fp8_autocast only "
+                "casts transformer_engine.pytorch's own modules (te.Linear, "
+                "te.LayerNorm, etc.), not arbitrary torch ops. Using it here would "
+                "silently train at full precision while appearing to use fp8. "
+                "Fix: install torchao instead (`pip install torchao`), which this "
+                "class IS correctly wired up to use via convert_to_float8_training()."
+            )
+
         raise ImportError(
-            "FP8 training requires transformer-engine or torchao. Install with: "
-            "pip install transformer-engine[pytorch]"
+            "FP8 training requires torchao (the supported backend). Install with: "
+            "pip install torchao"
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -97,18 +132,19 @@ class QuantizedLinear(nn.Linear):
             quantized_x = self._act_fake_quant(x)
             return F.linear(quantized_x, quantized_weight, self.bias)
 
-        # fp8 path: dispatch to whichever backend was resolved at construction
-        # time. We intentionally do not reimplement fp8 numerics ourselves —
-        # that would be exactly the kind of custom low-level kernel work this
-        # project avoids — and instead defer to the backend's own primitives.
-        if self._fp8_backend == "transformer_engine":
-            import transformer_engine.pytorch as te
-
-            with te.fp8_autocast(enabled=True):
-                return F.linear(x, self.weight, self.bias)
-
-        # torchao path: convert this module's weight to fp8 lazily on first
-        # use (convert_to_float8_training operates on an nn.Linear in place;
+        # fp8 path: torchao is the only backend _resolve_fp8_backend() can
+        # actually return (see that method for why transformer_engine is
+        # deliberately rejected with an explanatory error rather than
+        # silently accepted and no-op'd). We intentionally do not
+        # reimplement fp8 numerics ourselves — that would be exactly the
+        # kind of custom low-level kernel work this project avoids — and
+        # instead defer to torchao's own primitives.
+        assert self._fp8_backend == "torchao", (
+            f"unexpected fp8 backend {self._fp8_backend!r}; "
+            f"_resolve_fp8_backend should only ever return 'torchao'."
+        )
+        # Convert this module's weight to fp8 lazily on first use
+        # (convert_to_float8_training operates on an nn.Linear in place;
         # since QuantizedLinear IS an nn.Linear, we can pass `self` directly).
         if not self._torchao_converted:
             from torchao.float8 import convert_to_float8_training

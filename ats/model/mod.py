@@ -16,6 +16,7 @@ and passing the wrapped block's past_key_value through unchanged.
 
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -33,10 +34,30 @@ class MixtureOfDepths(nn.Module):
         self.block = block
         self.capacity_factor = capacity_factor
         self.gate = nn.Linear(hidden_size, 1, bias=True)
+        # Bug 10 fix: default Linear init gives ~50% selection regardless of
+        # capacity_factor. For capacity_factor < 0.5, bias the gate at init
+        # so the initial selection rate roughly matches the target capacity.
+        if self.capacity_factor < 0.5:
+            nn.init.constant_(
+                self.gate.bias, math.log(self.capacity_factor / (1 - self.capacity_factor))
+            )
 
     def forward(
-        self, x: torch.Tensor, **block_kwargs
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[object] = None,
+        use_cache: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[object]]:
+        # Bug 1 fix: torch.utils.checkpoint.checkpoint in transformer.py calls
+        # layer(x, attention_mask, past_kv, use_cache) positionally, so this
+        # signature must accept those as named positional args, not just
+        # **block_kwargs (which only captures keyword arguments).
+        block_kwargs = {
+            "attention_mask": attention_mask,
+            "past_key_value": past_key_value,
+            "use_cache": use_cache,
+        }
         batch, seq_len, hidden_size = x.shape
         if hidden_size != self.hidden_size:
             raise ValueError(
@@ -58,8 +79,11 @@ class MixtureOfDepths(nn.Module):
             hard_mask.scatter_(1, topk.indices, 1.0)
             ste_mask = hard_mask + (gate_probs - gate_probs.detach())
         else:
-            threshold = torch.quantile(gate_probs, 1.0 - self.capacity_factor, dim=1, keepdim=True)
-            hard_mask = (gate_probs >= threshold).float()
+            # Bug 6 fix: use topk (same as training) instead of quantile, so
+            # inference selects the identical token set training would have
+            # selected on ties, instead of potentially diverging.
+            topk = torch.topk(gate_probs, capacity, dim=1)
+            hard_mask = torch.zeros_like(gate_probs).scatter_(1, topk.indices, 1.0)
             ste_mask = hard_mask
 
         # The wrapped block is called exactly once. It always returns

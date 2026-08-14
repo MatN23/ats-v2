@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from ats.model.attention import build_incremental_causal_mask
 from ats.model.quantization import make_linear
 from ats.model.rope import RotaryEmbedding, apply_rotary_pos_emb
+from ats.model.swa import generate_swa_mask
 
 logger = logging.getLogger("ats.model.mla")
 
@@ -44,6 +45,9 @@ class MLAAttention(nn.Module):
         dropout: float = 0.0,
         rope_head_dim: Optional[int] = None,
         quantization: str = "none",
+        use_swa: bool = False,
+        swa_window_size: int = 4096,
+        force_full_attention: bool = False,
     ) -> None:
         super().__init__()
         if hidden_size % num_heads != 0:
@@ -57,11 +61,21 @@ class MLAAttention(nn.Module):
                 f"— it is meant to compress hidden_size ({hidden_size}). "
                 f"Typical choice: hidden_size // 4 or // 8."
             )
+        if use_swa and swa_window_size <= 0:
+            raise ValueError(
+                f"swa_window_size must be positive when use_swa=True, got {swa_window_size}."
+            )
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.latent_dim = latent_dim
         self.dropout_p = dropout
+        # Bug 2 fix: without these, MLAAttention has no way to know about the
+        # hybrid SWA pattern at all, so the "full attention every N layers"
+        # schedule was silently ignored for every MLA layer.
+        self.use_swa = use_swa
+        self.swa_window_size = swa_window_size
+        self.force_full_attention = force_full_attention
         self.rope_head_dim = rope_head_dim if rope_head_dim is not None else max(2, self.head_dim // 4)
         if self.rope_head_dim % 2 != 0:
             self.rope_head_dim += 1
@@ -146,6 +160,15 @@ class MLAAttention(nn.Module):
         else:
             attn_mask = attention_mask
             is_causal = past_key_value is None and attention_mask is None and seq_len > 1
+
+        # Bug 2 fix: apply the hybrid SWA window to MLA the same way
+        # GroupedQueryAttention does, so "full attention every N layers"
+        # (force_full_attention) is actually respected instead of every MLA
+        # layer silently running full attention regardless of the pattern.
+        if self.use_swa and not self.force_full_attention and past_key_value is None:
+            swa_mask = generate_swa_mask(seq_len, self.swa_window_size, x.device)
+            attn_mask = swa_mask if attn_mask is None else (attn_mask & swa_mask)
+            is_causal = False
 
         attn_out = F.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask,

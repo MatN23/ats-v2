@@ -151,7 +151,13 @@ class QuantizedLinear(nn.Linear):
 
             convert_to_float8_training(self)
             self._torchao_converted = True
-        return F.linear(x, self.weight, self.bias)
+        # Bug 9 fix: convert_to_float8_training patches this module to run
+        # the fp8 GEMM through torchao's own forward path. Calling
+        # F.linear(x, self.weight, self.bias) directly here bypassed that
+        # patched path and silently fell back to a full-precision matmul.
+        # Delegating to super().forward(x) uses whatever forward the
+        # conversion installed.
+        return super().forward(x)
 
 
 def make_linear(

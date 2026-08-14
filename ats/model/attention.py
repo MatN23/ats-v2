@@ -184,9 +184,13 @@ class GroupedQueryAttention(nn.Module):
         # causal/window_size flags can't express it either, so this case
         # always uses SDPA with an explicit mask regardless of
         # use_flash_attention.
-        needs_incremental_mask = (
-            past_key_value is not None and seq_len > 1 and attention_mask is None
-        )
+        # Bug 3 fix: this used to require seq_len > 1, so single-token
+        # incremental decoding (seq_len == 1, past_key_value set) fell
+        # through to the flash/SDPA branches below with no windowing applied,
+        # meaning SWA models attended to the entire KV cache instead of just
+        # the trailing window during generation. Dropping "seq_len > 1" here
+        # covers seq_len == 1 the same way as multi-token continuation.
+        needs_incremental_mask = past_key_value is not None and attention_mask is None
 
         if needs_incremental_mask:
             incremental_mask = build_incremental_causal_mask(

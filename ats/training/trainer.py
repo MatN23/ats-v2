@@ -243,10 +243,14 @@ class Trainer:
     def train_step(self, batch: Any) -> TrainingMetrics:
         batch = _move_batch_to_device(batch, self.model_engine.local_rank)
         output = self.model_engine(batch["input_ids"], attention_mask=batch.get("attention_mask"))
-        shift_logits = output.logits[..., :-1, :].contiguous()
-        shift_labels = batch["labels"][..., 1:].contiguous()
+        # Bug 12 fix: .reshape() handles non-contiguous tensors itself (it
+        # only copies when the view can't be expressed as a stride change),
+        # so the explicit .contiguous() calls before .view() were an
+        # unconditional copy that .reshape() makes unnecessary.
+        shift_logits = output.logits[..., :-1, :]
+        shift_labels = batch["labels"][..., 1:]
         ce_loss = torch.nn.functional.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1),
+            shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1),
             ignore_index=-100,
         )
         total_loss = ce_loss + output.aux_loss
@@ -285,9 +289,15 @@ class Trainer:
         # Prefer DeepSpeed's own accounting when it's actually populated
         # (e.g. under ZeRO stage 2/3 with a mixed-precision optimizer
         # wrapper); fall back to the value measured above otherwise.
-        grad_norm = float(self.model_engine.get_global_grad_norm() or 0.0)
-        if grad_norm == 0.0:
+        # Bug 7 fix: `get_global_grad_norm() or 0.0` treated a legitimate
+        # zero gradient norm the same as "not populated", silently discarding
+        # a real zero and substituting pre_step_grad_norm instead. Check
+        # for None explicitly so an actual zero is trusted.
+        grad_norm = self.model_engine.get_global_grad_norm()
+        if grad_norm is None:
             grad_norm = pre_step_grad_norm
+        else:
+            grad_norm = float(grad_norm)
 
         # fp16 (unlike bf16) uses dynamic loss scaling: DeepSpeed scales the
         # loss up before backward() and unscales before the real optimizer
@@ -376,10 +386,12 @@ class Trainer:
             for batch in self.eval_dataloader:
                 batch = _move_batch_to_device(batch, self.model_engine.local_rank)
                 output = self.model_engine(batch["input_ids"], attention_mask=batch.get("attention_mask"))
-                shift_logits = output.logits[..., :-1, :].contiguous()
-                shift_labels = batch["labels"][..., 1:].contiguous()
+                # Bug 12 fix: same .contiguous()+.view() -> .reshape() cleanup
+                # as Trainer.train_step, applied here in evaluate() too.
+                shift_logits = output.logits[..., :-1, :]
+                shift_labels = batch["labels"][..., 1:]
                 loss = torch.nn.functional.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1),
+                    shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1),
                     ignore_index=-100, reduction="sum",
                 )
                 num_valid = (shift_labels != -100).sum().item()
@@ -521,9 +533,14 @@ class DiffusionTrainer:
 
         self.model_engine.step()
 
-        grad_norm = float(self.model_engine.get_global_grad_norm() or 0.0)
-        if grad_norm == 0.0:
+        # Bug 7 fix: see Trainer.train_step -- distinguish "not populated"
+        # (None) from a legitimate zero grad norm instead of collapsing both
+        # to 0.0 via `or`.
+        grad_norm = self.model_engine.get_global_grad_norm()
+        if grad_norm is None:
             grad_norm = pre_step_grad_norm
+        else:
+            grad_norm = float(grad_norm)
 
         metrics = TrainingMetrics(
             step=self.global_step,

@@ -45,7 +45,12 @@ class RotaryEmbedding(nn.Module):
         if seq_len <= 0:
             raise ValueError(f"RotaryEmbedding requires seq_len > 0, got {seq_len}.")
         if seq_len > self._cached_seq_len:
-            self._build_cache(seq_len)
+            # Bug 11 fix: growing to exactly `seq_len` every time means
+            # incremental decoding (seq_len creeping up one token at a time)
+            # rebuilds the whole cache on every single step. Doubling
+            # instead amortizes that rebuild cost across many steps.
+            new_len = max(seq_len, self._cached_seq_len * 2 if self._cached_seq_len > 0 else seq_len)
+            self._build_cache(new_len)
         cos = self._cached_cos[:seq_len].to(device=device, dtype=dtype)
         sin = self._cached_sin[:seq_len].to(device=device, dtype=dtype)
         return cos, sin

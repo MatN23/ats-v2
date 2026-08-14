@@ -202,7 +202,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         config.peft.lora_r, config.peft.lora_alpha, config.peft.target_modules,
     )
 
-    model = ATSTransformer(config.model)
+    # Bug 4 fix: thread ep_size through from parallelism config (see
+    # ats/cli/train.py for the full explanation).
+    model = ATSTransformer(
+        config.model, ep_size=max(1, config.parallelism.gpus * config.parallelism.nodes)
+    )
     try:
         base_weights = load_model_weights_safetensors(args.checkpoint)
     except ConfigError as exc:

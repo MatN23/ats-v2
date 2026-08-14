@@ -70,9 +70,16 @@ class MambaBlock(nn.Module):
         # Causal depthwise 1D convolution over the sequence dimension, applied
         # per-channel (groups=d_inner), giving each position a short local
         # receptive field before the selective scan.
+        # Bug 14 fix: nn.Conv1d's `padding` argument is always symmetric (it
+        # cannot express a (left, right) pair), so padding=d_conv-1 padded
+        # both sides and the extra right-side output columns were computed
+        # only to be immediately thrown away by the [..., :seq_len] trim in
+        # forward(). Padding=0 here, combined with an explicit left-only
+        # F.pad(..., (d_conv - 1, 0)) in forward(), gets the same strictly
+        # causal result without the wasted right-side computation.
         self.conv1d = nn.Conv1d(
             in_channels=self.d_inner, out_channels=self.d_inner, kernel_size=d_conv,
-            groups=self.d_inner, padding=d_conv - 1, bias=True,
+            groups=self.d_inner, padding=0, bias=True,
         )
 
         # Input-dependent (selective) SSM parameters: dt, B, C are all
@@ -159,10 +166,13 @@ class MambaBlock(nn.Module):
         x_and_gate = self.in_proj(x)  # [batch, seq_len, 2*d_inner]
         x_main, gate = x_and_gate.chunk(2, dim=-1)
 
-        # Causal depthwise conv: transpose to [batch, d_inner, seq_len], pad
-        # is already causal via padding=d_conv-1 on the left+right, so trim
-        # the extra right-side outputs to keep it strictly causal.
-        x_conv = self.conv1d(x_main.transpose(1, 2))[..., :seq_len]
+        # Causal depthwise conv: transpose to [batch, d_inner, seq_len], then
+        # pad on the left only (kernel_size - 1 positions) so every output
+        # position only ever sees itself and earlier positions -- strictly
+        # causal without computing (and discarding) right-side padding.
+        x_main_t = x_main.transpose(1, 2)
+        x_main_t = F.pad(x_main_t, (self.d_conv - 1, 0))
+        x_conv = self.conv1d(x_main_t)
         x_conv = F.silu(x_conv.transpose(1, 2))  # [batch, seq_len, d_inner]
 
         # Selective parameters, input-dependent per position.

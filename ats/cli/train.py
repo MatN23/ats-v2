@@ -247,8 +247,13 @@ def apply_cli_overrides(config: ATSConfig, args: argparse.Namespace) -> ATSConfi
         )
         model_updates["checkpoint_every_n_layers"] = 1 if args.gradient_checkpointing else None
 
+    # Bug 13 fix: collect every section's update into one dict and apply it
+    # with a single top-level config.model_copy(update=...) call at the end,
+    # instead of a separate config.model_copy() per section (which built up
+    # to seven intermediate ATSConfig copies for one CLI invocation).
+    top_level_updates: dict = {}
     if model_updates:
-        config = config.model_copy(update={"model": config.model.model_copy(update=model_updates)})
+        top_level_updates["model"] = config.model.model_copy(update=model_updates)
 
     training_fields = {
         "max_steps": args.max_steps,
@@ -267,13 +272,11 @@ def apply_cli_overrides(config: ATSConfig, args: argparse.Namespace) -> ATSConfi
     }
     training_updates = {k: v for k, v in training_fields.items() if v is not None}
     if training_updates:
-        config = config.model_copy(update={"training": config.training.model_copy(update=training_updates)})
+        top_level_updates["training"] = config.training.model_copy(update=training_updates)
 
     optimizer_updates = {k: v for k, v in {"bits": args.optimizer_bits}.items() if v is not None}
     if optimizer_updates:
-        config = config.model_copy(
-            update={"optimizer": config.optimizer.model_copy(update=optimizer_updates)}
-        )
+        top_level_updates["optimizer"] = config.optimizer.model_copy(update=optimizer_updates)
 
     data_fields = {
         "seq_length": args.seq_length,
@@ -282,7 +285,7 @@ def apply_cli_overrides(config: ATSConfig, args: argparse.Namespace) -> ATSConfi
     }
     data_updates = {k: v for k, v in data_fields.items() if v is not None}
     if data_updates:
-        config = config.model_copy(update={"data": config.data.model_copy(update=data_updates)})
+        top_level_updates["data"] = config.data.model_copy(update=data_updates)
 
     parallelism_fields = {
         "strategy": args.parallelism_strategy,
@@ -291,15 +294,11 @@ def apply_cli_overrides(config: ATSConfig, args: argparse.Namespace) -> ATSConfi
     }
     parallelism_updates = {k: v for k, v in parallelism_fields.items() if v is not None}
     if parallelism_updates:
-        config = config.model_copy(
-            update={"parallelism": config.parallelism.model_copy(update=parallelism_updates)}
-        )
+        top_level_updates["parallelism"] = config.parallelism.model_copy(update=parallelism_updates)
 
     checkpoint_updates = {k: v for k, v in {"output_dir": args.output_dir}.items() if v is not None}
     if checkpoint_updates:
-        config = config.model_copy(
-            update={"checkpoint": config.checkpoint.model_copy(update=checkpoint_updates)}
-        )
+        top_level_updates["checkpoint"] = config.checkpoint.model_copy(update=checkpoint_updates)
 
     logging_fields = {
         "project_name": args.project_name,
@@ -308,7 +307,10 @@ def apply_cli_overrides(config: ATSConfig, args: argparse.Namespace) -> ATSConfi
     }
     logging_updates = {k: v for k, v in logging_fields.items() if v is not None}
     if logging_updates:
-        config = config.model_copy(update={"logging": config.logging.model_copy(update=logging_updates)})
+        top_level_updates["logging"] = config.logging.model_copy(update=logging_updates)
+
+    if top_level_updates:
+        config = config.model_copy(update=top_level_updates)
 
     # model_copy(update=...) bypasses field/model validators entirely, so we
     # force everything to be re-checked by round-tripping through
@@ -344,14 +346,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         config.model.use_moe, config.model.use_mod, config.model.use_mtp, config.model.model_type,
     )
 
-    model = ATSTransformer(config.model)
+    # Bug 4 fix: ep_size comes from parallelism.gpus/nodes on the top-level
+    # ATSConfig (ModelConfig has no parallelism field, so this can't be
+    # resolved inside ATSTransformer/TransformerBlock themselves).
+    model = ATSTransformer(
+        config.model, ep_size=max(1, config.parallelism.gpus * config.parallelism.nodes)
+    )
 
     # DeepSpeed/torchrun launchers set RANK (global) and LOCAL_RANK (per-node)
     # environment variables. We shard the data stream by global rank across
     # the full world (gpus * nodes) so every process sees a disjoint slice
     # instead of every GPU redundantly processing the same examples.
     rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
-    world_size = config.parallelism.gpus * config.parallelism.nodes
+    # Bug 5 fix: prefer the launcher's actual WORLD_SIZE (set by
+    # torchrun/DeepSpeed) over the config value. If the config and the
+    # launcher environment disagree, deriving world_size from config alone
+    # silently duplicates or drops data across ranks instead of erroring.
+    world_size = int(
+        os.environ.get("WORLD_SIZE", config.parallelism.gpus * config.parallelism.nodes)
+    )
     try:
         if rank >= world_size:
             raise ConfigError(

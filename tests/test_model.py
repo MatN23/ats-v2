@@ -672,10 +672,14 @@ def test_mamba_chunked_scan_matches_naive_sequential_reference():
 
     # Reproduce the exact same intermediate tensors MambaBlock.forward()
     # computes, so the sequential reference operates on IDENTICAL inputs.
+    # Bug 14 fix changed the conv from symmetric padding=d_conv-1 (both
+    # sides, then trim the right) to left-only F.pad + padding=0, so this
+    # reference is updated to match the new causal conv path.
     with torch.no_grad():
         x_and_gate = block.in_proj(x)
         x_main, gate = x_and_gate.chunk(2, dim=-1)
-        x_conv = block.conv1d(x_main.transpose(1, 2))[..., :seq_len]
+        x_main_t = torch.nn.functional.pad(x_main.transpose(1, 2), (d_conv - 1, 0))
+        x_conv = block.conv1d(x_main_t)
         x_conv = torch.nn.functional.silu(x_conv.transpose(1, 2))
         proj = block.x_proj(x_conv)
         B, C, dt_raw = torch.split(proj, [d_state, d_state, 1], dim=-1)

@@ -89,7 +89,11 @@ def main(argv=None) -> int:
         )
         return 1
 
-    model = ATSTransformer(config.model)
+    # Bug 4 fix: thread ep_size through from parallelism config (see
+    # ats/cli/train.py for the full explanation).
+    model = ATSTransformer(
+        config.model, ep_size=max(1, config.parallelism.gpus * config.parallelism.nodes)
+    )
     model_engine, _optimizer, _, _ = initialize_engine(model, config, micro_batch_size)
 
     checkpoint_manager = CheckpointManager(config)

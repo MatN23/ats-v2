@@ -93,7 +93,11 @@ def _ensure_hf_export(checkpoint_dir: Path, config_path: str, force: bool) -> Pa
             "cannot be exported. Fix: use --config for perplexity-mode evaluation instead."
         )
 
-    model = ATSTransformer(config.model)
+    # Bug 4 fix: thread ep_size through from parallelism config (see
+    # ats/cli/train.py for the full explanation).
+    model = ATSTransformer(
+        config.model, ep_size=max(1, config.parallelism.gpus * config.parallelism.nodes)
+    )
     model_engine, _optimizer, _, _ = initialize_engine(model, config, micro_batch_size=1)
     checkpoint_manager = CheckpointManager(config)
     checkpoint_manager.load(model_engine, str(checkpoint_dir))
@@ -132,7 +136,11 @@ def _run_perplexity_mode(config_path: str, checkpoint_dir: str, micro_batch_size
     config = load_config(config_path)
     micro_batch_size = micro_batch_size_arg if micro_batch_size_arg is not None else config.training.micro_batch_size
 
-    model = ATSTransformer(config.model)
+    # Bug 4 fix: thread ep_size through from parallelism config (see
+    # ats/cli/train.py for the full explanation).
+    model = ATSTransformer(
+        config.model, ep_size=max(1, config.parallelism.gpus * config.parallelism.nodes)
+    )
     model_engine, _optimizer, _, _ = initialize_engine(model, config, micro_batch_size)
 
     checkpoint_manager = CheckpointManager(config)

@@ -736,3 +736,107 @@ An `if isinstance(layer, MixtureOfDepths): ... else: ...` branch where both
 branches were identical — a leftover from before `MixtureOfDepths`' return
 signature was unified with every other layer type (see the earlier
 critical mod.py fix). Removed for clarity; no behavior change.
+
+## Bug-fix patch round (2026-08)
+
+This section documents a round of fixes applied to address 14 identified
+issues across the model, training, and CLI code. Verified by running the
+full test suite (`pytest tests/ -v`: 157 passed, 8 skipped — the skipped
+tests require an actual Triton/CUDA device and are unaffected by this
+patch) plus targeted end-to-end checks (gradient-checkpointed MoD backward
+pass, MLA+SWA hybrid-layer forward pass, MoD gate-bias init).
+
+### Critical bugs
+
+- **`ats/model/mod.py`** — `MixtureOfDepths.forward` accepted only
+  `(x, **block_kwargs)`, but `torch.utils.checkpoint.checkpoint` calls
+  layers positionally (`layer(x, attention_mask, past_kv, use_cache)`),
+  raising `TypeError` whenever MoD was combined with gradient checkpointing.
+  Signature now accepts `attention_mask`, `past_key_value`, `use_cache` as
+  named positional parameters.
+- **`ats/model/mla.py`, `ats/model/transformer.py`** — `MLAAttention` had
+  no `use_swa`/`swa_window_size`/`force_full_attention` parameters, so the
+  hybrid "full attention every N layers" schedule was silently ignored for
+  every MLA layer. Added the parameters to `MLAAttention.__init__`, applied
+  the SWA mask in `forward()` (mirroring `GroupedQueryAttention`), and
+  passed the config values through from `TransformerBlock.__init__`.
+- **`ats/model/attention.py`** — `needs_incremental_mask` required
+  `seq_len > 1`, so single-token incremental decoding (`seq_len == 1` with
+  a KV cache) fell through to the unwindowed path and attended to the
+  entire cache instead of the trailing SWA window. Dropped the
+  `seq_len > 1` condition so `seq_len == 1` is handled the same way as
+  multi-token continuation.
+- **`ats/model/transformer.py`, `ats/model/moe.py` call sites in
+  `ats/cli/{train,evaluate,export,finetune}.py`** — `MoELayer` was
+  constructed without `ep_size`, silently disabling expert parallelism.
+  Note: the literal fix suggested in the task spec
+  (`config.parallelism.gpus` read inside `TransformerBlock`) does not work
+  as written — `TransformerBlock`/`ATSTransformer` only ever receive a
+  `ModelConfig`, which has no `parallelism` field (that lives on the
+  top-level `ATSConfig`, and every real call site constructs
+  `ATSTransformer(config.model)`, never `ATSTransformer(config)`). Instead,
+  `ep_size` is now an explicit constructor parameter on both
+  `ATSTransformer` and `TransformerBlock` (default `1`, preserving existing
+  behavior for every caller that doesn't pass it), and the four real
+  construction sites (`train.py`, `evaluate.py` x2, `export.py`,
+  `finetune.py`) now pass
+  `ep_size=max(1, config.parallelism.gpus * config.parallelism.nodes)`
+  from the `ATSConfig` they already have in scope.
+- **`ats/cli/train.py`** — `world_size` was computed only from
+  `config.parallelism.gpus * config.parallelism.nodes`, ignoring the
+  actual launcher environment; a mismatch between config and launcher
+  silently duplicated or dropped training data across ranks. Now prefers
+  `int(os.environ.get("WORLD_SIZE", ...))`, falling back to the config
+  value only if the launcher didn't set it.
+
+### Functional bugs
+
+- **`ats/model/mod.py`** — training selected tokens via `topk`, inference
+  via `torch.quantile`; the two can disagree on ties. Inference now uses
+  `topk` as well, matching training exactly.
+- **`ats/training/trainer.py`** (`Trainer.train_step` and
+  `DiffusionTrainer.train_step`) — `float(get_global_grad_norm() or 0.0)`
+  treated a legitimate zero gradient norm identically to "not populated,"
+  silently substituting `pre_step_grad_norm` for a real zero. Now checks
+  `is None` explicitly.
+- **`ats/data/dataloader.py`** — already had the described safety
+  assertion (raises `ConfigError` on any inconsistent sequence length
+  within a batch); no change needed.
+- **`ats/model/quantization.py`** — after
+  `convert_to_float8_training(self)`, `QuantizedLinear.forward` still
+  called `F.linear(x, self.weight, self.bias)` explicitly, bypassing
+  whatever forward path the conversion installed. Now delegates to
+  `super().forward(x)` after conversion.
+- **`ats/model/mod.py`** — the gate's default `nn.Linear` init gives ~50%
+  token selection regardless of `capacity_factor`. Now initializes
+  `self.gate.bias` to `log(capacity_factor / (1 - capacity_factor))` when
+  `capacity_factor < 0.5`, so the initial selection rate starts near the
+  target capacity.
+
+### Optimizations
+
+- **`ats/model/rope.py`** — `_build_cache` rebuilt the cos/sin cache to
+  exactly `seq_len` on every extension, so incremental decoding (seq_len
+  creeping up one token at a time) rebuilt the whole cache on every step.
+  Now grows geometrically (doubling) instead.
+- **`ats/training/trainer.py`** — replaced `.contiguous().view(...)` with
+  `.reshape(...)` in the cross-entropy calls in both `Trainer.train_step`
+  and `Trainer.evaluate` (the `.contiguous()` call was an unconditional
+  copy that `.reshape()` makes unnecessary, since `.reshape()` only copies
+  when the view can't be expressed as a stride change).
+- **`ats/cli/train.py`** — `apply_cli_overrides` called
+  `config.model_copy(update=...)` once per config section (up to seven
+  times per invocation). Now collects every section's update into one
+  `top_level_updates` dict and applies it with a single top-level
+  `model_copy` call.
+- **`ats/model/mamba.py`, `tests/test_model.py`** — the causal depthwise
+  conv used symmetric `padding=d_conv-1` (both sides) and then trimmed the
+  extra right-side output columns, computing them only to discard them.
+  Note: the literal fix suggested in the task spec
+  (`padding=(d_conv - 1, 0)` passed to `nn.Conv1d`) is not valid —
+  `nn.Conv1d`'s `padding` argument is always symmetric and cannot express a
+  `(left, right)` pair. Implemented the equivalent correctly instead:
+  `padding=0` on the `Conv1d`, with an explicit left-only
+  `F.pad(x, (d_conv - 1, 0))` before it in `forward()`. Updated
+  `tests/test_mamba_chunked_scan_matches_naive_sequential_reference`'s
+  manual reproduction of the conv step to match.

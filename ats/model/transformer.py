@@ -74,7 +74,7 @@ class MambaLayer(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config: ModelConfig, layer_idx: int) -> None:
+    def __init__(self, config: ModelConfig, layer_idx: int, ep_size: int = 1) -> None:
         super().__init__()
         if not config.is_resolved():
             raise ValueError(
@@ -97,6 +97,12 @@ class TransformerBlock(nn.Module):
                 rope_theta=config.rope_theta,
                 dropout=config.dropout,
                 quantization=config.quantization,
+                # Bug 2 fix: without these, MLAAttention never learned about
+                # the hybrid SWA pattern, so use_swa/swa_full_attention_interval
+                # were silently ignored for every MLA layer.
+                use_swa=config.use_swa,
+                swa_window_size=config.swa_window_size,
+                force_full_attention=self.force_full_attention,
             )
         else:
             self.attention = GroupedQueryAttention(
@@ -122,6 +128,16 @@ class TransformerBlock(nn.Module):
                 top_k=config.moe_top_k,
                 capacity_factor=config.moe_capacity_factor,
                 load_balancing_weight=config.moe_load_balancing_weight,
+                # Bug 4 fix: without this, expert parallelism is silently
+                # disabled -- ep_size defaults to 1 inside MoELayer regardless
+                # of how many GPUs/nodes the run is actually launched on.
+                # Note: ModelConfig has no `parallelism` field (that lives on
+                # the top-level ATSConfig, which TransformerBlock never
+                # receives -- every real call site only ever constructs
+                # ATSTransformer(config.model)), so ep_size is threaded in
+                # here as an explicit constructor parameter instead, set by
+                # the caller that actually has ATSConfig.parallelism.
+                ep_size=ep_size,
                 quantization=config.quantization,
             )
             self.ffn_is_moe = True
@@ -172,7 +188,7 @@ class TransformerBlock(nn.Module):
 
 
 class ATSTransformer(nn.Module):
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, ep_size: int = 1) -> None:
         super().__init__()
         if not config.is_resolved():
             raise ValueError(
@@ -189,7 +205,7 @@ class ATSTransformer(nn.Module):
             if config.use_mamba and (layer_idx + 1) % config.mamba_every_n_layers == 0:
                 block: nn.Module = MambaLayer(config)
             else:
-                block = TransformerBlock(config, layer_idx)
+                block = TransformerBlock(config, layer_idx, ep_size=ep_size)
             if config.use_mod:
                 block = MixtureOfDepths(config.hidden_size, block, config.mod_capacity_factor)
             blocks.append(block)

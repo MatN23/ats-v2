@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install lint tools
+        run: pip install ruff
+
+      - name: Ruff check
+        run: ruff check .
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install project + type checker
+        run: |
+          pip install mypy
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then pip install -e . || true; fi
+
+      - name: Mypy
+        run: mypy ats --ignore-missing-imports
+
+  test:
+    name: Test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          pip install pytest pytest-cov
+          if [ -f pyproject.toml ]; then pip install -e . || true; fi
+
+      - name: Run tests
+        run: pytest -v --cov=ats --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 14
+
+  config-validate:
+    name: Validate example configs
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pydantic pyyaml
+          if [ -f pyproject.toml ]; then pip install -e . || true; fi
+
+      - name: Validate every YAML config under configs/ loads and passes ATSConfig validation
+        run: |
+          python - <<'PY'
+          import glob
+          import sys
+          import yaml
+
+          from ats.config.schema import ATSConfig, ConfigError
+
+          paths = glob.glob("configs/**/*.yml", recursive=True) + glob.glob("configs/**/*.yaml", recursive=True)
+          if not paths:
+              print("No config files found under configs/ -- skipping.")
+              sys.exit(0)
+
+          failed = False
+          for path in paths:
+              with open(path) as f:
+                  raw = yaml.safe_load(f)
+              try:
+                  ATSConfig(**raw)
+                  print(f"OK   {path}")
+              except ConfigError as exc:
+                  print(f"FAIL {path}: {exc}")
+                  failed = True
+
+          sys.exit(1 if failed else 0)
+          PY

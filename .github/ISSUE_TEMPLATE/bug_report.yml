@@ -1,0 +1,40 @@
+name: Bug report
+description: Something in ATS is broken or behaving unexpectedly
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including expected vs. actual behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Command run, config used (or relevant snippet), and dataset/model size if relevant.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / loss curves
+      description: Paste console output, stack traces, or a description of the loss/LR curve.
+      render: shell
+
+  - type: input
+    id: version
+    attributes:
+      label: Commit / version
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Python version, torch/deepspeed version, GPU(s), OS.

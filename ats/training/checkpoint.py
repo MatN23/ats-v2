@@ -13,7 +13,7 @@ import os
 import random
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import numpy as np
 import torch
@@ -33,7 +33,7 @@ _SAFETENSORS_FILENAME = "model.safetensors"
 def _current_rank() -> int:
     """Reads the current process's global rank from the environment (set by
     DeepSpeed/torchrun launchers), defaulting to 0 for single-process runs."""
-    return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+    return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
 
 
 def _barrier_if_distributed() -> None:
@@ -52,8 +52,8 @@ class TrainingHaltError(RuntimeError):
     """Raised when the adaptive controller forces training to stop."""
 
 
-def _capture_rng_state() -> Dict[str, Any]:
-    state: Dict[str, Any] = {
+def _capture_rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {
         "python": random.getstate(),
         "numpy": np.random.get_state(),
         "torch": torch.get_rng_state().tolist(),
@@ -63,8 +63,10 @@ def _capture_rng_state() -> Dict[str, Any]:
     return state
 
 
-def _restore_rng_state(state: Dict[str, Any]) -> None:
-    random.setstate(tuple(state["python"]) if isinstance(state["python"], list) else state["python"])
+def _restore_rng_state(state: dict[str, Any]) -> None:
+    random.setstate(
+        tuple(state["python"]) if isinstance(state["python"], list) else state["python"]
+    )
     np_state = state["numpy"]
     if isinstance(np_state, list):
         np_state = tuple(np_state)
@@ -76,7 +78,7 @@ def _restore_rng_state(state: Dict[str, Any]) -> None:
         )
 
 
-def load_model_weights_safetensors(checkpoint_dir: str) -> Dict[str, torch.Tensor]:
+def load_model_weights_safetensors(checkpoint_dir: str) -> dict[str, torch.Tensor]:
     """Loads just the model weights from a checkpoint's model.safetensors
     file, with no DeepSpeed engine and no pickle execution risk. Useful for
     export/inspection tooling that only needs weights, not optimizer state
@@ -116,8 +118,10 @@ class CheckpointManager:
         # that rank coordination is DeepSpeed's responsibility and is left
         # untouched here.
         model_engine.save_checkpoint(
-            str(self.output_dir), tag=tag,
-            client_state=client_state, save_latest=True,
+            str(self.output_dir),
+            tag=tag,
+            client_state=client_state,
+            save_latest=True,
         )
 
         # module.state_dict() must be called on EVERY rank even though only
@@ -125,15 +129,24 @@ class CheckpointManager:
         # (desharded) state dict is a collective operation that every rank
         # must participate in together, or it will hang waiting for ranks
         # that never call it.
-        module = model_engine.module if hasattr(model_engine, "module") else model_engine
-        state_dict = {k: v.detach().cpu().contiguous() for k, v in module.state_dict().items()}
+        module = (
+            model_engine.module if hasattr(model_engine, "module") else model_engine
+        )
+        state_dict = {
+            k: v.detach().cpu().contiguous() for k, v in module.state_dict().items()
+        }
 
         if rank == 0:
             state_path = ckpt_dir / _TRAINING_STATE_FILENAME
             with open(state_path, "w", encoding="utf-8") as f:
                 json.dump(
-                    {"global_step": global_step, "epoch": epoch, "config_hash": self.config.config_hash()},
-                    f, indent=2,
+                    {
+                        "global_step": global_step,
+                        "epoch": epoch,
+                        "config_hash": self.config.config_hash(),
+                    },
+                    f,
+                    indent=2,
                 )
 
             # Write a copy of the resolved config alongside the checkpoint so
@@ -158,7 +171,7 @@ class CheckpointManager:
         _barrier_if_distributed()
         return ckpt_dir
 
-    def load(self, model_engine: Any, checkpoint_dir: str) -> Dict[str, Any]:
+    def load(self, model_engine: Any, checkpoint_dir: str) -> dict[str, Any]:
         checkpoint_path = Path(checkpoint_dir)
         if not checkpoint_path.exists():
             raise ConfigError(
@@ -188,7 +201,9 @@ class CheckpointManager:
             )
 
         _restore_rng_state(client_state["rng_state"])
-        logger.info("Resumed from %s at step %d", checkpoint_path, client_state["global_step"])
+        logger.info(
+            "Resumed from %s at step %d", checkpoint_path, client_state["global_step"]
+        )
         return client_state
 
     def _prune_old_checkpoints(self) -> None:
@@ -198,6 +213,6 @@ class CheckpointManager:
             key=lambda p: int(p.name.split("_")[1]),
         )
         excess = len(step_dirs) - keep_n
-        for old_dir in step_dirs[:max(0, excess)]:
+        for old_dir in step_dirs[: max(0, excess)]:
             logger.info("Pruning old checkpoint %s", old_dir)
             shutil.rmtree(old_dir, ignore_errors=False)

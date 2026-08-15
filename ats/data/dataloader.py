@@ -3,7 +3,7 @@ collator. Padding/attention-mask/labels handling lives entirely here."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any
 
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
@@ -28,12 +28,17 @@ class _TorchMixedDataset(IterableDataset):
     slice of the same deterministic stream."""
 
     def __init__(
-        self, mixed_dataset: MixedDataset, rank: int = 0, world_size: int = 1,
+        self,
+        mixed_dataset: MixedDataset,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         if world_size < 1:
             raise ConfigError(f"world_size must be >= 1, got {world_size}.")
         if not 0 <= rank < world_size:
-            raise ConfigError(f"rank must be in [0, world_size), got rank={rank}, world_size={world_size}.")
+            raise ConfigError(
+                f"rank must be in [0, world_size), got rank={rank}, world_size={world_size}."
+            )
         self.mixed_dataset = mixed_dataset
         self.rank = rank
         self.world_size = world_size
@@ -55,7 +60,7 @@ class _TorchMixedDataset(IterableDataset):
                 yield example
 
 
-def _collate(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+def _collate(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
     if not batch:
         raise ConfigError("collate_fn received an empty batch.")
     seq_len = len(batch[0]["input_ids"])
@@ -95,11 +100,16 @@ def build_dataloader(
     # stream survived, for an effective 87.5% data loss). Use the same seed
     # for every rank and let the modulo-based sharding do all the work.
     mixed_dataset = MixedDataset(
-        sources=data_config.sources, tokenizer=tokenizer,
-        seq_length=data_config.seq_length, seed=seed,
+        sources=data_config.sources,
+        tokenizer=tokenizer,
+        seq_length=data_config.seq_length,
+        seed=seed,
     )
     torch_dataset = _TorchMixedDataset(mixed_dataset, rank=rank, world_size=world_size)
 
     return DataLoader(
-        torch_dataset, batch_size=batch_size, collate_fn=_collate, num_workers=num_workers,
+        torch_dataset,
+        batch_size=batch_size,
+        collate_fn=_collate,
+        num_workers=num_workers,
     )

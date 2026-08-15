@@ -6,7 +6,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Union
+from typing import Any
 
 import yaml
 from pydantic import ValidationError
@@ -20,7 +20,8 @@ _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:-[^}]*)?\}")
 def _substitute_env_vars(value: Any) -> Any:
     """Recursively replace ${VAR} / ${VAR:-default} in strings within a nested structure."""
     if isinstance(value, str):
-        def _replace(match: "re.Match[str]") -> str:
+
+        def _replace(match: re.Match[str]) -> str:
             var_name = match.group(1)
             default = match.group(2)
             if var_name in os.environ:
@@ -32,6 +33,7 @@ def _substitute_env_vars(value: Any) -> Any:
                 f"set and has no default. Fix: export {var_name}=<value>, or use "
                 f"'${{{var_name}:-<default>}}' syntax in the YAML."
             )
+
         return _ENV_VAR_PATTERN.sub(_replace, value)
     if isinstance(value, dict):
         return {k: _substitute_env_vars(v) for k, v in value.items()}
@@ -40,7 +42,7 @@ def _substitute_env_vars(value: Any) -> Any:
     return value
 
 
-def _read_raw(path: Path) -> Dict[str, Any]:
+def _read_raw(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise ConfigError(
             f"Config file not found: {path}. "
@@ -70,7 +72,7 @@ def _read_raw(path: Path) -> Dict[str, Any]:
     return raw
 
 
-def load_config(path: Union[str, Path]) -> ATSConfig:
+def load_config(path: str | Path) -> ATSConfig:
     """Load, env-substitute, validate, and auto-tune a config file into an ATSConfig."""
     path = Path(path)
     raw = _read_raw(path)

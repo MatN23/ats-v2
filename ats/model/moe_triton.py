@@ -22,14 +22,13 @@ means routing decisions, not the full dispatch pipeline.
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import torch
 import torch.nn.functional as F
 
 try:
     import triton
     import triton.language as tl
+
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
@@ -41,8 +40,11 @@ if HAS_TRITON:
 
     @triton.jit
     def _moe_routing_kernel(
-        logits_ptr, top_k_probs_ptr, top_k_idx_ptr,
-        num_experts, top_k: tl.constexpr,
+        logits_ptr,
+        top_k_probs_ptr,
+        top_k_idx_ptr,
+        num_experts,
+        top_k: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         row_idx = tl.program_id(0)
@@ -50,7 +52,9 @@ if HAS_TRITON:
         mask = col_offsets < num_experts
 
         row_start = row_idx * num_experts
-        logits = tl.load(logits_ptr + row_start + col_offsets, mask=mask, other=-float("inf"))
+        logits = tl.load(
+            logits_ptr + row_start + col_offsets, mask=mask, other=-float("inf")
+        )
 
         row_max = tl.max(logits, axis=0)
         shifted = logits - row_max
@@ -70,7 +74,9 @@ if HAS_TRITON:
         for k in tl.static_range(top_k):
             best_val = tl.max(remaining, axis=0)
             best_idx = tl.argmax(remaining, axis=0)
-            selected_probs = tl.where(tl.arange(0, top_k) == k, best_val, selected_probs)
+            selected_probs = tl.where(
+                tl.arange(0, top_k) == k, best_val, selected_probs
+            )
             selected_idx = tl.where(tl.arange(0, top_k) == k, best_idx, selected_idx)
             raw_sum += best_val
             remaining = tl.where(col_offsets == best_idx, -1.0, remaining)
@@ -81,7 +87,9 @@ if HAS_TRITON:
         tl.store(top_k_probs_ptr + out_row_start + out_offsets, normalized)
         tl.store(top_k_idx_ptr + out_row_start + out_offsets, selected_idx)
 
-    def _triton_moe_routing(gate_logits: torch.Tensor, top_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _triton_moe_routing(
+        gate_logits: torch.Tensor, top_k: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if top_k > _MAX_SUPPORTED_TOP_K:
             raise ValueError(
                 f"Triton MoE routing kernel supports top_k <= {_MAX_SUPPORTED_TOP_K} "
@@ -90,25 +98,38 @@ if HAS_TRITON:
             )
         num_tokens, num_experts = gate_logits.shape
         gate_logits = gate_logits.contiguous()
-        top_k_probs = torch.empty((num_tokens, top_k), device=gate_logits.device, dtype=torch.float32)
-        top_k_idx = torch.empty((num_tokens, top_k), device=gate_logits.device, dtype=torch.int32)
+        top_k_probs = torch.empty(
+            (num_tokens, top_k), device=gate_logits.device, dtype=torch.float32
+        )
+        top_k_idx = torch.empty(
+            (num_tokens, top_k), device=gate_logits.device, dtype=torch.int32
+        )
 
         block_size = triton.next_power_of_2(num_experts)
         grid = (num_tokens,)
         _moe_routing_kernel[grid](
-            gate_logits, top_k_probs, top_k_idx, num_experts, top_k, BLOCK_SIZE=block_size,
+            gate_logits,
+            top_k_probs,
+            top_k_idx,
+            num_experts,
+            top_k,
+            BLOCK_SIZE=block_size,
         )
         return top_k_probs, top_k_idx.long()
 
 
-def _pytorch_moe_routing(gate_logits: torch.Tensor, top_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def _pytorch_moe_routing(
+    gate_logits: torch.Tensor, top_k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     router_probs = F.softmax(gate_logits, dim=-1)
     top_k_probs, top_k_idx = torch.topk(router_probs, top_k, dim=-1)
     top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
     return top_k_probs, top_k_idx
 
 
-def fused_moe_routing(gate_logits: torch.Tensor, top_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def fused_moe_routing(
+    gate_logits: torch.Tensor, top_k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Returns (top_k_probs, top_k_idx) -- softmax + top-k expert selection,
     fused into one Triton kernel per token row when available and running
     on CUDA with top_k small enough for the unrolled kernel; otherwise the
@@ -126,8 +147,11 @@ def fused_moe_routing(gate_logits: torch.Tensor, top_k: int) -> Tuple[torch.Tens
 
 
 def fused_moe_dispatch(
-    gate_logits: torch.Tensor, hidden_states: torch.Tensor, top_k: int, capacity_factor: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    gate_logits: torch.Tensor,
+    hidden_states: torch.Tensor,
+    top_k: int,
+    capacity_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Convenience wrapper matching the spec's requested signature: computes
     fused routing (see fused_moe_routing) and the per-expert capacity limit
     for the given tokens/capacity_factor. Returns (top_k_probs, top_k_idx);
@@ -140,5 +164,7 @@ def fused_moe_dispatch(
             f"gate_logits has {gate_logits.shape[0]}; they must match."
         )
     if capacity_factor <= 0:
-        raise ValueError(f"fused_moe_dispatch requires capacity_factor > 0, got {capacity_factor}.")
+        raise ValueError(
+            f"fused_moe_dispatch requires capacity_factor > 0, got {capacity_factor}."
+        )
     return fused_moe_routing(gate_logits, top_k)

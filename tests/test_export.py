@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 
 import pytest
-import torch
 
 from ats.config.schema import ConfigError, ModelConfig
 from ats.export.huggingface import export_to_huggingface
@@ -14,21 +13,29 @@ from ats.model.transformer import ATSTransformer
 
 try:
     import safetensors  # noqa: F401
+
     _SAFETENSORS_AVAILABLE = True
 except ImportError:
     _SAFETENSORS_AVAILABLE = False
 
 
 def _dense_config(**overrides) -> ModelConfig:
-    base = dict(
-        hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2,
-        intermediate_size=64, vocab_size=50, max_seq_len=32,
-    )
+    base = {
+        "hidden_size": 32,
+        "num_layers": 2,
+        "num_heads": 4,
+        "num_kv_heads": 2,
+        "intermediate_size": 64,
+        "vocab_size": 50,
+        "max_seq_len": 32,
+    }
     base.update(overrides)
     return ModelConfig(**base)
 
 
-@pytest.mark.skipif(not _SAFETENSORS_AVAILABLE, reason="safetensors not installed in this environment")
+@pytest.mark.skipif(
+    not _SAFETENSORS_AVAILABLE, reason="safetensors not installed in this environment"
+)
 def test_dense_export_creates_expected_files(tmp_path):
     config = _dense_config()
     model = ATSTransformer(config)
@@ -44,7 +51,9 @@ def test_dense_export_creates_expected_files(tmp_path):
     assert hf_config["architectures"] == ["LlamaForCausalLM"]
 
 
-@pytest.mark.skipif(not _SAFETENSORS_AVAILABLE, reason="safetensors not installed in this environment")
+@pytest.mark.skipif(
+    not _SAFETENSORS_AVAILABLE, reason="safetensors not installed in this environment"
+)
 def test_swa_export_includes_sliding_window(tmp_path):
     config = _dense_config(use_swa=True, swa_window_size=128)
     model = ATSTransformer(config)
@@ -96,7 +105,9 @@ def test_diffusion_export_raises(tmp_path):
         export_to_huggingface(model, config, str(tmp_path / "exported_diffusion"))
 
 
-@pytest.mark.skipif(not _SAFETENSORS_AVAILABLE, reason="safetensors not installed in this environment")
+@pytest.mark.skipif(
+    not _SAFETENSORS_AVAILABLE, reason="safetensors not installed in this environment"
+)
 def test_export_writes_model_card(tmp_path):
     config = _dense_config(use_swa=True, swa_window_size=64)
     model = ATSTransformer(config)
@@ -112,6 +123,8 @@ def test_export_writes_model_card(tmp_path):
     # a different hidden_size must produce a different card.
     other_config = _dense_config(hidden_size=64, use_swa=True, swa_window_size=64)
     other_model = ATSTransformer(other_config)
-    other_out_dir = export_to_huggingface(other_model, other_config, str(tmp_path / "exported_card_2"))
+    other_out_dir = export_to_huggingface(
+        other_model, other_config, str(tmp_path / "exported_card_2")
+    )
     other_content = (other_out_dir / "README.md").read_text()
     assert content != other_content

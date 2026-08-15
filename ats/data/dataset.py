@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import json
 import random
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Literal, Optional, Tuple
+from typing import Any, Literal
 
 import numpy as np
 
@@ -54,7 +55,7 @@ def _iter_local_jsonl(path: Path) -> Iterator[str]:
             yield record["text"]
 
 
-def _load_preprocessed_meta(bin_path: Path) -> Dict[str, Any]:
+def _load_preprocessed_meta(bin_path: Path) -> dict[str, Any]:
     meta_path = bin_path.parent / PREPROCESSED_META_FILENAME
     if not meta_path.exists():
         raise ConfigError(
@@ -66,7 +67,9 @@ def _load_preprocessed_meta(bin_path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
-def _iter_preprocessed_examples(bin_path: Path, expected_seq_length: int) -> Iterator[Dict[str, Any]]:
+def _iter_preprocessed_examples(
+    bin_path: Path, expected_seq_length: int
+) -> Iterator[dict[str, Any]]:
     meta = _load_preprocessed_meta(bin_path)
     if meta["seq_length"] != expected_seq_length:
         raise ConfigError(
@@ -78,10 +81,17 @@ def _iter_preprocessed_examples(bin_path: Path, expected_seq_length: int) -> Ite
     num_blocks = meta["num_blocks"]
     seq_length = meta["seq_length"]
 
-    tokens = np.memmap(bin_path, dtype=PREPROCESSED_TOKEN_DTYPE, mode="r", shape=(num_blocks, seq_length))
+    tokens = np.memmap(
+        bin_path,
+        dtype=PREPROCESSED_TOKEN_DTYPE,
+        mode="r",
+        shape=(num_blocks, seq_length),
+    )
     valid_lengths_path = bin_path.parent / "valid_lengths.npy"
     if not valid_lengths_path.exists():
-        raise ConfigError(f"Preprocessed source {bin_path} is missing valid_lengths.npy.")
+        raise ConfigError(
+            f"Preprocessed source {bin_path} is missing valid_lengths.npy."
+        )
     valid_lengths = np.load(valid_lengths_path)
     if len(valid_lengths) != num_blocks:
         raise ConfigError(
@@ -98,7 +108,7 @@ def _iter_preprocessed_examples(bin_path: Path, expected_seq_length: int) -> Ite
         yield {"input_ids": block, "labels": labels}
 
 
-def _resolve_source(source: DataSource) -> Tuple[SourceKind, Iterator[Any]]:
+def _resolve_source(source: DataSource) -> tuple[SourceKind, Path | Iterator[Any]]:
     path = Path(source.path)
     if path.suffix == ".bin":
         if not path.exists():
@@ -106,7 +116,10 @@ def _resolve_source(source: DataSource) -> Tuple[SourceKind, Iterator[Any]]:
                 f"data source path does not exist: {path}. "
                 f"Fix: check data.sources[*].path in your config, or run preprocess.py first."
             )
-        return "preprocessed", path  # actual iterator built later once seq_length is known
+        return (
+            "preprocessed",
+            path,
+        )  # actual iterator built later once seq_length is known
     if path.suffix in (".jsonl", ".json"):
         if not path.exists():
             raise ConfigError(
@@ -131,12 +144,18 @@ class MixedDataset:
     already-fixed-length blocks via numpy memmap."""
 
     def __init__(
-        self, sources: List[DataSource], tokenizer: Tokenizer, seq_length: int, seed: int = 42,
+        self,
+        sources: list[DataSource],
+        tokenizer: Tokenizer,
+        seq_length: int,
+        seed: int = 42,
     ) -> None:
         if not sources:
             raise ConfigError("MixedDataset requires at least one source.")
         if seq_length <= 0:
-            raise ConfigError(f"MixedDataset seq_length must be positive, got {seq_length}.")
+            raise ConfigError(
+                f"MixedDataset seq_length must be positive, got {seq_length}."
+            )
         self.sources = sources
         self.tokenizer = tokenizer
         self.seq_length = seq_length
@@ -144,19 +163,25 @@ class MixedDataset:
         total_weight = sum(s.weight for s in sources)
         self._probs = [s.weight / total_weight for s in sources]
 
-    def __iter__(self) -> Iterator[Dict[str, Any]]:
+    def __iter__(self) -> Iterator[dict[str, Any]]:
         rng = random.Random(self.seed)
-        kinds: List[SourceKind] = []
-        source_iters: List[Iterator[Any]] = []
+        kinds: list[SourceKind] = []
+        source_iters: list[Iterator[Any]] = []
         for s in self.sources:
             kind, payload = _resolve_source(s)
             kinds.append(kind)
-            if kind == "preprocessed":
-                source_iters.append(_iter_preprocessed_examples(payload, self.seq_length))
+            # kind == "preprocessed" and isinstance(payload, Path) always
+            # agree (see _resolve_source), but mypy can't correlate two
+            # separately-unpacked variables from a discriminated union, so
+            # narrow on payload's own type directly.
+            if isinstance(payload, Path):
+                source_iters.append(
+                    _iter_preprocessed_examples(payload, self.seq_length)
+                )
             else:
                 source_iters.append(payload)
 
-        buffer: List[int] = []
+        buffer: list[int] = []
         active = list(range(len(self.sources)))
 
         while active:
@@ -180,7 +205,7 @@ class MixedDataset:
 
             while len(buffer) >= self.seq_length:
                 chunk = buffer[: self.seq_length]
-                buffer = buffer[self.seq_length:]
+                buffer = buffer[self.seq_length :]
                 yield self._make_example(chunk, is_padded=False)
 
         if buffer:
@@ -191,8 +216,11 @@ class MixedDataset:
             yield self._make_example(padded, is_padded=True, valid_len=len(buffer))
 
     def _make_example(
-        self, chunk: List[int], is_padded: bool, valid_len: Optional[int] = None,
-    ) -> Dict[str, Any]:
+        self,
+        chunk: list[int],
+        is_padded: bool,
+        valid_len: int | None = None,
+    ) -> dict[str, Any]:
         labels = list(chunk)
         if is_padded:
             valid_len = valid_len if valid_len is not None else len(chunk)

@@ -24,7 +24,6 @@ import subprocess
 import sys
 import traceback
 from pathlib import Path
-from typing import List, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -39,7 +38,7 @@ def _print_header(title: str) -> None:
     print(f"\n{'=' * 60}\n{title}\n{'=' * 60}")
 
 
-def check_imports() -> List[str]:
+def check_imports() -> list[str]:
     """Imports every module under ats/. Returns a list of failure messages
     (empty if everything imported cleanly)."""
     _print_header("1. Importing every module under ats/")
@@ -66,7 +65,7 @@ def check_imports() -> List[str]:
     return failures
 
 
-def check_model_instantiation() -> List[str]:
+def check_model_instantiation() -> list[str]:
     """Instantiates ATSTransformer with a tiny config and runs a real
     forward + backward pass. Returns a list of failure messages."""
     _print_header("2. Instantiating models and running forward/backward passes")
@@ -80,46 +79,123 @@ def check_model_instantiation() -> List[str]:
     except ImportError as exc:
         return [f"Cannot run model checks: {exc}. Run `pip install -e .` first."]
 
-    checks: List[Tuple[str, ModelConfig]] = [
-        ("dense", ModelConfig(
-            hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2,
-            intermediate_size=64, vocab_size=50, max_seq_len=32, use_flash_attention=False,
-        )),
-        ("swa", ModelConfig(
-            hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2,
-            intermediate_size=64, vocab_size=50, max_seq_len=32, use_flash_attention=False,
-            use_swa=True, swa_window_size=4,
-        )),
-        ("mla", ModelConfig(
-            hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2,
-            intermediate_size=64, vocab_size=50, max_seq_len=32,
-            use_mla=True, mla_latent_dim=8,
-        )),
-        ("moe", ModelConfig(
-            hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2,
-            intermediate_size=64, vocab_size=50, max_seq_len=32, use_flash_attention=False,
-            use_moe=True, num_experts=4, moe_top_k=2,
-        )),
-        ("mod", ModelConfig(
-            hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2,
-            intermediate_size=64, vocab_size=50, max_seq_len=32, use_flash_attention=False,
-            use_mod=True,
-        )),
-        ("mamba", ModelConfig(
-            hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2,
-            intermediate_size=64, vocab_size=50, max_seq_len=32, use_flash_attention=False,
-            use_mamba=True, mamba_every_n_layers=1,
-        )),
-        ("mtp", ModelConfig(
-            hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2,
-            intermediate_size=64, vocab_size=50, max_seq_len=32, use_flash_attention=False,
-            use_mtp=True, mtp_num_tokens=2,
-        )),
-        ("int8_quantization", ModelConfig(
-            hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2,
-            intermediate_size=64, vocab_size=50, max_seq_len=32, use_flash_attention=False,
-            quantization="int8",
-        )),
+    checks: list[tuple[str, ModelConfig]] = [
+        (
+            "dense",
+            ModelConfig(
+                hidden_size=32,
+                num_layers=2,
+                num_heads=4,
+                num_kv_heads=2,
+                intermediate_size=64,
+                vocab_size=50,
+                max_seq_len=32,
+                use_flash_attention=False,
+            ),
+        ),
+        (
+            "swa",
+            ModelConfig(
+                hidden_size=32,
+                num_layers=2,
+                num_heads=4,
+                num_kv_heads=2,
+                intermediate_size=64,
+                vocab_size=50,
+                max_seq_len=32,
+                use_flash_attention=False,
+                use_swa=True,
+                swa_window_size=4,
+            ),
+        ),
+        (
+            "mla",
+            ModelConfig(
+                hidden_size=32,
+                num_layers=2,
+                num_heads=4,
+                num_kv_heads=2,
+                intermediate_size=64,
+                vocab_size=50,
+                max_seq_len=32,
+                use_mla=True,
+                mla_latent_dim=8,
+            ),
+        ),
+        (
+            "moe",
+            ModelConfig(
+                hidden_size=32,
+                num_layers=2,
+                num_heads=4,
+                num_kv_heads=2,
+                intermediate_size=64,
+                vocab_size=50,
+                max_seq_len=32,
+                use_flash_attention=False,
+                use_moe=True,
+                num_experts=4,
+                moe_top_k=2,
+            ),
+        ),
+        (
+            "mod",
+            ModelConfig(
+                hidden_size=32,
+                num_layers=2,
+                num_heads=4,
+                num_kv_heads=2,
+                intermediate_size=64,
+                vocab_size=50,
+                max_seq_len=32,
+                use_flash_attention=False,
+                use_mod=True,
+            ),
+        ),
+        (
+            "mamba",
+            ModelConfig(
+                hidden_size=32,
+                num_layers=2,
+                num_heads=4,
+                num_kv_heads=2,
+                intermediate_size=64,
+                vocab_size=50,
+                max_seq_len=32,
+                use_flash_attention=False,
+                use_mamba=True,
+                mamba_every_n_layers=1,
+            ),
+        ),
+        (
+            "mtp",
+            ModelConfig(
+                hidden_size=32,
+                num_layers=2,
+                num_heads=4,
+                num_kv_heads=2,
+                intermediate_size=64,
+                vocab_size=50,
+                max_seq_len=32,
+                use_flash_attention=False,
+                use_mtp=True,
+                mtp_num_tokens=2,
+            ),
+        ),
+        (
+            "int8_quantization",
+            ModelConfig(
+                hidden_size=32,
+                num_layers=2,
+                num_heads=4,
+                num_kv_heads=2,
+                intermediate_size=64,
+                vocab_size=50,
+                max_seq_len=32,
+                use_flash_attention=False,
+                quantization="int8",
+            ),
+        ),
     ]
 
     for name, config in checks:
@@ -131,25 +207,32 @@ def check_model_instantiation() -> List[str]:
             loss.backward()
             grad_found = any(p.grad is not None for p in model.parameters())
             if not grad_found:
-                raise RuntimeError("backward() ran but no parameter received a gradient")
-            print(f"  OK   {name}: forward+backward pass succeeded, logits shape {tuple(output.logits.shape)}")
+                raise RuntimeError(
+                    "backward() ran but no parameter received a gradient"
+                )
+            print(
+                f"  OK   {name}: forward+backward pass succeeded, logits shape {tuple(output.logits.shape)}"
+            )
         except Exception as exc:  # noqa: BLE001 -- same rationale as check_imports:
             # this check exists specifically to surface any failure across
             # every architecture combination, captured and reported below.
             print(f"  FAIL {name}: {exc}")
-            failures.append(f"model instantiation ({name}): {exc}\n{traceback.format_exc()}")
+            failures.append(
+                f"model instantiation ({name}): {exc}\n{traceback.format_exc()}"
+            )
 
     return failures
 
 
-def check_pytest() -> List[str]:
+def check_pytest() -> list[str]:
     """Runs `pytest tests/` as a subprocess. Returns a list with one entry
     describing the failure if pytest's exit code is non-zero."""
     _print_header("3. Running pytest tests/")
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pytest", "tests/", "-v"],
-            cwd=str(REPO_ROOT), check=False,
+            cwd=str(REPO_ROOT),
+            check=False,
         )
     except FileNotFoundError as exc:
         return [f"Could not run pytest: {exc}. Is pytest installed?"]
@@ -160,7 +243,7 @@ def check_pytest() -> List[str]:
 
 
 def main() -> int:
-    all_failures: List[str] = []
+    all_failures: list[str] = []
     all_failures.extend(check_imports())
     all_failures.extend(check_model_instantiation())
     all_failures.extend(check_pytest())

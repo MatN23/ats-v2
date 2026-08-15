@@ -22,22 +22,37 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Export an ats-v2 checkpoint to a downstream format.",
     )
-    parser.add_argument("--checkpoint", required=True, help="Checkpoint directory, e.g. checkpoints/run/step_10000.")
-    parser.add_argument("--output_dir", required=True, help="Directory to write the exported model to.")
     parser.add_argument(
-        "--format", choices=["huggingface"], default="huggingface",
+        "--checkpoint",
+        required=True,
+        help="Checkpoint directory, e.g. checkpoints/run/step_10000.",
+    )
+    parser.add_argument(
+        "--output_dir", required=True, help="Directory to write the exported model to."
+    )
+    parser.add_argument(
+        "--format",
+        choices=["huggingface"],
+        default="huggingface",
         help="Export target format. Only 'huggingface' is currently supported.",
     )
     parser.add_argument(
-        "--config", default=None,
+        "--config",
+        default=None,
         help="Config file used for the original training run. If omitted, "
-             "ats looks for a sibling 'config.yaml' next to the checkpoint.",
+        "ats looks for a sibling 'config.yaml' next to the checkpoint.",
     )
-    parser.add_argument("--tokenizer_dir", default=None, help="Directory of tokenizer files to copy alongside the export.")
     parser.add_argument(
-        "--micro-batch-size", type=int, default=None,
+        "--tokenizer_dir",
+        default=None,
+        help="Directory of tokenizer files to copy alongside the export.",
+    )
+    parser.add_argument(
+        "--micro-batch-size",
+        type=int,
+        default=None,
         help="Per-GPU micro batch size used only to initialize the DeepSpeed engine for "
-             "loading the checkpoint. Overrides training.micro_batch_size if given.",
+        "loading the checkpoint. Overrides training.micro_batch_size if given.",
     )
     return parser.parse_args(argv)
 
@@ -76,7 +91,9 @@ def main(argv=None) -> int:
         return 1
 
     micro_batch_size = (
-        args.micro_batch_size if args.micro_batch_size is not None else config.training.micro_batch_size
+        args.micro_batch_size
+        if args.micro_batch_size is not None
+        else config.training.micro_batch_size
     )
 
     if config.model.use_mla:
@@ -105,7 +122,9 @@ def main(argv=None) -> int:
 
     try:
         output_path = export_to_huggingface(
-            model=model_engine.module if hasattr(model_engine, "module") else model_engine,
+            model=model_engine.module
+            if hasattr(model_engine, "module")
+            else model_engine,
             model_config=config.model,
             output_dir=args.output_dir,
             tokenizer_dir=args.tokenizer_dir,

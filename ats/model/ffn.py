@@ -4,16 +4,19 @@ the elementwise ops automatically when the model is compiled."""
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
-from ats.model.quantization import make_linear
+from ats.model.quantization import QuantizationMode, make_linear
 
 
 class SwiGLU(nn.Module):
     def __init__(
-        self, hidden_size: int, intermediate_size: int, dropout: float = 0.0,
-        quantization: str = "none",
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        dropout: float = 0.0,
+        quantization: QuantizationMode = "none",
     ) -> None:
         super().__init__()
         if hidden_size <= 0 or intermediate_size <= 0:
@@ -23,8 +26,12 @@ class SwiGLU(nn.Module):
             )
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
-        self.gate_up_proj = make_linear(hidden_size, 2 * intermediate_size, quantization, bias=False)
-        self.down_proj = make_linear(intermediate_size, hidden_size, quantization, bias=False)
+        self.gate_up_proj = make_linear(
+            hidden_size, 2 * intermediate_size, quantization, bias=False
+        )
+        self.down_proj = make_linear(
+            intermediate_size, hidden_size, quantization, bias=False
+        )
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

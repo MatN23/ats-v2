@@ -5,18 +5,18 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import cast
 
 import torch
-import torch.nn as nn
 import torch.utils.checkpoint
+from torch import nn
 
 from ats.config.schema import ModelConfig
 from ats.model.attention import GroupedQueryAttention, PastKeyValue
 from ats.model.ffn import SwiGLU
 from ats.model.initialization import init_residual_projection, init_weights
-from ats.model.mla import MLAAttention
 from ats.model.mamba import MambaBlock
+from ats.model.mla import MLAAttention
 from ats.model.mod import MixtureOfDepths
 from ats.model.moe import MoELayer
 from ats.model.mtp import MultiTokenPredictionHead
@@ -28,9 +28,9 @@ from ats.model.swa import is_full_attention_layer
 class TransformerOutput:
     logits: torch.Tensor
     aux_loss: torch.Tensor
-    past_key_values: Optional[List[Optional[PastKeyValue]]] = None
-    mtp_logits: Optional[List[torch.Tensor]] = None
-    expert_utilization: Optional[Dict[int, float]] = None
+    past_key_values: list[PastKeyValue | None] | None = None
+    mtp_logits: list[torch.Tensor] | None = None
+    expert_utilization: dict[int, float] | None = None
 
 
 class MambaLayer(nn.Module):
@@ -44,9 +44,14 @@ class MambaLayer(nn.Module):
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        self.input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # MambaLayer is only ever constructed from ATSTransformer.__init__,
+        # after that constructor's own is_resolved() check, but mypy can't
+        # see across that call boundary -- narrow again here.
+        assert config.hidden_size is not None
+        hidden_size: int = config.hidden_size
+        self.input_norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
         self.mamba = MambaBlock(
-            hidden_size=config.hidden_size,
+            hidden_size=hidden_size,
             d_state=config.mamba_d_state,
             d_conv=config.mamba_d_conv,
             expand=config.mamba_expand,
@@ -56,10 +61,10 @@ class MambaLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[PastKeyValue] = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_value: PastKeyValue | None = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[PastKeyValue]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, PastKeyValue | None]:
         if past_key_value is not None:
             raise ValueError(
                 "MambaLayer does not support KV-cache-based incremental decoding in "
@@ -81,7 +86,21 @@ class TransformerBlock(nn.Module):
                 "TransformerBlock received an unresolved ModelConfig (architecture "
                 "fields are None). Call ats.config.defaults.apply_size_preset() first."
             )
-        self.input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # is_resolved() guarantees these are not None at runtime, but mypy
+        # can't narrow a mutable pydantic attribute across the rest of this
+        # function from a boolean method call, so bind narrowed locals here.
+        assert config.hidden_size is not None
+        assert config.num_layers is not None
+        assert config.num_heads is not None
+        assert config.num_kv_heads is not None
+        assert config.intermediate_size is not None
+        hidden_size: int = config.hidden_size
+        num_layers: int = config.num_layers
+        num_heads: int = config.num_heads
+        num_kv_heads: int = config.num_kv_heads
+        intermediate_size: int = config.intermediate_size
+
+        self.input_norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
         self.uses_mla = config.use_mla
         self.force_full_attention = config.use_swa and is_full_attention_layer(
@@ -90,8 +109,8 @@ class TransformerBlock(nn.Module):
 
         if config.use_mla:
             self.attention: nn.Module = MLAAttention(
-                hidden_size=config.hidden_size,
-                num_heads=config.num_heads,
+                hidden_size=hidden_size,
+                num_heads=num_heads,
                 latent_dim=config.resolved_mla_latent_dim,
                 max_seq_len=config.max_seq_len,
                 rope_theta=config.rope_theta,
@@ -106,9 +125,9 @@ class TransformerBlock(nn.Module):
             )
         else:
             self.attention = GroupedQueryAttention(
-                hidden_size=config.hidden_size,
-                num_heads=config.num_heads,
-                num_kv_heads=config.num_kv_heads,
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
                 max_seq_len=config.max_seq_len,
                 rope_theta=config.rope_theta,
                 dropout=config.dropout,
@@ -117,14 +136,14 @@ class TransformerBlock(nn.Module):
                 swa_window_size=config.swa_window_size,
                 quantization=config.quantization,
             )
-        self.post_attention_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
         if config.use_moe:
             self.ffn: nn.Module = MoELayer(
-                hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
                 num_experts=config.num_experts,
-                num_layers=config.num_layers,
+                num_layers=num_layers,
                 top_k=config.moe_top_k,
                 capacity_factor=config.moe_capacity_factor,
                 load_balancing_weight=config.moe_load_balancing_weight,
@@ -143,14 +162,22 @@ class TransformerBlock(nn.Module):
             self.ffn_is_moe = True
         else:
             self.ffn = SwiGLU(
-                config.hidden_size, config.intermediate_size, config.dropout,
+                hidden_size,
+                intermediate_size,
+                config.dropout,
                 quantization=config.quantization,
             )
             self.ffn_is_moe = False
 
-        init_residual_projection(self.attention.o_proj, config.num_layers)
+        # self.attention/self.ffn are declared as plain nn.Module (they can
+        # hold different concrete types depending on config), so mypy falls
+        # back to nn.Module.__getattr__'s generic Tensor|Module return type
+        # for .o_proj/.down_proj here. Both concrete types actually assign
+        # these via ats.model.quantization.make_linear(), which returns
+        # nn.Linear, so the cast is accurate, not a workaround.
+        init_residual_projection(cast(nn.Linear, self.attention.o_proj), num_layers)
         if not self.ffn_is_moe:
-            init_residual_projection(self.ffn.down_proj, config.num_layers)
+            init_residual_projection(cast(nn.Linear, self.ffn.down_proj), num_layers)
         # (MoE's own experts get the same depth-scaled residual-projection
         # init applied inside MoELayer.__init__ instead, since MoELayer
         # doesn't expose a single .down_proj -- see ats.model.moe.)
@@ -158,20 +185,26 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[PastKeyValue] = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_value: PastKeyValue | None = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[PastKeyValue]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, PastKeyValue | None]:
         residual = x
         h = self.input_norm(x)
         if self.uses_mla:
             attn_out, new_past_key_value = self.attention(
-                h, attention_mask=attention_mask, past_key_value=past_key_value, use_cache=use_cache
+                h,
+                attention_mask=attention_mask,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
             )
         else:
             attn_out, new_past_key_value = self.attention(
-                h, attention_mask=attention_mask, past_key_value=past_key_value,
-                use_cache=use_cache, force_full_attention=self.force_full_attention,
+                h,
+                attention_mask=attention_mask,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                force_full_attention=self.force_full_attention,
             )
         x = residual + attn_out
 
@@ -196,34 +229,43 @@ class ATSTransformer(nn.Module):
                 "Call ats.config.defaults.apply_size_preset(config.model) first, "
                 "or pass model.size in the YAML config."
             )
-        self.config = config
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.embed_scale = math.sqrt(config.hidden_size)
+        # See TransformerBlock.__init__ for why these locals are needed:
+        # is_resolved() guarantees non-None at runtime, but mypy can't
+        # narrow a mutable pydantic attribute from a boolean method result.
+        assert config.hidden_size is not None
+        assert config.num_layers is not None
+        hidden_size: int = config.hidden_size
+        num_layers: int = config.num_layers
 
-        blocks: List[nn.Module] = []
-        for layer_idx in range(config.num_layers):
+        self.config = config
+        self.embed_tokens = nn.Embedding(config.vocab_size, hidden_size)
+        self.embed_scale = math.sqrt(hidden_size)
+
+        blocks: list[nn.Module] = []
+        for layer_idx in range(num_layers):
             if config.use_mamba and (layer_idx + 1) % config.mamba_every_n_layers == 0:
                 block: nn.Module = MambaLayer(config)
             else:
                 block = TransformerBlock(config, layer_idx, ep_size=ep_size)
             if config.use_mod:
-                block = MixtureOfDepths(config.hidden_size, block, config.mod_capacity_factor)
+                block = MixtureOfDepths(hidden_size, block, config.mod_capacity_factor)
             blocks.append(block)
         self.layers = nn.ModuleList(blocks)
 
         self.uses_mtp = config.use_mtp
         if config.use_mtp:
             self.mtp_head = MultiTokenPredictionHead(
-                hidden_size=config.hidden_size, vocab_size=config.vocab_size,
+                hidden_size=hidden_size,
+                vocab_size=config.vocab_size,
                 num_future_tokens=config.mtp_num_tokens,
             )
 
-        self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.final_norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = nn.Linear(hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
 
-        self.apply(lambda m: init_weights(m, config.num_layers))
+        self.apply(lambda m: init_weights(m, num_layers))
         if config.tie_word_embeddings:
             # Re-tie after init since apply() re-initializes embed_tokens.weight
             # in place, which lm_head.weight already aliases (no-op, kept for clarity).
@@ -232,12 +274,12 @@ class ATSTransformer(nn.Module):
     def _run_layers(
         self,
         x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[List[Optional[PastKeyValue]]],
+        attention_mask: torch.Tensor | None,
+        past_key_values: list[PastKeyValue | None] | None,
         use_cache: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[Optional[PastKeyValue]]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, list[PastKeyValue | None]]:
         total_aux_loss = torch.zeros((), device=x.device, dtype=torch.float32)
-        new_past_key_values: List[Optional[PastKeyValue]] = []
+        new_past_key_values: list[PastKeyValue | None] = []
 
         # Activation checkpointing only makes sense during training (it
         # trades recompute for memory on the backward pass) and is
@@ -249,18 +291,32 @@ class ATSTransformer(nn.Module):
         use_checkpointing = self.training and not use_cache and bool(n)
 
         for layer_idx, layer in enumerate(self.layers):
-            past_kv = past_key_values[layer_idx] if past_key_values is not None else None
+            past_kv = (
+                past_key_values[layer_idx] if past_key_values is not None else None
+            )
             # Every layer type (TransformerBlock, MambaLayer, and
             # MixtureOfDepths wrapping either) returns the same
             # (hidden_states, aux_loss, past_key_value) 3-tuple, so no
             # branching by layer type is needed here.
-            if use_checkpointing and layer_idx % n == 0:
+            # `n is not None` is checked again here (redundant with
+            # use_checkpointing's `bool(n)`, which already guarantees n is
+            # a positive int) so mypy can narrow n from `int | None` to
+            # `int` for the `layer_idx % n` below.
+            if use_checkpointing and n is not None and layer_idx % n == 0:
                 x, aux_loss, new_kv = torch.utils.checkpoint.checkpoint(
-                    layer, x, attention_mask, past_kv, use_cache, use_reentrant=False,
+                    layer,
+                    x,
+                    attention_mask,
+                    past_kv,
+                    use_cache,
+                    use_reentrant=False,
                 )
             else:
                 x, aux_loss, new_kv = layer(
-                    x, attention_mask=attention_mask, past_key_value=past_kv, use_cache=use_cache,
+                    x,
+                    attention_mask=attention_mask,
+                    past_key_value=past_kv,
+                    use_cache=use_cache,
                 )
             total_aux_loss = total_aux_loss + aux_loss
             new_past_key_values.append(new_kv)
@@ -268,7 +324,9 @@ class ATSTransformer(nn.Module):
         return x, total_aux_loss, new_past_key_values
 
     def forward_hidden(
-        self, inputs_embeds: torch.Tensor, attention_mask: Optional[torch.Tensor] = None,
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Runs the transformer stack directly on precomputed embeddings
         (e.g. noised embeddings from DiffusionLM), skipping the token
@@ -276,21 +334,27 @@ class ATSTransformer(nn.Module):
         states rather than logits. No aux-loss/MoE/MoD routing state is
         threaded through here since diffusion training does not use KV
         caching or autoregressive generation."""
-        if inputs_embeds.dim() != 3 or inputs_embeds.shape[-1] != self.config.hidden_size:
+        if (
+            inputs_embeds.dim() != 3
+            or inputs_embeds.shape[-1] != self.config.hidden_size
+        ):
             raise ValueError(
                 f"ATSTransformer.forward_hidden expected inputs_embeds of shape "
                 f"[batch, seq_len, {self.config.hidden_size}], got {tuple(inputs_embeds.shape)}."
             )
         x, _aux_loss, _past = self._run_layers(
-            inputs_embeds, attention_mask, past_key_values=None, use_cache=False,
+            inputs_embeds,
+            attention_mask,
+            past_key_values=None,
+            use_cache=False,
         )
         return self.final_norm(x)
 
     def forward(
         self,
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[Optional[PastKeyValue]]] = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: list[PastKeyValue | None] | None = None,
         use_cache: bool = False,
     ) -> TransformerOutput:
         if input_ids.dim() != 2:
@@ -298,7 +362,10 @@ class ATSTransformer(nn.Module):
                 f"ATSTransformer expected input_ids of shape [batch, seq_len], "
                 f"got shape {tuple(input_ids.shape)}."
             )
-        if input_ids.max().item() >= self.config.vocab_size or input_ids.min().item() < 0:
+        if (
+            input_ids.max().item() >= self.config.vocab_size
+            or input_ids.min().item() < 0
+        ):
             raise ValueError(
                 f"input_ids contains token ids outside [0, {self.config.vocab_size}). "
                 f"Got min={input_ids.min().item()}, max={input_ids.max().item()}. "
@@ -307,7 +374,10 @@ class ATSTransformer(nn.Module):
 
         x = self.embed_tokens(input_ids) * self.embed_scale
         x, total_aux_loss, new_past_key_values = self._run_layers(
-            x, attention_mask, past_key_values, use_cache,
+            x,
+            attention_mask,
+            past_key_values,
+            use_cache,
         )
         x = self.final_norm(x)
         logits = self.lm_head(x)
@@ -323,7 +393,7 @@ class ATSTransformer(nn.Module):
             expert_utilization=expert_utilization,
         )
 
-    def _collect_expert_utilization(self) -> Optional[Dict[int, float]]:
+    def _collect_expert_utilization(self) -> dict[int, float] | None:
         """Averages per-expert utilization across every MoE-enabled layer in
         the stack (unwrapping MixtureOfDepths where present), so
         AdaptiveController's expert-collapse detection actually receives a
@@ -332,10 +402,14 @@ class ATSTransformer(nn.Module):
         if not self.config.use_moe:
             return None
 
-        per_layer_utilization = []
+        per_layer_utilization: list[dict[int, float]] = []
         for layer in self.layers:
             block = layer.block if isinstance(layer, MixtureOfDepths) else layer
-            if isinstance(block, TransformerBlock) and block.ffn_is_moe:
+            if (
+                isinstance(block, TransformerBlock)
+                and block.ffn_is_moe
+                and isinstance(block.ffn, MoELayer)
+            ):
                 utilization = block.ffn.last_expert_utilization
                 if utilization is not None:
                     per_layer_utilization.append(utilization)
@@ -345,7 +419,8 @@ class ATSTransformer(nn.Module):
 
         num_experts = len(per_layer_utilization[0])
         averaged = {
-            expert_id: sum(u.get(expert_id, 0.0) for u in per_layer_utilization) / len(per_layer_utilization)
+            expert_id: sum(u.get(expert_id, 0.0) for u in per_layer_utilization)
+            / len(per_layer_utilization)
             for expert_id in range(num_experts)
         }
         return averaged

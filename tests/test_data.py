@@ -13,7 +13,8 @@ from ats.data.dataloader import _collate
 from ats.data.dataset import MixedDataset
 
 try:
-    import tiktoken  # noqa: F401
+    import tiktoken
+
     _TIKTOKEN_AVAILABLE = True
 except ImportError:
     _TIKTOKEN_AVAILABLE = False
@@ -33,7 +34,9 @@ def _tiktoken_usable() -> bool:
     try:
         tiktoken.get_encoding("cl100k_base")
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001 -- deliberately broad: this is an availability
+        # probe, and tiktoken.get_encoding can raise several different network/HTTP
+        # exception types depending on environment; any failure here means "unusable".
         return False
 
 
@@ -63,7 +66,10 @@ def test_fake_tokenizer_round_trip():
     assert tok.decode(ids) == text
 
 
-@pytest.mark.skipif(not _TIKTOKEN_USABLE, reason="tiktoken cl100k_base encoding not usable (not installed, or its data file could not be downloaded -- e.g. no network/blocked egress)")
+@pytest.mark.skipif(
+    not _TIKTOKEN_USABLE,
+    reason="tiktoken cl100k_base encoding not usable (not installed, or its data file could not be downloaded -- e.g. no network/blocked egress)",
+)
 def test_real_tokenizer_round_trip():
     from ats.data.tokenizer import Tokenizer
 
@@ -76,12 +82,14 @@ def test_real_tokenizer_round_trip():
 def test_dataset_yields_fixed_length_chunks(tmp_path):
     data_path = tmp_path / "data.jsonl"
     with open(data_path, "w") as f:
-        for i in range(5):
-            f.write(json.dumps({"text": "abcdefghij"}) + "\n")
+        f.writelines(json.dumps({"text": "abcdefghij"}) + "\n" for i in range(5))
 
     tok = _FakeTokenizer()
     dataset = MixedDataset(
-        sources=[DataSource(path=str(data_path), weight=1.0)], tokenizer=tok, seq_length=7, seed=0,
+        sources=[DataSource(path=str(data_path), weight=1.0)],
+        tokenizer=tok,
+        seq_length=7,
+        seed=0,
     )
     examples = list(dataset)
     assert len(examples) > 0
@@ -93,11 +101,16 @@ def test_dataset_yields_fixed_length_chunks(tmp_path):
 def test_dataset_no_data_loss_at_final_boundary(tmp_path):
     data_path = tmp_path / "data.jsonl"
     with open(data_path, "w") as f:
-        f.write(json.dumps({"text": "abc"}) + "\n")  # 3 chars + eos = 4 tokens, seq_length=10
+        f.write(
+            json.dumps({"text": "abc"}) + "\n"
+        )  # 3 chars + eos = 4 tokens, seq_length=10
 
     tok = _FakeTokenizer()
     dataset = MixedDataset(
-        sources=[DataSource(path=str(data_path), weight=1.0)], tokenizer=tok, seq_length=10, seed=0,
+        sources=[DataSource(path=str(data_path), weight=1.0)],
+        tokenizer=tok,
+        seq_length=10,
+        seed=0,
     )
     examples = list(dataset)
     assert len(examples) == 1
@@ -115,7 +128,10 @@ def test_dataset_rejects_missing_text_field(tmp_path):
 
     tok = _FakeTokenizer()
     dataset = MixedDataset(
-        sources=[DataSource(path=str(data_path), weight=1.0)], tokenizer=tok, seq_length=4, seed=0,
+        sources=[DataSource(path=str(data_path), weight=1.0)],
+        tokenizer=tok,
+        seq_length=4,
+        seed=0,
     )
     with pytest.raises(ConfigError):
         list(dataset)
@@ -144,7 +160,11 @@ def test_collate_rejects_inconsistent_lengths():
 
 # --- Regression tests for reported bugs ---
 
-@pytest.mark.skipif(not _TIKTOKEN_USABLE, reason="tiktoken cl100k_base encoding not usable (not installed, or its data file could not be downloaded -- e.g. no network/blocked egress)")
+
+@pytest.mark.skipif(
+    not _TIKTOKEN_USABLE,
+    reason="tiktoken cl100k_base encoding not usable (not installed, or its data file could not be downloaded -- e.g. no network/blocked egress)",
+)
 def test_tiktoken_pad_and_eos_ids_are_in_range():
     """Regression test: pad_token_id/eos_token_id must be < vocab_size, or
     nn.Embedding(vocab_size, hidden_size) raises IndexError the moment a
@@ -158,7 +178,10 @@ def test_tiktoken_pad_and_eos_ids_are_in_range():
     assert tok.pad_token_id >= 0
 
 
-@pytest.mark.skipif(not _TIKTOKEN_USABLE, reason="tiktoken cl100k_base encoding not usable (not installed, or its data file could not be downloaded -- e.g. no network/blocked egress)")
+@pytest.mark.skipif(
+    not _TIKTOKEN_USABLE,
+    reason="tiktoken cl100k_base encoding not usable (not installed, or its data file could not be downloaded -- e.g. no network/blocked egress)",
+)
 def test_tiktoken_middle_truncation_marker_is_in_range():
     """'middle' truncation inserts self.eos_token_id as a marker; this must
     also be a valid embedding index."""
@@ -189,12 +212,16 @@ def test_dataloader_worker_sharding_produces_no_duplicates():
         def __iter__(self):
             return iter(range(20))
 
-    fake_dataset = dataloader_module._TorchMixedDataset(_FakeMixedDataset(), rank=0, world_size=1)
+    fake_dataset = dataloader_module._TorchMixedDataset(
+        _FakeMixedDataset(), rank=0, world_size=1
+    )
 
     seen_by_worker = {}
     for worker_id in (0, 1):
         original = dataloader_module.get_worker_info
-        dataloader_module.get_worker_info = lambda: _FakeWorkerInfo(worker_id, 2)
+        dataloader_module.get_worker_info = lambda wid=worker_id: _FakeWorkerInfo(
+            wid, 2
+        )
         try:
             seen_by_worker[worker_id] = list(fake_dataset)
         finally:
@@ -208,6 +235,7 @@ def test_dataloader_worker_sharding_produces_no_duplicates():
 
 # --- preprocess.py / preprocessed-source reading tests ---
 
+
 def test_preprocess_packed_output_round_trips(tmp_path):
     """Exercises the real preprocess.preprocess() pipeline end-to-end using
     the fake character-level tokenizer's package-free logic pattern, but
@@ -217,8 +245,10 @@ def test_preprocess_packed_output_round_trips(tmp_path):
 
     input_path = tmp_path / "docs.jsonl"
     with open(input_path, "w") as f:
-        for text in ["hello world", "a short doc", "another one here", "final doc"]:
-            f.write(json.dumps({"text": text}) + "\n")
+        f.writelines(
+            json.dumps({"text": text}) + "\n"
+            for text in ["hello world", "a short doc", "another one here", "final doc"]
+        )
 
     class _FakeTok:
         vocab_size = 300
@@ -238,7 +268,11 @@ def test_preprocess_packed_output_round_trips(tmp_path):
 
     output_dir = tmp_path / "preprocessed"
     num_blocks = preprocess_module.preprocess(
-        str(input_path), str(output_dir), "cl100k_base", seq_length=10, packing=True,
+        str(input_path),
+        str(output_dir),
+        "cl100k_base",
+        seq_length=10,
+        packing=True,
     )
     assert num_blocks > 0
     assert (output_dir / "tokens.bin").exists()
@@ -276,7 +310,9 @@ def test_preprocessed_source_read_by_mixed_dataset(tmp_path):
 
     dataset = MixedDataset(
         sources=[DataSource(path=str(out_dir / "tokens.bin"), weight=1.0)],
-        tokenizer=_FakeTokenizer(), seq_length=seq_length, seed=0,
+        tokenizer=_FakeTokenizer(),
+        seq_length=seq_length,
+        seed=0,
     )
     examples = list(dataset)
     assert len(examples) == 2
@@ -304,7 +340,9 @@ def test_preprocessed_source_seq_length_mismatch_raises(tmp_path):
 
     dataset = MixedDataset(
         sources=[DataSource(path=str(out_dir / "tokens.bin"), weight=1.0)],
-        tokenizer=_FakeTokenizer(), seq_length=8, seed=0,  # mismatched on purpose
+        tokenizer=_FakeTokenizer(),
+        seq_length=8,
+        seed=0,  # mismatched on purpose
     )
     with pytest.raises(ConfigError):
         list(dataset)
@@ -347,7 +385,9 @@ def test_dataloader_rank_sharding_gives_full_coverage_no_duplicates():
     world_size = 4
     all_seen = []
     for rank in range(world_size):
-        ds = dataloader_module._TorchMixedDataset(_FixedStream(), rank=rank, world_size=world_size)
+        ds = dataloader_module._TorchMixedDataset(
+            _FixedStream(), rank=rank, world_size=world_size
+        )
         all_seen.extend(list(ds))
 
     assert len(all_seen) == 200
@@ -355,7 +395,10 @@ def test_dataloader_rank_sharding_gives_full_coverage_no_duplicates():
     assert sorted(all_seen) == list(range(200))
 
 
-@pytest.mark.skipif(not _TIKTOKEN_USABLE, reason="tiktoken cl100k_base encoding not usable (not installed, or its data file could not be downloaded -- e.g. no network/blocked egress)")
+@pytest.mark.skipif(
+    not _TIKTOKEN_USABLE,
+    reason="tiktoken cl100k_base encoding not usable (not installed, or its data file could not be downloaded -- e.g. no network/blocked egress)",
+)
 def test_tokenizer_decode_filters_negative_ids():
     """Regression test: decode() previously only filtered ids >= vocab_size,
     not negative ids -- so passing a labels array (which legitimately

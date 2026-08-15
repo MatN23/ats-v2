@@ -18,9 +18,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="[NOT YET IMPLEMENTED] Align an ats-v2 checkpoint (DPO/RLHF-style).",
     )
     parser.add_argument("--config", required=True, help="Path to a YAML config file.")
-    parser.add_argument("--base-checkpoint", required=True, help="Checkpoint to align from.")
     parser.add_argument(
-        "--method", choices=["dpo", "rlhf"], default="dpo",
+        "--base-checkpoint", required=True, help="Checkpoint to align from."
+    )
+    parser.add_argument(
+        "--method",
+        choices=["dpo", "rlhf"],
+        default="dpo",
         help="Alignment method (not yet implemented for either value).",
     )
     return parser

@@ -6,13 +6,12 @@ written by ats itself in either path."""
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
-from ats.model.quantization import make_linear
+from ats.model.quantization import QuantizationMode, make_linear
 from ats.model.rope import RotaryEmbedding, apply_rotary_pos_emb
 from ats.model.swa import generate_swa_mask
 
@@ -20,16 +19,20 @@ logger = logging.getLogger("ats.model.attention")
 
 try:
     from flash_attn import flash_attn_func
+
     _FLASH_ATTN_AVAILABLE = True
 except ImportError:
     flash_attn_func = None
     _FLASH_ATTN_AVAILABLE = False
 
-PastKeyValue = Tuple[torch.Tensor, torch.Tensor]
+PastKeyValue = tuple[torch.Tensor, torch.Tensor]
 
 
 def build_incremental_causal_mask(
-    seq_len: int, past_len: int, device: torch.device, window_size: Optional[int] = None,
+    seq_len: int,
+    past_len: int,
+    device: torch.device,
+    window_size: int | None = None,
 ) -> torch.Tensor:
     """Mask for attending `seq_len` new query positions against a KV cache
     of `past_len` prior positions plus the `seq_len` new key/value positions
@@ -47,8 +50,12 @@ def build_incremental_causal_mask(
     during multi-token continuation decoding.
     """
     total_len = past_len + seq_len
-    query_positions = torch.arange(past_len, total_len, device=device).unsqueeze(1)  # [seq_len, 1]
-    key_positions = torch.arange(total_len, device=device).unsqueeze(0)  # [1, total_len]
+    query_positions = torch.arange(past_len, total_len, device=device).unsqueeze(
+        1
+    )  # [seq_len, 1]
+    key_positions = torch.arange(total_len, device=device).unsqueeze(
+        0
+    )  # [1, total_len]
     distance = query_positions - key_positions  # [seq_len, total_len]
     mask = distance >= 0  # causal: key at or before query's absolute position
     if window_size is not None:
@@ -57,7 +64,10 @@ def build_incremental_causal_mask(
 
 
 def build_padding_causal_mask(
-    attention_mask: torch.Tensor, seq_len: int, is_causal: bool, device: torch.device,
+    attention_mask: torch.Tensor,
+    seq_len: int,
+    is_causal: bool,
+    device: torch.device,
 ) -> torch.Tensor:
     """Combines a [batch, seq_len] padding mask (1 = attend, 0 = pad) with an
     optional causal mask into the [batch, 1, seq_len, seq_len] boolean shape
@@ -67,10 +77,14 @@ def build_padding_causal_mask(
     present, so without this the model would attend to future positions
     whenever a padding mask is supplied, with no error to signal it."""
     batch = attention_mask.shape[0]
-    key_mask = attention_mask.to(device=device, dtype=torch.bool)[:, None, None, :]  # [batch,1,1,seq_len]
+    key_mask = attention_mask.to(device=device, dtype=torch.bool)[
+        :, None, None, :
+    ]  # [batch,1,1,seq_len]
     mask = key_mask.expand(batch, 1, seq_len, seq_len)
     if is_causal:
-        causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+        causal = torch.tril(
+            torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
+        )
         mask = mask & causal
     return mask
 
@@ -87,7 +101,7 @@ class GroupedQueryAttention(nn.Module):
         use_flash_attention: bool = True,
         use_swa: bool = False,
         swa_window_size: int = 4096,
-        quantization: str = "none",
+        quantization: QuantizationMode = "none",
     ) -> None:
         super().__init__()
         if hidden_size % num_heads != 0:
@@ -119,10 +133,18 @@ class GroupedQueryAttention(nn.Module):
                 "installed; falling back to torch.nn.functional.scaled_dot_product_attention."
             )
 
-        self.q_proj = make_linear(hidden_size, num_heads * self.head_dim, quantization, bias=False)
-        self.k_proj = make_linear(hidden_size, num_kv_heads * self.head_dim, quantization, bias=False)
-        self.v_proj = make_linear(hidden_size, num_kv_heads * self.head_dim, quantization, bias=False)
-        self.o_proj = make_linear(num_heads * self.head_dim, hidden_size, quantization, bias=False)
+        self.q_proj = make_linear(
+            hidden_size, num_heads * self.head_dim, quantization, bias=False
+        )
+        self.k_proj = make_linear(
+            hidden_size, num_kv_heads * self.head_dim, quantization, bias=False
+        )
+        self.v_proj = make_linear(
+            hidden_size, num_kv_heads * self.head_dim, quantization, bias=False
+        )
+        self.o_proj = make_linear(
+            num_heads * self.head_dim, hidden_size, quantization, bias=False
+        )
         self.rotary_emb = RotaryEmbedding(self.head_dim, max_seq_len, rope_theta)
 
     @staticmethod
@@ -137,11 +159,11 @@ class GroupedQueryAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[PastKeyValue] = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_value: PastKeyValue | None = None,
         use_cache: bool = False,
         force_full_attention: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[PastKeyValue]]:
+    ) -> tuple[torch.Tensor, PastKeyValue | None]:
         if x.dim() != 3:
             raise ValueError(
                 f"GroupedQueryAttention expected input of shape "
@@ -154,9 +176,21 @@ class GroupedQueryAttention(nn.Module):
                 f"got {hidden_size} (full shape {tuple(x.shape)})."
             )
 
-        q = self.q_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(batch, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = (
+            self.q_proj(x)
+            .view(batch, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.k_proj(x)
+            .view(batch, seq_len, self.num_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v_proj(x)
+            .view(batch, seq_len, self.num_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
 
         past_len = 0 if past_key_value is None else past_key_value[0].shape[2]
         total_len = past_len + seq_len
@@ -194,38 +228,61 @@ class GroupedQueryAttention(nn.Module):
 
         if needs_incremental_mask:
             incremental_mask = build_incremental_causal_mask(
-                seq_len, past_len, x.device, window_size=self.swa_window_size if apply_swa else None,
+                seq_len,
+                past_len,
+                x.device,
+                window_size=self.swa_window_size if apply_swa else None,
             )
             attn_out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=incremental_mask,
-                dropout_p=self.dropout_p if self.training else 0.0, is_causal=False,
+                q,
+                k,
+                v,
+                attn_mask=incremental_mask,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                is_causal=False,
             )
-            attn_out = attn_out.transpose(1, 2).reshape(batch, seq_len, self.num_heads * self.head_dim)
-        elif self.use_flash_attention and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16):
+            attn_out = attn_out.transpose(1, 2).reshape(
+                batch, seq_len, self.num_heads * self.head_dim
+            )
+        elif (
+            self.use_flash_attention
+            and x.is_cuda
+            and x.dtype in (torch.float16, torch.bfloat16)
+        ):
             q_bshd = q.transpose(1, 2)
             k_bshd = k.transpose(1, 2)
             v_bshd = v.transpose(1, 2)
-            flash_kwargs = dict(
-                dropout_p=self.dropout_p if self.training else 0.0, causal=is_causal,
-            )
+            flash_kwargs = {
+                "dropout_p": self.dropout_p if self.training else 0.0,
+                "causal": is_causal,
+            }
             if apply_swa:
                 # flash_attn>=2.2 accepts window_size=(left, right); (-1, -1) means
                 # unbounded. We restrict the left (past) window and leave right
                 # unbounded since attention is causal (right is masked by `causal`).
                 try:
                     attn_out = flash_attn_func(
-                        q_bshd, k_bshd, v_bshd,
-                        window_size=(self.swa_window_size - 1, 0), **flash_kwargs,
+                        q_bshd,
+                        k_bshd,
+                        v_bshd,
+                        window_size=(self.swa_window_size - 1, 0),
+                        **flash_kwargs,
                     )
                 except TypeError:
                     logger.warning(
                         "Installed flash_attn version does not support the window_size "
                         "argument; falling back to SDPA with a manual banded mask for SWA."
                     )
-                    swa_mask = generate_swa_mask(seq_len, self.swa_window_size, x.device)
+                    swa_mask = generate_swa_mask(
+                        seq_len, self.swa_window_size, x.device
+                    )
                     attn_out = F.scaled_dot_product_attention(
-                        q, k, v, attn_mask=swa_mask,
-                        dropout_p=self.dropout_p if self.training else 0.0, is_causal=False,
+                        q,
+                        k,
+                        v,
+                        attn_mask=swa_mask,
+                        dropout_p=self.dropout_p if self.training else 0.0,
+                        is_causal=False,
                     ).transpose(1, 2)
             else:
                 attn_out = flash_attn_func(q_bshd, k_bshd, v_bshd, **flash_kwargs)
@@ -242,7 +299,9 @@ class GroupedQueryAttention(nn.Module):
                 # the moment attention_mask is not None), so the causal
                 # component has to be folded back in here explicitly.
                 attn_mask = build_padding_causal_mask(
-                    attention_mask, seq_len, is_causal=(past_key_value is None and seq_len > 1),
+                    attention_mask,
+                    seq_len,
+                    is_causal=(past_key_value is None and seq_len > 1),
                     device=x.device,
                 )
                 use_is_causal = False
@@ -251,11 +310,16 @@ class GroupedQueryAttention(nn.Module):
                 attn_mask = swa_mask if attn_mask is None else (attn_mask & swa_mask)
                 use_is_causal = False
             attn_out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask,
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
                 dropout_p=self.dropout_p if self.training else 0.0,
                 is_causal=use_is_causal,
             )
-            attn_out = attn_out.transpose(1, 2).reshape(batch, seq_len, self.num_heads * self.head_dim)
+            attn_out = attn_out.transpose(1, 2).reshape(
+                batch, seq_len, self.num_heads * self.head_dim
+            )
 
         out = self.o_proj(attn_out)
         return out, new_past_key_value

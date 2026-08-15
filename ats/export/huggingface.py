@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Dict, Optional
 
 import torch
 
@@ -24,7 +23,7 @@ from ats.utils.logging_utils import get_logger
 logger = get_logger("ats.export.huggingface")
 
 
-def _build_hf_config(model_config: ModelConfig) -> Dict:
+def _build_hf_config(model_config: ModelConfig) -> dict:
     if not model_config.is_resolved():
         raise ConfigError("Cannot export a model whose ModelConfig is not resolved.")
     hf_config = {
@@ -50,10 +49,12 @@ def _build_hf_config(model_config: ModelConfig) -> Dict:
 
 
 def _remap_state_dict(
-    ats_state_dict: Dict[str, torch.Tensor], num_layers: int, tie_word_embeddings: bool,
-) -> Dict[str, torch.Tensor]:
+    ats_state_dict: dict[str, torch.Tensor],
+    num_layers: int,
+    tie_word_embeddings: bool,
+) -> dict[str, torch.Tensor]:
     """ats.model.transformer naming -> HF LlamaForCausalLM naming."""
-    hf_state_dict: Dict[str, torch.Tensor] = {}
+    hf_state_dict: dict[str, torch.Tensor] = {}
     hf_state_dict["model.embed_tokens.weight"] = ats_state_dict["embed_tokens.weight"]
     hf_state_dict["model.norm.weight"] = ats_state_dict["final_norm.weight"]
     # When tied, ats.model.transformer.ATSTransformer makes lm_head.weight literally
@@ -98,14 +99,20 @@ def _remap_state_dict(
             )
         gate_up = ats_state_dict[gate_up_key]
         intermediate_size = gate_up.shape[0] // 2
-        hf_state_dict[hf_prefix + "mlp.gate_proj.weight"] = gate_up[:intermediate_size].clone()
-        hf_state_dict[hf_prefix + "mlp.up_proj.weight"] = gate_up[intermediate_size:].clone()
+        hf_state_dict[hf_prefix + "mlp.gate_proj.weight"] = gate_up[
+            :intermediate_size
+        ].clone()
+        hf_state_dict[hf_prefix + "mlp.up_proj.weight"] = gate_up[
+            intermediate_size:
+        ].clone()
 
     return hf_state_dict
 
 
 def _build_model_card(model_config: ModelConfig) -> str:
-    attention_kind = "MLA" if model_config.use_mla else ("SWA" if model_config.use_swa else "GQA")
+    attention_kind = (
+        "MLA" if model_config.use_mla else ("SWA" if model_config.use_swa else "GQA")
+    )
     ffn_kind = "MoE" if model_config.use_moe else "SwiGLU (dense)"
     tags = ["ats-v2", model_config.name, "moe" if model_config.use_moe else "dense"]
     if model_config.use_swa:
@@ -154,8 +161,10 @@ def _build_model_card(model_config: ModelConfig) -> str:
 
 
 def export_to_huggingface(
-    model: ATSTransformer, model_config: ModelConfig, output_dir: str,
-    tokenizer_dir: Optional[str] = None,
+    model: ATSTransformer,
+    model_config: ModelConfig,
+    output_dir: str,
+    tokenizer_dir: str | None = None,
 ) -> Path:
     if model_config.use_mla:
         raise ConfigError(
@@ -193,8 +202,17 @@ def export_to_huggingface(
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    ats_state_dict = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
-    hf_state_dict = _remap_state_dict(ats_state_dict, model_config.num_layers, model_config.tie_word_embeddings)
+    ats_state_dict = {
+        k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()
+    }
+    # model is an already-constructed ATSTransformer, which requires a
+    # resolved ModelConfig at construction time, so model_config.num_layers
+    # is guaranteed not None here -- mypy can't see across that earlier
+    # construction, so narrow again explicitly.
+    assert model_config.num_layers is not None
+    hf_state_dict = _remap_state_dict(
+        ats_state_dict, model_config.num_layers, model_config.tie_word_embeddings
+    )
 
     save_file(hf_state_dict, str(out_path / "model.safetensors"))
 

@@ -10,8 +10,7 @@ the recent metrics history.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Deque, Dict, Optional
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -24,13 +23,13 @@ class TrainingMetrics:
     loss: float
     grad_norm: float
     learning_rate: float
-    expert_utilization: Optional[Dict[int, float]] = None
+    expert_utilization: dict[int, float] | None = None
 
 
 @dataclass(frozen=True)
 class AdaptiveAction:
     type: str
-    params: Dict[str, float]
+    params: dict[str, float]
     apply: bool
 
 
@@ -42,7 +41,7 @@ class AdaptiveController:
     def __init__(self, config: AdaptiveConfig) -> None:
         self.config = config
         self.enabled = config.enabled
-        self.history: Deque[TrainingMetrics] = deque(maxlen=config.history_size)
+        self.history: deque[TrainingMetrics] = deque(maxlen=config.history_size)
 
         self._last_lr_adjust_step = -1_000_000
         self._consecutive_emergency_cuts = 0
@@ -56,7 +55,7 @@ class AdaptiveController:
         # this is used.
         self._consecutive_plateau_boosts = 0
 
-    def step(self, metrics: TrainingMetrics) -> Optional[AdaptiveAction]:
+    def step(self, metrics: TrainingMetrics) -> AdaptiveAction | None:
         if not self.enabled:
             return None
 
@@ -76,8 +75,8 @@ class AdaptiveController:
         #    spike_window losses against the mean of the spike_window before that.
         if len(self.history) >= 2 * cfg.spike_window:
             losses = [m.loss for m in self.history]
-            recent = losses[-cfg.spike_window:]
-            older = losses[-2 * cfg.spike_window:-cfg.spike_window]
+            recent = losses[-cfg.spike_window :]
+            older = losses[-2 * cfg.spike_window : -cfg.spike_window]
             recent_avg = float(np.mean(recent))
             older_avg = float(np.mean(older))
             if older_avg > 0 and recent_avg > older_avg * cfg.spike_ratio:
@@ -104,7 +103,7 @@ class AdaptiveController:
         #    longer triggers on flatness alone. A hard cap on consecutive
         #    boosts (below) is the backstop for the converged case.
         if len(self.history) >= cfg.plateau_window:
-            window = [m.loss for m in list(self.history)[-cfg.plateau_window:]]
+            window = [m.loss for m in list(self.history)[-cfg.plateau_window :]]
             mean_loss = float(np.mean(window))
             if mean_loss > 0:
                 rel_std = float(np.std(window)) / mean_loss
@@ -112,19 +111,24 @@ class AdaptiveController:
                 half = max(1, cfg.plateau_window // 2)
                 first_half_mean = float(np.mean(window[:half]))
                 second_half_mean = float(np.mean(window[-half:]))
-                relative_improvement = (
-                    (first_half_mean - second_half_mean) / max(abs(first_half_mean), 1e-8)
+                relative_improvement = (first_half_mean - second_half_mean) / max(
+                    abs(first_half_mean), 1e-8
                 )
                 is_stagnant = relative_improvement < cfg.plateau_min_improvement
 
                 if rel_std < cfg.plateau_rel_std and is_stagnant:
-                    if self._consecutive_plateau_boosts >= cfg.max_consecutive_plateau_boosts:
+                    if (
+                        self._consecutive_plateau_boosts
+                        >= cfg.max_consecutive_plateau_boosts
+                    ):
                         # Already boosted several times in a row with no
                         # spike/cut in between to indicate the boosts are
                         # actually doing anything. Stop -- this is far more
                         # likely a converged model than a stuck one.
                         return None
-                    action = self._make_action("plateau_lr_boost", factor=1.5, cooldown=200)
+                    action = self._make_action(
+                        "plateau_lr_boost", factor=1.5, cooldown=200
+                    )
                     if action is not None:
                         self._consecutive_plateau_boosts += 1
                         return action
@@ -141,7 +145,9 @@ class AdaptiveController:
 
         return None
 
-    def _make_action(self, action_type: str, factor: float, cooldown: int) -> Optional[AdaptiveAction]:
+    def _make_action(
+        self, action_type: str, factor: float, cooldown: int
+    ) -> AdaptiveAction | None:
         """Enforces a cooldown between LR adjustments to prevent oscillation,
         and forces a training halt after 3 consecutive emergency cuts to
         prevent an LR death spiral."""

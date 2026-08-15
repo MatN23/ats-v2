@@ -8,26 +8,47 @@ from pydantic import ValidationError
 from ats.config.defaults import MODEL_SIZE_PRESETS, apply_size_preset
 from ats.config.loader import load_config
 from ats.config.schema import (
-    ATSConfig, ConfigError, DataConfig, DataSource, ModelConfig, TrainingConfig,
+    ATSConfig,
+    ConfigError,
+    DataConfig,
+    DataSource,
+    ModelConfig,
+    TrainingConfig,
 )
 
 
 def test_model_config_requires_positive_dropout():
     with pytest.raises(ValidationError):
         ModelConfig(
-            hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
-            intermediate_size=128, dropout=1.5,
+            hidden_size=64,
+            num_layers=2,
+            num_heads=4,
+            num_kv_heads=2,
+            intermediate_size=128,
+            dropout=1.5,
         )
 
 
 def test_model_config_heads_must_divide_hidden_size():
     with pytest.raises(ValidationError):
-        ModelConfig(hidden_size=65, num_layers=2, num_heads=4, num_kv_heads=2, intermediate_size=128)
+        ModelConfig(
+            hidden_size=65,
+            num_layers=2,
+            num_heads=4,
+            num_kv_heads=2,
+            intermediate_size=128,
+        )
 
 
 def test_model_config_kv_heads_must_divide_heads():
     with pytest.raises(ValidationError):
-        ModelConfig(hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=3, intermediate_size=128)
+        ModelConfig(
+            hidden_size=64,
+            num_layers=2,
+            num_heads=4,
+            num_kv_heads=3,
+            intermediate_size=128,
+        )
 
 
 def test_training_config_warmup_cannot_exceed_max_steps():
@@ -91,8 +112,14 @@ def test_moe_num_experts_must_be_at_least_top_k():
     with pytest.raises(ValidationError):
         ATSConfig(
             model=ModelConfig(
-                hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
-                intermediate_size=128, use_moe=True, num_experts=1, moe_top_k=2,
+                hidden_size=64,
+                num_layers=2,
+                num_heads=4,
+                num_kv_heads=2,
+                intermediate_size=128,
+                use_moe=True,
+                num_experts=1,
+                moe_top_k=2,
             ),
             training=TrainingConfig(max_steps=10, learning_rate=1e-4, warmup_steps=1),
             data=DataConfig(sources=[DataSource(path="x.jsonl")], seq_length=16),
@@ -100,17 +127,22 @@ def test_moe_num_experts_must_be_at_least_top_k():
 
 
 def test_config_hash_changes_when_architecture_changes():
-    base = ModelConfig(hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2, intermediate_size=128)
-    common = dict(
-        training=TrainingConfig(max_steps=10, learning_rate=1e-4, warmup_steps=1),
-        data=DataConfig(sources=[DataSource(path="x.jsonl")], seq_length=16),
+    base = ModelConfig(
+        hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2, intermediate_size=128
     )
+    common = {
+        "training": TrainingConfig(max_steps=10, learning_rate=1e-4, warmup_steps=1),
+        "data": DataConfig(sources=[DataSource(path="x.jsonl")], seq_length=16),
+    }
     cfg_a = ATSConfig(model=base, **common)
-    cfg_b = ATSConfig(model=base.model_copy(update={"hidden_size": 128, "num_heads": 8}), **common)
+    cfg_b = ATSConfig(
+        model=base.model_copy(update={"hidden_size": 128, "num_heads": 8}), **common
+    )
     assert cfg_a.config_hash() != cfg_b.config_hash()
 
 
 # --- CLI override merge logic (ats.cli.train) ---
+
 
 def _cli_config(argv):
     """Helper: parse argv (excluding --config) against the debug config and
@@ -183,6 +215,7 @@ def test_cli_moe_flags_apply_numeric_overrides():
 
 # --- micro_batch_size: config field + CLI precedence regression tests ---
 
+
 def test_training_config_micro_batch_size_default_is_one():
     training = TrainingConfig(max_steps=10, learning_rate=1e-4, warmup_steps=1)
     assert training.micro_batch_size == 1
@@ -190,7 +223,9 @@ def test_training_config_micro_batch_size_default_is_one():
 
 def test_training_config_rejects_non_positive_micro_batch_size():
     with pytest.raises(ValidationError):
-        TrainingConfig(max_steps=10, learning_rate=1e-4, warmup_steps=1, micro_batch_size=0)
+        TrainingConfig(
+            max_steps=10, learning_rate=1e-4, warmup_steps=1, micro_batch_size=0
+        )
 
 
 def test_load_config_debug_yaml_micro_batch_size_is_read_from_file():
@@ -206,7 +241,9 @@ def test_cli_without_micro_batch_size_flag_preserves_yaml_value():
     training.micro_batch_size untouched when the flag isn't passed."""
     config = _cli_config([])
     assert config.model.hidden_size == 128  # sanity: still the debug config
-    assert config.training.micro_batch_size == 4  # from configs/debug.yaml, not clobbered to 1
+    assert (
+        config.training.micro_batch_size == 4
+    )  # from configs/debug.yaml, not clobbered to 1
 
 
 def test_cli_micro_batch_size_flag_overrides_yaml():
@@ -240,67 +277,105 @@ def test_training_config_rejects_zero_keep_last_n_checkpoints():
     CheckpointManager._prune_old_checkpoints() to delete every checkpoint,
     including the one just saved in the same save() call."""
     with pytest.raises(ValidationError):
-        TrainingConfig(max_steps=10, learning_rate=1e-4, warmup_steps=1, keep_last_n_checkpoints=0)
+        TrainingConfig(
+            max_steps=10, learning_rate=1e-4, warmup_steps=1, keep_last_n_checkpoints=0
+        )
 
 
 def test_training_config_rejects_negative_keep_last_n_checkpoints():
     with pytest.raises(ValidationError):
-        TrainingConfig(max_steps=10, learning_rate=1e-4, warmup_steps=1, keep_last_n_checkpoints=-1)
+        TrainingConfig(
+            max_steps=10, learning_rate=1e-4, warmup_steps=1, keep_last_n_checkpoints=-1
+        )
 
 
 def test_training_config_accepts_valid_keep_last_n_checkpoints():
-    training = TrainingConfig(max_steps=10, learning_rate=1e-4, warmup_steps=1, keep_last_n_checkpoints=1)
+    training = TrainingConfig(
+        max_steps=10, learning_rate=1e-4, warmup_steps=1, keep_last_n_checkpoints=1
+    )
     assert training.keep_last_n_checkpoints == 1
 
 
 # --- Regression tests: previously-unvalidated fields that could crash with
 # confusing low-level errors instead of a clear ConfigError ---
 
+
 def test_model_config_rejects_non_positive_vocab_size():
     with pytest.raises(ValidationError):
-        ModelConfig(hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2, intermediate_size=128, vocab_size=0)
+        ModelConfig(
+            hidden_size=64,
+            num_layers=2,
+            num_heads=4,
+            num_kv_heads=2,
+            intermediate_size=128,
+            vocab_size=0,
+        )
 
 
 def test_model_config_rejects_non_positive_max_seq_len():
     with pytest.raises(ValidationError):
         ModelConfig(
-            hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
-            intermediate_size=128, max_seq_len=0,
+            hidden_size=64,
+            num_layers=2,
+            num_heads=4,
+            num_kv_heads=2,
+            intermediate_size=128,
+            max_seq_len=0,
         )
 
 
 def test_model_config_rejects_non_positive_num_experts():
     with pytest.raises(ValidationError):
         ModelConfig(
-            hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
-            intermediate_size=128, num_experts=0,
+            hidden_size=64,
+            num_layers=2,
+            num_heads=4,
+            num_kv_heads=2,
+            intermediate_size=128,
+            num_experts=0,
         )
 
 
 def test_model_config_rejects_non_positive_moe_capacity_factor():
     with pytest.raises(ValidationError):
         ModelConfig(
-            hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
-            intermediate_size=128, moe_capacity_factor=0.0,
+            hidden_size=64,
+            num_layers=2,
+            num_heads=4,
+            num_kv_heads=2,
+            intermediate_size=128,
+            moe_capacity_factor=0.0,
         )
 
 
 def test_model_config_rejects_negative_moe_load_balancing_weight():
     with pytest.raises(ValidationError):
         ModelConfig(
-            hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
-            intermediate_size=128, moe_load_balancing_weight=-0.01,
+            hidden_size=64,
+            num_layers=2,
+            num_heads=4,
+            num_kv_heads=2,
+            intermediate_size=128,
+            moe_load_balancing_weight=-0.01,
         )
 
 
 def test_model_config_rejects_out_of_range_mod_capacity_factor():
     with pytest.raises(ValidationError):
         ModelConfig(
-            hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
-            intermediate_size=128, mod_capacity_factor=1.5,
+            hidden_size=64,
+            num_layers=2,
+            num_heads=4,
+            num_kv_heads=2,
+            intermediate_size=128,
+            mod_capacity_factor=1.5,
         )
     with pytest.raises(ValidationError):
         ModelConfig(
-            hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
-            intermediate_size=128, mod_capacity_factor=0.0,
+            hidden_size=64,
+            num_layers=2,
+            num_heads=4,
+            num_kv_heads=2,
+            intermediate_size=128,
+            mod_capacity_factor=0.0,
         )

@@ -8,7 +8,13 @@ import pytest
 import torch
 
 from ats.config.schema import (
-    AdaptiveConfig, ATSConfig, CheckpointConfig, DataConfig, DataSource, ModelConfig, TrainingConfig,
+    AdaptiveConfig,
+    ATSConfig,
+    CheckpointConfig,
+    DataConfig,
+    DataSource,
+    ModelConfig,
+    TrainingConfig,
 )
 from ats.training.adaptive_controller import AdaptiveController, TrainingMetrics
 from ats.training.checkpoint import CheckpointManager
@@ -16,14 +22,18 @@ from ats.training.scheduler import WarmupCosineScheduler
 
 
 def test_scheduler_warmup_is_linear():
-    sched = WarmupCosineScheduler(base_lr=1.0, warmup_steps=10, max_steps=100, min_lr_ratio=0.1)
+    sched = WarmupCosineScheduler(
+        base_lr=1.0, warmup_steps=10, max_steps=100, min_lr_ratio=0.1
+    )
     assert sched.get_lr(0) == pytest.approx(1.0 / 10)
     assert sched.get_lr(9) == pytest.approx(1.0)
     assert sched.get_lr(0) < sched.get_lr(5) < sched.get_lr(9)
 
 
 def test_scheduler_decays_to_min_lr_at_end():
-    sched = WarmupCosineScheduler(base_lr=1.0, warmup_steps=10, max_steps=100, min_lr_ratio=0.1)
+    sched = WarmupCosineScheduler(
+        base_lr=1.0, warmup_steps=10, max_steps=100, min_lr_ratio=0.1
+    )
     assert sched.get_lr(99) == pytest.approx(0.1, abs=0.02)
     assert sched.get_lr(200) == pytest.approx(0.1)
 
@@ -34,7 +44,9 @@ def test_scheduler_rejects_warmup_greater_than_max_steps():
 
 
 def _metrics(step, loss, grad_norm=1.0):
-    return TrainingMetrics(step=step, loss=loss, grad_norm=grad_norm, learning_rate=1e-4)
+    return TrainingMetrics(
+        step=step, loss=loss, grad_norm=grad_norm, learning_rate=1e-4
+    )
 
 
 def test_adaptive_controller_detects_loss_spike():
@@ -64,7 +76,9 @@ def test_adaptive_controller_detects_loss_spike():
 
 
 def test_adaptive_controller_detects_plateau():
-    config = AdaptiveConfig(plateau_window=10, plateau_rel_std=0.01, spike_window=1000, history_size=2000)
+    config = AdaptiveConfig(
+        plateau_window=10, plateau_rel_std=0.01, spike_window=1000, history_size=2000
+    )
     controller = AdaptiveController(config)
     action = None
     for step in range(10):
@@ -74,7 +88,12 @@ def test_adaptive_controller_detects_plateau():
 
 
 def test_adaptive_controller_halts_after_three_emergency_cuts():
-    config = AdaptiveConfig(grad_norm_threshold=5.0, spike_window=1000, plateau_window=1000, history_size=2000)
+    config = AdaptiveConfig(
+        grad_norm_threshold=5.0,
+        spike_window=1000,
+        plateau_window=1000,
+        history_size=2000,
+    )
     controller = AdaptiveController(config)
     halted = False
     step = 0
@@ -88,7 +107,12 @@ def test_adaptive_controller_halts_after_three_emergency_cuts():
 
 
 def test_adaptive_controller_respects_cooldown():
-    config = AdaptiveConfig(grad_norm_threshold=5.0, spike_window=1000, plateau_window=1000, history_size=2000)
+    config = AdaptiveConfig(
+        grad_norm_threshold=5.0,
+        spike_window=1000,
+        plateau_window=1000,
+        history_size=2000,
+    )
     controller = AdaptiveController(config)
     first = controller.step(_metrics(0, loss=1.0, grad_norm=100.0))
     second = controller.step(_metrics(1, loss=1.0, grad_norm=100.0))
@@ -118,8 +142,14 @@ class _TinyModelEngine:
         os.makedirs(ckpt_dir, exist_ok=True)
         torch.save(self.module.state_dict(), os.path.join(ckpt_dir, "model.pt"))
         with open(os.path.join(ckpt_dir, "client_state.json"), "w") as f:
-            json.dump({"global_step": client_state["global_step"], "epoch": client_state["epoch"],
-                       "config_hash": client_state["config_hash"]}, f)
+            json.dump(
+                {
+                    "global_step": client_state["global_step"],
+                    "epoch": client_state["epoch"],
+                    "config_hash": client_state["config_hash"],
+                },
+                f,
+            )
         torch.save(client_state["rng_state"], os.path.join(ckpt_dir, "rng_state.pt"))
 
     def load_checkpoint(self, load_dir, tag):
@@ -146,7 +176,14 @@ class _TinyModelEngine:
 
 
 def _make_config(tmp_path):
-    model_config = ModelConfig(hidden_size=8, num_layers=1, num_heads=2, num_kv_heads=1, intermediate_size=16, vocab_size=20)
+    model_config = ModelConfig(
+        hidden_size=8,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=1,
+        intermediate_size=16,
+        vocab_size=20,
+    )
     return ATSConfig(
         model=model_config,
         training=TrainingConfig(max_steps=10, learning_rate=1e-3, warmup_steps=1),
@@ -182,11 +219,19 @@ def test_checkpoint_load_rejects_mismatched_config(tmp_path):
     manager = CheckpointManager(config)
     ckpt_dir = manager.save(engine, global_step=1, epoch=0)
 
-    other_model_config = ModelConfig(hidden_size=16, num_layers=1, num_heads=2, num_kv_heads=1, intermediate_size=32, vocab_size=20)
+    other_model_config = ModelConfig(
+        hidden_size=16,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=1,
+        intermediate_size=32,
+        vocab_size=20,
+    )
     other_config = config.model_copy(update={"model": other_model_config})
     other_manager = CheckpointManager(other_config)
 
     from ats.config.schema import ConfigError
+
     with pytest.raises(ConfigError):
         other_manager.load(engine, str(ckpt_dir))
 

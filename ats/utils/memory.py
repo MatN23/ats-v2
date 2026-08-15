@@ -4,8 +4,9 @@ pre-flight memory *estimator* that runs before any GPU memory is allocated."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
 logger = get_logger("ats.utils.memory")
 
 _BYTES_PER_PARAM = {"bf16": 2, "fp16": 2, "fp32": 4}
-_BYTES_PER_GIB = 1024 ** 3
+_BYTES_PER_GIB = 1024**3
 # Adam keeps two fp32 moment tensors (m, v) per parameter, plus (under mixed
 # precision) an fp32 master-weight copy. This is the standard
 # mixed-precision-Adam memory accounting used by DeepSpeed's own ZeRO memory
@@ -49,8 +50,12 @@ class MemoryReport:
 
 def _zero_stage_from_strategy(strategy: str) -> int:
     mapping = {
-        "deepspeed_zero0": 0, "deepspeed_zero1": 1, "deepspeed_zero2": 2,
-        "deepspeed_zero3": 3, "deepspeed_moe": 2, "fsdp": 3,
+        "deepspeed_zero0": 0,
+        "deepspeed_zero1": 1,
+        "deepspeed_zero2": 2,
+        "deepspeed_zero3": 3,
+        "deepspeed_moe": 2,
+        "fsdp": 3,
     }
     return mapping.get(strategy, 2)
 
@@ -62,7 +67,9 @@ def _detect_available_gpu_memory_gb() -> float:
     return torch.cuda.get_device_properties(device).total_memory / _BYTES_PER_GIB
 
 
-def estimate_memory(config: "ATSConfig", target_batch_size: Optional[int] = None) -> MemoryReport:
+def estimate_memory(
+    config: ATSConfig, target_batch_size: int | None = None
+) -> MemoryReport:
     """Estimate peak per-GPU memory before training starts (no GPU memory is
     allocated by this function). Uses the same parameter-count arithmetic as
     ats.parallelism.auto_parallel.estimate_param_count, standard
@@ -80,6 +87,14 @@ def estimate_memory(config: "ATSConfig", target_batch_size: Optional[int] = None
             "estimate_memory requires a resolved ModelConfig (hidden_size/num_layers/"
             "etc must not be None). Call ats.config.defaults.apply_size_preset() first."
         )
+    # is_resolved() guarantees these are not None at runtime, but mypy can't
+    # narrow a mutable pydantic attribute across the rest of this function
+    # from a boolean method call, so bind narrowed locals here (see the same
+    # pattern in ats.model.transformer.TransformerBlock.__init__).
+    assert config.model.num_layers is not None
+    assert config.model.hidden_size is not None
+    num_layers: int = config.model.num_layers
+    hidden_size: int = config.model.hidden_size
 
     world_size = max(1, config.parallelism.gpus * config.parallelism.nodes)
     strategy = resolve_strategy(config)
@@ -88,9 +103,12 @@ def estimate_memory(config: "ATSConfig", target_batch_size: Optional[int] = None
     num_params = estimate_param_count(config.model)
     bytes_per_param = _BYTES_PER_PARAM[config.training.mixed_precision]
 
-    model_bytes = num_params * bytes_per_param
-    optimizer_bytes = num_params * _ADAM_BYTES_PER_PARAM_FP32_STATES
-    gradient_bytes = num_params * 4  # gradients accumulated in fp32
+    # Declared as float (not inferred as int from the first assignment)
+    # since these get divided by world_size below when ZeRO sharding
+    # applies, and division always produces a float in Python.
+    model_bytes: float = num_params * bytes_per_param
+    optimizer_bytes: float = num_params * _ADAM_BYTES_PER_PARAM_FP32_STATES
+    gradient_bytes: float = num_params * 4  # gradients accumulated in fp32
 
     # ZeRO sharding: stage 1 shards optimizer state, stage 2 additionally
     # shards gradients, stage 3 additionally shards parameters themselves.
@@ -101,10 +119,17 @@ def estimate_memory(config: "ATSConfig", target_batch_size: Optional[int] = None
     if zero_stage >= 3:
         model_bytes = model_bytes / world_size
 
-    batch_size = target_batch_size if target_batch_size is not None else config.training.micro_batch_size
+    batch_size = (
+        target_batch_size
+        if target_batch_size is not None
+        else config.training.micro_batch_size
+    )
     seq_len = config.data.seq_length
-    activation_bytes = (
-        batch_size * seq_len * config.model.num_layers * config.model.hidden_size
+    activation_bytes: float = (
+        batch_size
+        * seq_len
+        * num_layers
+        * hidden_size
         * _ACTIVATION_BYTES_PER_TOKEN_PER_LAYER_PER_HIDDEN
     )
     if config.model.checkpoint_every_n_layers:
@@ -122,7 +147,8 @@ def estimate_memory(config: "ATSConfig", target_batch_size: Optional[int] = None
         # heuristic: reduction_factor = 1 + 2 / n. n=1 -> 3x (unchanged from
         # the old flag), n=2 -> 2x, n=3 -> 1.67x, and so on toward 1x
         # (no reduction) as n grows.
-        reduction_factor = 1.0 + 2.0 / config.model.checkpoint_every_n_layers
+        checkpoint_every_n_layers = config.model.checkpoint_every_n_layers
+        reduction_factor = 1.0 + 2.0 / checkpoint_every_n_layers
         activation_bytes = activation_bytes / reduction_factor
 
     model_gb = (model_bytes + gradient_bytes) / _BYTES_PER_GIB
@@ -164,14 +190,14 @@ def estimate_memory(config: "ATSConfig", target_batch_size: Optional[int] = None
     )
 
 
-def get_gpu_memory_info() -> Dict[str, float]:
+def get_gpu_memory_info() -> dict[str, float]:
     """Returns allocated/reserved GPU memory in GiB, or zeros if no CUDA device."""
     if not torch.cuda.is_available():
         return {"allocated_gib": 0.0, "reserved_gib": 0.0, "total_gib": 0.0}
     device = torch.cuda.current_device()
-    allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
-    reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
-    total = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+    allocated = torch.cuda.memory_allocated(device) / (1024**3)
+    reserved = torch.cuda.memory_reserved(device) / (1024**3)
+    total = torch.cuda.get_device_properties(device).total_memory / (1024**3)
     return {"allocated_gib": allocated, "reserved_gib": reserved, "total_gib": total}
 
 

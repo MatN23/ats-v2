@@ -5,19 +5,33 @@ from __future__ import annotations
 
 import pytest
 
-from ats.config.schema import ATSConfig, DataConfig, DataSource, ModelConfig, ParallelismConfig, TrainingConfig
+from ats.config.schema import (
+    ATSConfig,
+    DataConfig,
+    DataSource,
+    ModelConfig,
+    ParallelismConfig,
+    TrainingConfig,
+)
 from ats.utils.memory import estimate_memory
 
 
 def _config(**model_overrides) -> ATSConfig:
-    defaults = dict(
-        hidden_size=512, num_layers=8, num_heads=8, num_kv_heads=8,
-        intermediate_size=2048, vocab_size=32000, max_seq_len=2048,
-    )
+    defaults = {
+        "hidden_size": 512,
+        "num_layers": 8,
+        "num_heads": 8,
+        "num_kv_heads": 8,
+        "intermediate_size": 2048,
+        "vocab_size": 32000,
+        "max_seq_len": 2048,
+    }
     model = ModelConfig(**{**defaults, **model_overrides})
     return ATSConfig(
         model=model,
-        training=TrainingConfig(max_steps=100, learning_rate=1e-4, warmup_steps=10, micro_batch_size=4),
+        training=TrainingConfig(
+            max_steps=100, learning_rate=1e-4, warmup_steps=10, micro_batch_size=4
+        ),
         data=DataConfig(sources=[DataSource(path="x.jsonl")], seq_length=2048),
         parallelism=ParallelismConfig(gpus=1, nodes=1),
     )
@@ -28,12 +42,16 @@ def test_estimate_memory_returns_positive_components():
     assert report.model_gb > 0
     assert report.optimizer_gb > 0
     assert report.activation_gb > 0
-    assert report.total_gb == pytest.approx(report.model_gb + report.optimizer_gb + report.activation_gb)
+    assert report.total_gb == pytest.approx(
+        report.model_gb + report.optimizer_gb + report.activation_gb
+    )
 
 
 def test_estimate_memory_scales_with_parameter_count():
     small = estimate_memory(_config(hidden_size=512, intermediate_size=2048))
-    large = estimate_memory(_config(hidden_size=2048, intermediate_size=8192, num_heads=16, num_kv_heads=16))
+    large = estimate_memory(
+        _config(hidden_size=2048, intermediate_size=8192, num_heads=16, num_kv_heads=16)
+    )
     assert large.model_gb > small.model_gb
     assert large.optimizer_gb > small.optimizer_gb
 
@@ -43,7 +61,9 @@ def test_estimate_memory_scales_with_batch_size():
     large_batch = estimate_memory(_config(), target_batch_size=16)
     assert large_batch.activation_gb > small_batch.activation_gb
     # Activation memory should scale roughly linearly with batch size.
-    assert large_batch.activation_gb == pytest.approx(small_batch.activation_gb * 16, rel=0.05)
+    assert large_batch.activation_gb == pytest.approx(
+        small_batch.activation_gb * 16, rel=0.05
+    )
 
 
 def test_estimate_memory_gradient_checkpointing_reduces_activations():
@@ -54,17 +74,28 @@ def test_estimate_memory_gradient_checkpointing_reduces_activations():
 
 def test_estimate_memory_zero_stage_shards_optimizer_across_gpus():
     model = ModelConfig(
-        hidden_size=512, num_layers=8, num_heads=8, num_kv_heads=8,
-        intermediate_size=2048, vocab_size=32000, max_seq_len=2048,
+        hidden_size=512,
+        num_layers=8,
+        num_heads=8,
+        num_kv_heads=8,
+        intermediate_size=2048,
+        vocab_size=32000,
+        max_seq_len=2048,
     )
     single_gpu = ATSConfig(
         model=model,
-        training=TrainingConfig(max_steps=100, learning_rate=1e-4, warmup_steps=10, micro_batch_size=4),
+        training=TrainingConfig(
+            max_steps=100, learning_rate=1e-4, warmup_steps=10, micro_batch_size=4
+        ),
         data=DataConfig(sources=[DataSource(path="x.jsonl")], seq_length=2048),
         parallelism=ParallelismConfig(strategy="deepspeed_zero1", gpus=1, nodes=1),
     )
     multi_gpu = single_gpu.model_copy(
-        update={"parallelism": ParallelismConfig(strategy="deepspeed_zero1", gpus=8, nodes=1)}
+        update={
+            "parallelism": ParallelismConfig(
+                strategy="deepspeed_zero1", gpus=8, nodes=1
+            )
+        }
     )
     report_single = estimate_memory(single_gpu)
     report_multi = estimate_memory(multi_gpu)

@@ -24,6 +24,7 @@ import torch
 try:
     import triton
     import triton.language as tl
+
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
@@ -33,8 +34,12 @@ if HAS_TRITON:
 
     @triton.jit
     def _rope_kernel(
-        x_ptr, cos_ptr, sin_ptr, out_ptr,
-        seq_len, head_dim,
+        x_ptr,
+        cos_ptr,
+        sin_ptr,
+        out_ptr,
+        seq_len,
+        head_dim,
         BLOCK_SIZE: tl.constexpr,
     ):
         # Grid: one program per (batch*heads, seq_position) pair, flattened
@@ -47,11 +52,19 @@ if HAS_TRITON:
         seq_pos = row_idx % seq_len
         row_start = row_idx * head_dim
 
-        x1 = tl.load(x_ptr + row_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        x2 = tl.load(x_ptr + row_start + half + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        x1 = tl.load(x_ptr + row_start + col_offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        x2 = tl.load(x_ptr + row_start + half + col_offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
 
-        cos1 = tl.load(cos_ptr + seq_pos * head_dim + col_offsets, mask=mask, other=1.0).to(tl.float32)
-        sin1 = tl.load(sin_ptr + seq_pos * head_dim + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        cos1 = tl.load(
+            cos_ptr + seq_pos * head_dim + col_offsets, mask=mask, other=1.0
+        ).to(tl.float32)
+        sin1 = tl.load(
+            sin_ptr + seq_pos * head_dim + col_offsets, mask=mask, other=0.0
+        ).to(tl.float32)
 
         # rotate_half convention: out1 = x1*cos - x2*sin, out2 = x2*cos + x1*sin
         # (cos/sin are duplicated across the two halves, per rope.py's cache
@@ -62,7 +75,9 @@ if HAS_TRITON:
         tl.store(out_ptr + row_start + col_offsets, out1, mask=mask)
         tl.store(out_ptr + row_start + half + col_offsets, out2, mask=mask)
 
-    def _triton_apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def _triton_apply_rope(
+        x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
         # x: [batch, heads, seq_len, head_dim]; cos/sin: [seq_len, head_dim]
         batch, heads, seq_len, head_dim = x.shape
         x_flat = x.reshape(-1, head_dim).contiguous()
@@ -70,7 +85,9 @@ if HAS_TRITON:
         num_rows = x_flat.shape[0]
         block_size = triton.next_power_of_2(head_dim // 2)
         grid = (num_rows,)
-        _rope_kernel[grid](x_flat, cos, sin, out, seq_len, head_dim, BLOCK_SIZE=block_size)
+        _rope_kernel[grid](
+            x_flat, cos, sin, out, seq_len, head_dim, BLOCK_SIZE=block_size
+        )
         return out.reshape(batch, heads, seq_len, head_dim)
 
 
@@ -80,13 +97,17 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-def _pytorch_apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+def _pytorch_apply_rope(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
     cos_b = cos.unsqueeze(0).unsqueeze(0)
     sin_b = sin.unsqueeze(0).unsqueeze(0)
     return (x * cos_b) + (_rotate_half(x) * sin_b)
 
 
-def fused_apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+def fused_apply_rope(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
     """Applies RoPE rotation to `x` ([batch, heads, seq_len, head_dim]) given
     `cos`/`sin` ([seq_len, head_dim]), matching
     ats.model.rope.apply_rotary_pos_emb's math exactly. Uses a fused Triton

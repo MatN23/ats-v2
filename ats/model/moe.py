@@ -13,19 +13,20 @@ production path.
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional, Tuple
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from ats.model.ffn import SwiGLU
 from ats.model.initialization import init_residual_projection
+from ats.model.quantization import QuantizationMode
 
 logger = logging.getLogger("ats.model.moe")
 
 try:
     from deepspeed.moe.layer import MoE as DeepSpeedMoE
+
     _DEEPSPEED_MOE_AVAILABLE = True
 except ImportError:
     DeepSpeedMoE = None
@@ -37,9 +38,15 @@ class _PyTorchMoEFallback(nn.Module):
     DeepSpeed's MoE module cannot be imported."""
 
     def __init__(
-        self, hidden_size: int, intermediate_size: int, num_experts: int,
-        top_k: int, capacity_factor: float, load_balancing_weight: float,
-        num_layers: int, quantization: str = "none",
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+        top_k: int,
+        capacity_factor: float,
+        load_balancing_weight: float,
+        num_layers: int,
+        quantization: QuantizationMode = "none",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -49,17 +56,26 @@ class _PyTorchMoEFallback(nn.Module):
         self.load_balancing_weight = load_balancing_weight
         self.gate = nn.Linear(hidden_size, num_experts, bias=False)
         self.experts = nn.ModuleList(
-            [SwiGLU(hidden_size, intermediate_size, quantization=quantization) for _ in range(num_experts)]
+            [
+                SwiGLU(hidden_size, intermediate_size, quantization=quantization)
+                for _ in range(num_experts)
+            ]
         )
         # Each expert's down_proj writes directly into the residual stream,
         # exactly like the dense FFN path's down_proj -- it needs the same
         # depth-scaled init (see ats.model.initialization), not the generic
         # one a later blanket init_weights() pass would otherwise give it.
         for expert in self.experts:
+            # nn.ModuleList iteration is typed as yielding plain nn.Module by
+            # the torch stubs, even though every element here is a SwiGLU;
+            # narrow explicitly so expert.down_proj is seen as nn.Linear.
+            assert isinstance(expert, SwiGLU)
             init_residual_projection(expert.down_proj, num_layers)
-        self.last_expert_utilization: Optional[Dict[int, float]] = None
+        self.last_expert_utilization: dict[int, float] | None = None
 
-    def compute_routing(self, flat_x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def compute_routing(
+        self, flat_x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (top_k_probs, top_k_idx, router_probs) for a flattened
         [num_tokens, hidden_size] input: top_k_probs are the (renormalized,
         sum-to-1-per-token) gating weights for the selected experts,
@@ -73,7 +89,7 @@ class _PyTorchMoEFallback(nn.Module):
         top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
         return top_k_probs, top_k_idx, router_probs
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch, seq_len, hidden_size = x.shape
         if hidden_size != self.hidden_size:
             raise ValueError(
@@ -84,7 +100,9 @@ class _PyTorchMoEFallback(nn.Module):
 
         top_k_probs, top_k_idx, router_probs = self.compute_routing(flat_x)
 
-        capacity = max(1, int(self.capacity_factor * num_tokens * self.top_k / self.num_experts))
+        capacity = max(
+            1, int(self.capacity_factor * num_tokens * self.top_k / self.num_experts)
+        )
         output = torch.zeros_like(flat_x)
         total_dropped = 0
 
@@ -99,7 +117,7 @@ class _PyTorchMoEFallback(nn.Module):
             expert_input = flat_x[token_indices]
             expert_output = self.experts[expert_id](expert_input)
             slot_weight = top_k_probs[token_indices]
-            slot_mask = (top_k_idx[token_indices] == expert_id)
+            slot_mask = top_k_idx[token_indices] == expert_id
             weight = (slot_weight * slot_mask).sum(dim=-1, keepdim=True)
             output.index_add_(0, token_indices, expert_output * weight)
 
@@ -110,13 +128,17 @@ class _PyTorchMoEFallback(nn.Module):
                 "layer this step. Fix: increase moe_capacity_factor, or install deepspeed "
                 "for the expert-parallel MoE path, which doesn't have this single-process "
                 "capacity limitation in the same way.",
-                total_dropped, num_tokens * self.top_k, capacity,
+                total_dropped,
+                num_tokens * self.top_k,
+                capacity,
             )
 
         # Standard load-balancing auxiliary loss (Switch Transformer style):
         # encourages uniform routing probability mass and uniform dispatch fraction.
         router_prob_mean = router_probs.mean(dim=0)  # [num_experts]
-        dispatch_mask = F.one_hot(top_k_idx, self.num_experts).float().sum(dim=1)  # [tokens, experts]
+        dispatch_mask = (
+            F.one_hot(top_k_idx, self.num_experts).float().sum(dim=1)
+        )  # [tokens, experts]
         dispatch_fraction = dispatch_mask.mean(dim=0)  # [num_experts]
         aux_loss = self.num_experts * torch.sum(router_prob_mean * dispatch_fraction)
         aux_loss = aux_loss * self.load_balancing_weight
@@ -132,7 +154,9 @@ class _PyTorchMoEFallback(nn.Module):
         # same 0..1-summing-to-1 scale as the DeepSpeed backend's
         # counts/total normalization, rather than two backends silently
         # reporting the same metric on different scales.
-        normalized_utilization = dispatch_fraction / dispatch_fraction.sum().clamp(min=1e-8)
+        normalized_utilization = dispatch_fraction / dispatch_fraction.sum().clamp(
+            min=1e-8
+        )
         self.last_expert_utilization = {
             i: float(normalized_utilization[i].item()) for i in range(self.num_experts)
         }
@@ -154,12 +178,12 @@ class MoELayer(nn.Module):
         capacity_factor: float = 1.25,
         load_balancing_weight: float = 0.01,
         ep_size: int = 1,
-        quantization: str = "none",
+        quantization: QuantizationMode = "none",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.uses_deepspeed = _DEEPSPEED_MOE_AVAILABLE
-        self.last_expert_utilization: Optional[Dict[int, float]] = None
+        self.last_expert_utilization: dict[int, float] | None = None
         # Only used on the DeepSpeed path (the fallback scales its own
         # aux_loss internally) -- see the load_balancing_weight comment in
         # forward() for why this is applied here rather than passed into
@@ -195,11 +219,17 @@ class MoELayer(nn.Module):
                 "production multi-GPU MoE training."
             )
             self.moe = _PyTorchMoEFallback(
-                hidden_size, intermediate_size, num_experts, top_k,
-                capacity_factor, load_balancing_weight, num_layers=num_layers, quantization=quantization,
+                hidden_size,
+                intermediate_size,
+                num_experts,
+                top_k,
+                capacity_factor,
+                load_balancing_weight,
+                num_layers=num_layers,
+                quantization=quantization,
             )
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.uses_deepspeed:
             raw_output = self.moe(x)
             try:
@@ -225,13 +255,15 @@ class MoELayer(nn.Module):
                 total = counts.sum()
                 if total > 0:
                     self.last_expert_utilization = {
-                        i: float((counts[i] / total).item()) for i in range(counts.shape[0])
+                        i: float((counts[i] / total).item())
+                        for i in range(counts.shape[0])
                     }
             except (AttributeError, TypeError, IndexError) as exc:
                 logger.warning(
                     "Could not derive expert_utilization from DeepSpeed's exp_counts "
                     "(got %r): %s. Expert-collapse detection will be skipped this step.",
-                    type(exp_counts).__name__, exc,
+                    type(exp_counts).__name__,
+                    exc,
                 )
             # DeepSpeedMoE.forward() returns the raw, unscaled load-balancing
             # loss (see the constructor comment on why load_balancing_weight

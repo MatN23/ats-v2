@@ -7,7 +7,11 @@ import math
 
 class WarmupCosineScheduler:
     def __init__(
-        self, base_lr: float, warmup_steps: int, max_steps: int, min_lr_ratio: float = 0.1,
+        self,
+        base_lr: float,
+        warmup_steps: int,
+        max_steps: int,
+        min_lr_ratio: float = 0.1,
     ) -> None:
         if warmup_steps < 0:
             raise ValueError(f"warmup_steps must be >= 0, got {warmup_steps}.")
@@ -32,6 +36,8 @@ class WarmupCosineScheduler:
             return self.base_lr * (step + 1) / self.warmup_steps
         if step >= self.max_steps:
             return self.min_lr
-        progress = (step - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps)
+        progress = (step - self.warmup_steps) / max(
+            1, self.max_steps - self.warmup_steps
+        )
         cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
         return self.min_lr + (self.base_lr - self.min_lr) * cosine_factor

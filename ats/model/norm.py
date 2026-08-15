@@ -4,8 +4,8 @@ falls back to a plain, correct nn.Module implementation otherwise. No custom ker
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 
 class RMSNorm(nn.Module):
@@ -34,4 +34,4 @@ class RMSNorm(nn.Module):
         x = x.to(torch.float32)
         variance = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
-        return (self.weight * x.to(input_dtype))
+        return self.weight * x.to(input_dtype)

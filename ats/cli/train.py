@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import List, Optional
 
 from ats.config.loader import load_config
 from ats.config.schema import ATSConfig, ConfigError
@@ -44,8 +43,11 @@ def _bool_flag(parser: argparse.ArgumentParser, name: str, help_text: str = "") 
     or None if the user passed neither (so YAML/preset values aren't
     clobbered by an argparse default)."""
     parser.add_argument(
-        f"--{name}", dest=name.replace("-", "_"),
-        action=argparse.BooleanOptionalAction, default=None, help=help_text,
+        f"--{name}",
+        dest=name.replace("-", "_"),
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=help_text,
     )
 
 
@@ -54,12 +56,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Train an ats-v2 model from a single YAML config, with CLI overrides.",
     )
     parser.add_argument("--config", required=True, help="Path to a YAML config file.")
-    parser.add_argument("--resume", default=None, help="Checkpoint directory to resume from.")
     parser.add_argument(
-        "--micro-batch-size", type=int, default=None,
+        "--resume", default=None, help="Checkpoint directory to resume from."
+    )
+    parser.add_argument(
+        "--micro-batch-size",
+        type=int,
+        default=None,
         help="Per-GPU micro batch size. Overrides training.micro_batch_size from the "
-             "config if given; otherwise the resolved config value (YAML, or its "
-             "Pydantic default of 1) is used.",
+        "config if given; otherwise the resolved config value (YAML, or its "
+        "Pydantic default of 1) is used.",
     )
 
     # --- Architecture toggles ---
@@ -71,11 +77,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     _bool_flag(parser, "use-mtp", "Enable Multi-Token Prediction.")
 
     parser.add_argument(
-        "--architecture", choices=_ARCHITECTURE_PRESETS, default=None,
+        "--architecture",
+        choices=_ARCHITECTURE_PRESETS,
+        default=None,
         help="Convenience preset that sets multiple architecture flags at once. "
-             "An explicit --use-x/--no-use-x for the same flag overrides the preset.",
+        "An explicit --use-x/--no-use-x for the same flag overrides the preset.",
     )
-    parser.add_argument("--model-type", choices=["autoregressive", "diffusion"], default=None)
+    parser.add_argument(
+        "--model-type", choices=["autoregressive", "diffusion"], default=None
+    )
     parser.add_argument("--quantization", choices=["none", "int8", "fp8"], default=None)
 
     # --- Numeric architecture overrides ---
@@ -102,19 +112,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--intermediate-size", type=int, default=None)
     parser.add_argument("--vocab-size", type=int, default=None)
     parser.add_argument("--max-seq-len", type=int, default=None)
-    _bool_flag(parser, "tie-word-embeddings", "Tie the LM head to the embedding matrix.")
+    _bool_flag(
+        parser, "tie-word-embeddings", "Tie the LM head to the embedding matrix."
+    )
     parser.add_argument("--dropout", type=float, default=None)
     parser.add_argument("--rms-norm-eps", type=float, default=None)
     parser.add_argument("--rope-theta", type=float, default=None)
     _bool_flag(parser, "use-flash-attention", "Use flash-attn where available.")
     parser.add_argument(
-        "--checkpoint-every-n-layers", type=int, default=None,
+        "--checkpoint-every-n-layers",
+        type=int,
+        default=None,
         help="Apply activation checkpointing every Nth transformer layer (1 = every "
-             "layer, matching the old --gradient-checkpointing flag). Omit to leave "
-             "checkpointing disabled/as configured.",
+        "layer, matching the old --gradient-checkpointing flag). Omit to leave "
+        "checkpointing disabled/as configured.",
     )
     _bool_flag(
-        parser, "gradient-checkpointing",
+        parser,
+        "gradient-checkpointing",
         "Deprecated alias for --checkpoint-every-n-layers 1 / --no-checkpoint-every-n-layers. "
         "Use --checkpoint-every-n-layers instead.",
     )
@@ -130,13 +145,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-every", type=int, default=None)
     parser.add_argument("--save-every", type=int, default=None)
     parser.add_argument("--keep-last-n-checkpoints", type=int, default=None)
-    parser.add_argument("--mixed-precision", choices=["bf16", "fp16", "fp32"], default=None)
+    parser.add_argument(
+        "--mixed-precision", choices=["bf16", "fp16", "fp32"], default=None
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
-        "--optimizer-bits", type=int, choices=[32, 8], default=None,
+        "--optimizer-bits",
+        type=int,
+        choices=[32, 8],
+        default=None,
         help="Optimizer precision. 8 uses bitsandbytes 8-bit Adam (requires the "
-             "'8bit' extra) instead of torch AdamW, trading a small amount of "
-             "precision for roughly 4x less optimizer-state memory.",
+        "'8bit' extra) instead of torch AdamW, trading a small amount of "
+        "precision for roughly 4x less optimizer-state memory.",
     )
 
     # --- Data overrides ---
@@ -147,8 +167,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # --- Parallelism overrides ---
     parser.add_argument(
         "--parallelism-strategy",
-        choices=["auto", "deepspeed_zero0", "deepspeed_zero1", "deepspeed_zero2",
-                 "deepspeed_zero3", "deepspeed_moe", "fsdp"],
+        choices=[
+            "auto",
+            "deepspeed_zero0",
+            "deepspeed_zero1",
+            "deepspeed_zero2",
+            "deepspeed_zero3",
+            "deepspeed_moe",
+            "fsdp",
+        ],
         default=None,
     )
     parser.add_argument("--gpus", type=int, default=None)
@@ -245,7 +272,9 @@ def apply_cli_overrides(config: ATSConfig, args: argparse.Namespace) -> ATSConfi
             "--gradient-checkpointing is deprecated; use --checkpoint-every-n-layers "
             "instead (1 = every layer, matching --gradient-checkpointing)."
         )
-        model_updates["checkpoint_every_n_layers"] = 1 if args.gradient_checkpointing else None
+        model_updates["checkpoint_every_n_layers"] = (
+            1 if args.gradient_checkpointing else None
+        )
 
     # Bug 13 fix: collect every section's update into one dict and apply it
     # with a single top-level config.model_copy(update=...) call at the end,
@@ -272,11 +301,17 @@ def apply_cli_overrides(config: ATSConfig, args: argparse.Namespace) -> ATSConfi
     }
     training_updates = {k: v for k, v in training_fields.items() if v is not None}
     if training_updates:
-        top_level_updates["training"] = config.training.model_copy(update=training_updates)
+        top_level_updates["training"] = config.training.model_copy(
+            update=training_updates
+        )
 
-    optimizer_updates = {k: v for k, v in {"bits": args.optimizer_bits}.items() if v is not None}
+    optimizer_updates = {
+        k: v for k, v in {"bits": args.optimizer_bits}.items() if v is not None
+    }
     if optimizer_updates:
-        top_level_updates["optimizer"] = config.optimizer.model_copy(update=optimizer_updates)
+        top_level_updates["optimizer"] = config.optimizer.model_copy(
+            update=optimizer_updates
+        )
 
     data_fields = {
         "seq_length": args.seq_length,
@@ -294,11 +329,17 @@ def apply_cli_overrides(config: ATSConfig, args: argparse.Namespace) -> ATSConfi
     }
     parallelism_updates = {k: v for k, v in parallelism_fields.items() if v is not None}
     if parallelism_updates:
-        top_level_updates["parallelism"] = config.parallelism.model_copy(update=parallelism_updates)
+        top_level_updates["parallelism"] = config.parallelism.model_copy(
+            update=parallelism_updates
+        )
 
-    checkpoint_updates = {k: v for k, v in {"output_dir": args.output_dir}.items() if v is not None}
+    checkpoint_updates = {
+        k: v for k, v in {"output_dir": args.output_dir}.items() if v is not None
+    }
     if checkpoint_updates:
-        top_level_updates["checkpoint"] = config.checkpoint.model_copy(update=checkpoint_updates)
+        top_level_updates["checkpoint"] = config.checkpoint.model_copy(
+            update=checkpoint_updates
+        )
 
     logging_fields = {
         "project_name": args.project_name,
@@ -320,13 +361,13 @@ def apply_cli_overrides(config: ATSConfig, args: argparse.Namespace) -> ATSConfi
     # use_mtp + model_type=diffusion).
     try:
         config = ATSConfig.model_validate(config.model_dump())
-    except Exception as exc:  # noqa: BLE001 -- re-raised as ConfigError immediately below
+    except Exception as exc:
         raise ConfigError(f"CLI overrides produced an invalid config: {exc}") from exc
 
     return config
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     setup_logging()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -341,9 +382,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info(
         "Resolved config: model=%s hidden_size=%d num_layers=%d "
         "use_swa=%s use_mla=%s use_mamba=%s use_moe=%s use_mod=%s use_mtp=%s model_type=%s",
-        config.model.name, config.model.hidden_size, config.model.num_layers,
-        config.model.use_swa, config.model.use_mla, config.model.use_mamba,
-        config.model.use_moe, config.model.use_mod, config.model.use_mtp, config.model.model_type,
+        config.model.name,
+        config.model.hidden_size,
+        config.model.num_layers,
+        config.model.use_swa,
+        config.model.use_mla,
+        config.model.use_mamba,
+        config.model.use_moe,
+        config.model.use_mod,
+        config.model.use_mtp,
+        config.model.model_type,
     )
 
     # Bug 4 fix: ep_size comes from parallelism.gpus/nodes on the top-level
@@ -357,7 +405,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # environment variables. We shard the data stream by global rank across
     # the full world (gpus * nodes) so every process sees a disjoint slice
     # instead of every GPU redundantly processing the same examples.
-    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
     # Bug 5 fix: prefer the launcher's actual WORLD_SIZE (set by
     # torchrun/DeepSpeed) over the config value. If the config and the
     # launcher environment disagree, deriving world_size from config alone
@@ -377,20 +425,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     train_dataloader = build_dataloader(
-        config.data, batch_size=config.training.micro_batch_size,
-        rank=rank, world_size=world_size,
+        config.data,
+        batch_size=config.training.micro_batch_size,
+        rank=rank,
+        world_size=world_size,
         seed=config.training.seed,
     )
 
+    trainer: Trainer | DiffusionTrainer
     try:
         if config.model.model_type == "diffusion":
             trainer = DiffusionTrainer(
-                model=model, config=config, train_dataloader=train_dataloader,
+                model=model,
+                config=config,
+                train_dataloader=train_dataloader,
                 micro_batch_size=config.training.micro_batch_size,
             )
         else:
             trainer = Trainer(
-                model=model, config=config, train_dataloader=train_dataloader,
+                model=model,
+                config=config,
+                train_dataloader=train_dataloader,
                 micro_batch_size=config.training.micro_batch_size,
             )
     except ConfigError as exc:

@@ -6,7 +6,11 @@ import pytest
 import torch
 
 from ats.config.schema import (
-    ATSConfig, DataConfig, DataSource, ModelConfig, TrainingConfig,
+    ATSConfig,
+    DataConfig,
+    DataSource,
+    ModelConfig,
+    TrainingConfig,
 )
 from ats.model.transformer import ATSTransformer
 
@@ -14,8 +18,13 @@ from ats.model.transformer import ATSTransformer
 @pytest.fixture
 def dummy_model_config() -> ModelConfig:
     return ModelConfig(
-        hidden_size=64, num_layers=2, num_heads=4, num_kv_heads=2,
-        intermediate_size=128, vocab_size=100, max_seq_len=64,
+        hidden_size=64,
+        num_layers=2,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=128,
+        vocab_size=100,
+        max_seq_len=64,
     )
 
 
@@ -24,7 +33,9 @@ def dummy_ats_config(dummy_model_config: ModelConfig) -> ATSConfig:
     return ATSConfig(
         model=dummy_model_config,
         training=TrainingConfig(max_steps=20, learning_rate=1e-3, warmup_steps=2),
-        data=DataConfig(sources=[DataSource(path="dummy.jsonl", weight=1.0)], seq_length=16),
+        data=DataConfig(
+            sources=[DataSource(path="dummy.jsonl", weight=1.0)], seq_length=16
+        ),
     )
 
 

@@ -21,7 +21,6 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional
 
 from ats.config.loader import load_config
 from ats.config.schema import ATSConfig, ConfigError
@@ -41,19 +40,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config", required=True, help="Path to a YAML config file.")
     parser.add_argument(
-        "--checkpoint", dest="checkpoint", default=None,
+        "--checkpoint",
+        dest="checkpoint",
+        default=None,
         help="Base model checkpoint directory to fine-tune from, e.g. "
-             "checkpoints/run/step_10000 (must contain model.safetensors, as "
-             "written by CheckpointManager.save).",
+        "checkpoints/run/step_10000 (must contain model.safetensors, as "
+        "written by CheckpointManager.save).",
     )
     parser.add_argument(
-        "--base-checkpoint", dest="checkpoint", default=None,
+        "--base-checkpoint",
+        dest="checkpoint",
+        default=None,
         help="Deprecated alias for --checkpoint.",
     )
     parser.add_argument(
-        "--output-dir", default=None,
+        "--output-dir",
+        default=None,
         help="Directory to write the LoRA adapter and merged checkpoint to. "
-             "Defaults to checkpoint.output_dir from the config.",
+        "Defaults to checkpoint.output_dir from the config.",
     )
 
     # --- PEFT overrides (mutate config.peft; see apply_cli_overrides) ---
@@ -61,13 +65,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-alpha", type=int, default=None)
     parser.add_argument("--lora-dropout", type=float, default=None)
     parser.add_argument(
-        "--target-modules", type=str, default=None,
+        "--target-modules",
+        type=str,
+        default=None,
         help="Comma-separated module names to wrap with LoRA adapters, e.g. "
-             "'q_proj,v_proj,o_proj'.",
+        "'q_proj,v_proj,o_proj'.",
     )
 
     parser.add_argument(
-        "--micro-batch-size", type=int, default=None,
+        "--micro-batch-size",
+        type=int,
+        default=None,
         help="Per-GPU micro batch size. Overrides training.micro_batch_size.",
     )
     parser.add_argument("--max-steps", type=int, default=None)
@@ -85,12 +93,16 @@ def apply_cli_overrides(config: ATSConfig, args: argparse.Namespace) -> ATSConfi
     }
     peft_updates = {k: v for k, v in peft_fields.items() if v is not None}
     if args.target_modules is not None:
-        peft_updates["target_modules"] = [m.strip() for m in args.target_modules.split(",") if m.strip()]
+        peft_updates["target_modules"] = [
+            m.strip() for m in args.target_modules.split(",") if m.strip()
+        ]
     # Running ats-finetune at all implies LoRA is what the user wants, so
     # force peft.enabled=True regardless of what the YAML says -- there is
     # no other reason to invoke this entry point.
     peft_updates["enabled"] = True
-    config = config.model_copy(update={"peft": config.peft.model_copy(update=peft_updates)})
+    config = config.model_copy(
+        update={"peft": config.peft.model_copy(update=peft_updates)}
+    )
 
     training_fields = {
         "max_steps": args.max_steps,
@@ -99,11 +111,13 @@ def apply_cli_overrides(config: ATSConfig, args: argparse.Namespace) -> ATSConfi
     }
     training_updates = {k: v for k, v in training_fields.items() if v is not None}
     if training_updates:
-        config = config.model_copy(update={"training": config.training.model_copy(update=training_updates)})
+        config = config.model_copy(
+            update={"training": config.training.model_copy(update=training_updates)}
+        )
 
     try:
         config = ATSConfig.model_validate(config.model_dump())
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise ConfigError(f"CLI overrides produced an invalid config: {exc}") from exc
 
     return config
@@ -170,12 +184,15 @@ def _build_lora_model(model: ATSTransformer, config: ATSConfig):
     total = sum(p.numel() for p in peft_model.parameters())
     logger.info(
         "LoRA adapters injected on %s: %d/%d trainable params (%.3f%%)",
-        peft_config.target_modules, trainable, total, 100 * trainable / total,
+        peft_config.target_modules,
+        trainable,
+        total,
+        100 * trainable / total,
     )
     return peft_model
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     setup_logging()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -192,14 +209,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.error("Config error: %s", exc)
         return 1
 
-    output_dir = Path(args.output_dir if args.output_dir is not None else config.checkpoint.output_dir)
+    output_dir = Path(
+        args.output_dir if args.output_dir is not None else config.checkpoint.output_dir
+    )
     lora_dir = output_dir / "lora_adapter"
     merged_dir = output_dir / "merged"
 
     logger.info(
         "Fine-tuning %s from %s with LoRA(r=%d, alpha=%d, target_modules=%s)",
-        config.model.name, args.checkpoint,
-        config.peft.lora_r, config.peft.lora_alpha, config.peft.target_modules,
+        config.model.name,
+        args.checkpoint,
+        config.peft.lora_r,
+        config.peft.lora_alpha,
+        config.peft.target_modules,
     )
 
     # Bug 4 fix: thread ep_size through from parallelism config (see
@@ -223,7 +245,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "Base checkpoint at %s does not match the model architecture described by "
             "--config (parameter shape mismatch): %s. "
             "Fix: use the exact config the checkpoint was trained with.",
-            args.checkpoint, exc,
+            args.checkpoint,
+            exc,
         )
         return 1
     if missing or unexpected:
@@ -231,7 +254,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             "Base checkpoint at %s does not match the model architecture described by "
             "--config: %d missing key(s), %d unexpected key(s) (e.g. missing=%s, "
             "unexpected=%s). Fix: use the exact config the checkpoint was trained with.",
-            args.checkpoint, len(missing), len(unexpected), missing[:3], unexpected[:3],
+            args.checkpoint,
+            len(missing),
+            len(unexpected),
+            missing[:3],
+            unexpected[:3],
         )
         return 1
 
@@ -241,16 +268,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.error("Config error: %s", exc)
         return 1
 
-    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
     world_size = config.parallelism.gpus * config.parallelism.nodes
     train_dataloader = build_dataloader(
-        config.data, batch_size=config.training.micro_batch_size,
-        rank=rank, world_size=world_size, seed=config.training.seed,
+        config.data,
+        batch_size=config.training.micro_batch_size,
+        rank=rank,
+        world_size=world_size,
+        seed=config.training.seed,
     )
 
     try:
         trainer = Trainer(
-            model=peft_model, config=config, train_dataloader=train_dataloader,
+            model=peft_model,
+            config=config,
+            train_dataloader=train_dataloader,
             micro_batch_size=config.training.micro_batch_size,
         )
     except ConfigError as exc:
@@ -265,7 +297,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # requirement CheckpointManager.save documents -- but only rank 0 should
     # write files, or every rank would race to write the same output paths.
     trained_module = (
-        trainer.model_engine.module if hasattr(trainer.model_engine, "module") else trainer.model_engine
+        trainer.model_engine.module
+        if hasattr(trainer.model_engine, "module")
+        else trainer.model_engine
     )
     if rank == 0:
         trained_module.save_pretrained(str(lora_dir))
@@ -278,7 +312,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     # immediately after -- export_to_huggingface below needs the real one.
     base_module = model  # same nn.Module instance peft_model wraps
     original_config = base_module.config
-    base_module.config = {"tie_word_embeddings": config.model.tie_word_embeddings}
+    # Deliberately violates base_module.config's static ModelConfig type for
+    # the duration of this call -- see the comment above for why peft needs
+    # a dict-like shim here. Restored to the real ModelConfig immediately
+    # after in the `finally` block.
+    base_module.config = {  # type: ignore[assignment]
+        "tie_word_embeddings": config.model.tie_word_embeddings
+    }
     try:
         merged_model = trained_module.merge_and_unload()
     finally:
@@ -286,9 +326,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if rank == 0:
         export_to_huggingface(
-            model=merged_model, model_config=config.model, output_dir=str(merged_dir),
+            model=merged_model,
+            model_config=config.model,
+            output_dir=str(merged_dir),
         )
-        logger.info("Saved LoRA adapter to %s and merged checkpoint to %s", lora_dir, merged_dir)
+        logger.info(
+            "Saved LoRA adapter to %s and merged checkpoint to %s", lora_dir, merged_dir
+        )
 
     return 0
 

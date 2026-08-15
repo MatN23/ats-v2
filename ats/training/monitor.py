@@ -4,7 +4,6 @@ No background threads — flush happens synchronously when the trainer calls log
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Optional
 
 from ats.config.schema import LoggingConfig
 from ats.utils.logging_utils import get_logger
@@ -17,7 +16,7 @@ class Monitor:
     def __init__(self, config: LoggingConfig) -> None:
         self.config = config
         self._tokens_seen_at_last_log = 0
-        self._time_at_last_log: Optional[float] = None
+        self._time_at_last_log: float | None = None
 
         self._tb_writer = None
         if config.use_tensorboard:
@@ -42,7 +41,7 @@ class Monitor:
             wandb.init(project=config.project_name)
             self._wandb = wandb
 
-    def log(self, step: int, metrics: Dict[str, float], tokens_per_step: int) -> None:
+    def log(self, step: int, metrics: dict[str, float], tokens_per_step: int) -> None:
         now = time.monotonic()
         tokens_per_sec = 0.0
         if self._time_at_last_log is not None:

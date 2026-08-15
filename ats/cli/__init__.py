@@ -7,4 +7,4 @@ silently doing nothing, so running them tells you what's missing instead of
 looking like a hang or a no-op.
 """
 
-__all__ = ["train", "evaluate", "export", "doctor", "finetune", "align"]
+__all__ = ["align", "doctor", "evaluate", "export", "finetune", "train"]

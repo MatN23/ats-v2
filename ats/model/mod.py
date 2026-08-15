@@ -17,14 +17,15 @@ and passing the wrapped block's past_key_value through unchanged.
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 class MixtureOfDepths(nn.Module):
-    def __init__(self, hidden_size: int, block: nn.Module, capacity_factor: float = 0.5) -> None:
+    def __init__(
+        self, hidden_size: int, block: nn.Module, capacity_factor: float = 0.5
+    ) -> None:
         super().__init__()
         if not 0.0 < capacity_factor <= 1.0:
             raise ValueError(
@@ -39,16 +40,17 @@ class MixtureOfDepths(nn.Module):
         # so the initial selection rate roughly matches the target capacity.
         if self.capacity_factor < 0.5:
             nn.init.constant_(
-                self.gate.bias, math.log(self.capacity_factor / (1 - self.capacity_factor))
+                self.gate.bias,
+                math.log(self.capacity_factor / (1 - self.capacity_factor)),
             )
 
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[object] = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_value: object | None = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[object]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, object | None]:
         # Bug 1 fix: torch.utils.checkpoint.checkpoint in transformer.py calls
         # layer(x, attention_mask, past_kv, use_cache) positionally, so this
         # signature must accept those as named positional args, not just
@@ -58,7 +60,7 @@ class MixtureOfDepths(nn.Module):
             "past_key_value": past_key_value,
             "use_cache": use_cache,
         }
-        batch, seq_len, hidden_size = x.shape
+        _batch, seq_len, hidden_size = x.shape
         if hidden_size != self.hidden_size:
             raise ValueError(
                 f"MixtureOfDepths expected hidden_size={self.hidden_size}, got {hidden_size}."

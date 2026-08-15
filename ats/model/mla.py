@@ -16,14 +16,13 @@ what makes it safe to cache and reuse across positions.
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from ats.model.attention import build_incremental_causal_mask
-from ats.model.quantization import make_linear
+from ats.model.quantization import QuantizationMode, make_linear
 from ats.model.rope import RotaryEmbedding, apply_rotary_pos_emb
 from ats.model.swa import generate_swa_mask
 
@@ -31,7 +30,7 @@ logger = logging.getLogger("ats.model.mla")
 
 # Cache tuple for MLA holds ONLY the compressed latent (and the shared
 # decoupled-RoPE key slice), never full per-head K/V tensors.
-MLAPastState = Tuple[torch.Tensor, torch.Tensor]  # (latent_cache, rope_k_cache)
+MLAPastState = tuple[torch.Tensor, torch.Tensor]  # (latent_cache, rope_k_cache)
 
 
 class MLAAttention(nn.Module):
@@ -43,8 +42,8 @@ class MLAAttention(nn.Module):
         max_seq_len: int = 4096,
         rope_theta: float = 10000.0,
         dropout: float = 0.0,
-        rope_head_dim: Optional[int] = None,
-        quantization: str = "none",
+        rope_head_dim: int | None = None,
+        quantization: QuantizationMode = "none",
         use_swa: bool = False,
         swa_window_size: int = 4096,
         force_full_attention: bool = False,
@@ -76,33 +75,47 @@ class MLAAttention(nn.Module):
         self.use_swa = use_swa
         self.swa_window_size = swa_window_size
         self.force_full_attention = force_full_attention
-        self.rope_head_dim = rope_head_dim if rope_head_dim is not None else max(2, self.head_dim // 4)
+        self.rope_head_dim = (
+            rope_head_dim if rope_head_dim is not None else max(2, self.head_dim // 4)
+        )
         if self.rope_head_dim % 2 != 0:
             self.rope_head_dim += 1
 
         # Down-projection: hidden_size -> latent_dim. This latent is what's cached.
         self.w_dkv = make_linear(hidden_size, latent_dim, quantization, bias=False)
         # Up-projections from the shared latent to per-head K and V content.
-        self.w_uk = make_linear(latent_dim, num_heads * self.head_dim, quantization, bias=False)
-        self.w_uv = make_linear(latent_dim, num_heads * self.head_dim, quantization, bias=False)
+        self.w_uk = make_linear(
+            latent_dim, num_heads * self.head_dim, quantization, bias=False
+        )
+        self.w_uv = make_linear(
+            latent_dim, num_heads * self.head_dim, quantization, bias=False
+        )
         # Query path: its own down/up compression.
         self.w_dq = make_linear(hidden_size, latent_dim, quantization, bias=False)
-        self.w_uq = make_linear(latent_dim, num_heads * self.head_dim, quantization, bias=False)
+        self.w_uq = make_linear(
+            latent_dim, num_heads * self.head_dim, quantization, bias=False
+        )
         # Decoupled RoPE: a small position-aware slice appended to q/k content,
         # computed directly from x so no position info enters the cached latent.
-        self.w_qr = make_linear(hidden_size, num_heads * self.rope_head_dim, quantization, bias=False)
-        self.w_kr = make_linear(hidden_size, self.rope_head_dim, quantization, bias=False)  # shared across heads
+        self.w_qr = make_linear(
+            hidden_size, num_heads * self.rope_head_dim, quantization, bias=False
+        )
+        self.w_kr = make_linear(
+            hidden_size, self.rope_head_dim, quantization, bias=False
+        )  # shared across heads
 
-        self.o_proj = make_linear(num_heads * self.head_dim, hidden_size, quantization, bias=False)
+        self.o_proj = make_linear(
+            num_heads * self.head_dim, hidden_size, quantization, bias=False
+        )
         self.rotary_emb = RotaryEmbedding(self.rope_head_dim, max_seq_len, rope_theta)
 
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[MLAPastState] = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_value: MLAPastState | None = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[MLAPastState]]:
+    ) -> tuple[torch.Tensor, MLAPastState | None]:
         if x.dim() != 3:
             raise ValueError(
                 f"MLAAttention expected input of shape [batch, seq_len, hidden_size], "
@@ -125,25 +138,47 @@ class MLAAttention(nn.Module):
         else:
             c_kv_full = c_kv
             k_rope_full = k_rope
-        new_past_key_value: Optional[MLAPastState] = (c_kv_full, k_rope_full) if use_cache else None
+        new_past_key_value: MLAPastState | None = (
+            (c_kv_full, k_rope_full) if use_cache else None
+        )
         total_len = past_len + seq_len
 
         # --- Up-project the (full, cached) latent to per-head K/V content ---
-        k_content = self.w_uk(c_kv_full).view(batch, total_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.w_uv(c_kv_full).view(batch, total_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k_content = (
+            self.w_uk(c_kv_full)
+            .view(batch, total_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.w_uv(c_kv_full)
+            .view(batch, total_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
 
         # --- Query path: compress then up-project, current tokens only ---
         c_q = self.w_dq(x)
-        q_content = self.w_uq(c_q).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        q_rope = self.w_qr(x).view(batch, seq_len, self.num_heads, self.rope_head_dim).transpose(1, 2)
+        q_content = (
+            self.w_uq(c_q)
+            .view(batch, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        q_rope = (
+            self.w_qr(x)
+            .view(batch, seq_len, self.num_heads, self.rope_head_dim)
+            .transpose(1, 2)
+        )
 
         # --- Decoupled RoPE applied only to the small rope slice ---
         cos, sin = self.rotary_emb(total_len, device=x.device, dtype=x.dtype)
         k_rope_expanded = k_rope_full.unsqueeze(1).expand(
             batch, self.num_heads, total_len, self.rope_head_dim
         )
-        q_rope_full_pad = F.pad(q_rope, (0, 0, past_len, 0))  # align seq axis for the shared apply call
-        q_rope_rotated, k_rope_rotated = apply_rotary_pos_emb(q_rope_full_pad, k_rope_expanded, cos, sin)
+        q_rope_full_pad = F.pad(
+            q_rope, (0, 0, past_len, 0)
+        )  # align seq axis for the shared apply call
+        q_rope_rotated, k_rope_rotated = apply_rotary_pos_emb(
+            q_rope_full_pad, k_rope_expanded, cos, sin
+        )
         q_rope_rotated = q_rope_rotated[:, :, past_len:total_len, :]
 
         q = torch.cat([q_content, q_rope_rotated], dim=-1)
@@ -154,12 +189,15 @@ class MLAAttention(nn.Module):
         # for the full rationale: neither is_causal=True nor False correctly
         # expresses "new tokens see all cached positions, causal among
         # themselves" when past_key_value is set and seq_len > 1).
+        attn_mask: torch.Tensor | None
         if past_key_value is not None and seq_len > 1 and attention_mask is None:
             attn_mask = build_incremental_causal_mask(seq_len, past_len, x.device)
             is_causal = False
         else:
             attn_mask = attention_mask
-            is_causal = past_key_value is None and attention_mask is None and seq_len > 1
+            is_causal = (
+                past_key_value is None and attention_mask is None and seq_len > 1
+            )
 
         # Bug 2 fix: apply the hybrid SWA window to MLA the same way
         # GroupedQueryAttention does, so "full attention every N layers"
@@ -171,11 +209,16 @@ class MLAAttention(nn.Module):
             is_causal = False
 
         attn_out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask,
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
             dropout_p=self.dropout_p if self.training else 0.0,
             is_causal=is_causal,
         )
-        attn_out = attn_out.transpose(1, 2).reshape(batch, seq_len, self.num_heads * self.head_dim)
+        attn_out = attn_out.transpose(1, 2).reshape(
+            batch, seq_len, self.num_heads * self.head_dim
+        )
         out = self.o_proj(attn_out)
         return out, new_past_key_value
 

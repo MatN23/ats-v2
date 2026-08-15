@@ -26,8 +26,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator, List
 
 import numpy as np
 
@@ -40,23 +40,37 @@ TOKEN_DTYPE = np.int32
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Offline-tokenize a dataset for ats-v2.")
-    parser.add_argument("--input", required=True, help="Input .jsonl file (records with a 'text' field).")
-    parser.add_argument("--output-dir", required=True, help="Directory to write tokens.bin/valid_lengths.npy/meta.json to.")
+    parser = argparse.ArgumentParser(
+        description="Offline-tokenize a dataset for ats-v2."
+    )
     parser.add_argument(
-        "--tokenizer", default="cl100k_base",
+        "--input",
+        required=True,
+        help="Input .jsonl file (records with a 'text' field).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+        help="Directory to write tokens.bin/valid_lengths.npy/meta.json to.",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        default="cl100k_base",
         help="tiktoken encoding name (e.g. cl100k_base) or 'hf:<model_id>' for a HuggingFace tokenizer.",
     )
-    parser.add_argument("--seq-length", type=int, required=True, help="Fixed block length in tokens.")
     parser.add_argument(
-        "--packing", action="store_true",
+        "--seq-length", type=int, required=True, help="Fixed block length in tokens."
+    )
+    parser.add_argument(
+        "--packing",
+        action="store_true",
         help="Pack multiple short documents into each block instead of one document per block.",
     )
     return parser
 
 
 def _resolve_tokenizer_name(tokenizer_arg: str) -> str:
-    if tokenizer_arg.startswith("hf:") or tokenizer_arg.startswith("tiktoken:"):
+    if tokenizer_arg.startswith(("hf:", "tiktoken:")):
         return tokenizer_arg
     return f"tiktoken:{tokenizer_arg}"
 
@@ -70,15 +84,21 @@ def _iter_documents(input_path: Path) -> Iterator[str]:
             try:
                 record = json.loads(line)
             except json.JSONDecodeError as exc:
-                raise ValueError(f"Malformed JSON on line {line_num} of {input_path}: {exc}") from exc
+                raise ValueError(
+                    f"Malformed JSON on line {line_num} of {input_path}: {exc}"
+                ) from exc
             if "text" not in record:
-                raise ValueError(f"Line {line_num} of {input_path} has no 'text' field: {record}")
+                raise ValueError(
+                    f"Line {line_num} of {input_path} has no 'text' field: {record}"
+                )
             yield record["text"]
 
 
 def _tokenize_unpacked(
-    documents: Iterator[str], tokenizer: Tokenizer, seq_length: int,
-) -> Iterator[List[int]]:
+    documents: Iterator[str],
+    tokenizer: Tokenizer,
+    seq_length: int,
+) -> Iterator[list[int]]:
     """One block per document: truncate long documents, pad short ones."""
     for text in documents:
         ids = tokenizer.encode(text) + [tokenizer.eos_token_id]
@@ -88,11 +108,13 @@ def _tokenize_unpacked(
 
 
 def _tokenize_packed(
-    documents: Iterator[str], tokenizer: Tokenizer, seq_length: int,
-) -> Iterator[List[int]]:
+    documents: Iterator[str],
+    tokenizer: Tokenizer,
+    seq_length: int,
+) -> Iterator[list[int]]:
     """Concatenate documents (EOS-delimited) and slice into full seq_length
     blocks; only the very last block of the whole corpus may be partial."""
-    buffer: List[int] = []
+    buffer: list[int] = []
     for text in documents:
         buffer.extend(tokenizer.encode(text) + [tokenizer.eos_token_id])
         while len(buffer) >= seq_length:
@@ -103,7 +125,11 @@ def _tokenize_packed(
 
 
 def preprocess(
-    input_path: str, output_dir: str, tokenizer_name: str, seq_length: int, packing: bool,
+    input_path: str,
+    output_dir: str,
+    tokenizer_name: str,
+    seq_length: int,
+    packing: bool,
 ) -> int:
     """Runs the full offline preprocessing pipeline. Returns the number of
     blocks written.
@@ -123,11 +149,14 @@ def preprocess(
     out_path.mkdir(parents=True, exist_ok=True)
 
     documents = _iter_documents(Path(input_path))
-    block_generator = _tokenize_packed(documents, tokenizer, seq_length) if packing \
+    block_generator = (
+        _tokenize_packed(documents, tokenizer, seq_length)
+        if packing
         else _tokenize_unpacked(documents, tokenizer, seq_length)
+    )
 
     bin_path = out_path / "tokens.bin"
-    valid_lengths: List[int] = []
+    valid_lengths: list[int] = []
     num_blocks = 0
 
     with open(bin_path, "wb") as bin_file:
@@ -147,7 +176,9 @@ def preprocess(
 
     if num_blocks == 0:
         bin_path.unlink()  # clean up the empty file rather than leaving a stray 0-byte artifact
-        raise ValueError(f"No documents were tokenized from {input_path}; is the file empty?")
+        raise ValueError(
+            f"No documents were tokenized from {input_path}; is the file empty?"
+        )
 
     np.save(out_path / "valid_lengths.npy", np.array(valid_lengths, dtype=np.int32))
 
@@ -168,7 +199,10 @@ def preprocess(
     padding_fraction = 1.0 - (total_tokens / total_capacity) if total_capacity else 0.0
     logger.info(
         "Wrote %d blocks (%d real tokens, %.1f%% padding) to %s",
-        num_blocks, total_tokens, padding_fraction * 100, out_path,
+        num_blocks,
+        total_tokens,
+        padding_fraction * 100,
+        out_path,
     )
     return num_blocks
 
@@ -179,7 +213,9 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        preprocess(args.input, args.output_dir, args.tokenizer, args.seq_length, args.packing)
+        preprocess(
+            args.input, args.output_dir, args.tokenizer, args.seq_length, args.packing
+        )
     except (ValueError, FileNotFoundError) as exc:
         logger.error("Preprocessing failed: %s", exc)
         return 1

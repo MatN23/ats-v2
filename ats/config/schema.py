@@ -9,7 +9,7 @@ training code.
 from __future__ import annotations
 
 import warnings
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -29,14 +29,14 @@ class ModelConfig(BaseModel):
     """
 
     name: str = "ats_transformer"
-    size: Optional[str] = None
+    size: str | None = None
 
     vocab_size: int = 50304
-    hidden_size: Optional[int] = None
-    num_layers: Optional[int] = None
-    num_heads: Optional[int] = None
-    num_kv_heads: Optional[int] = None
-    intermediate_size: Optional[int] = None
+    hidden_size: int | None = None
+    num_layers: int | None = None
+    num_heads: int | None = None
+    num_kv_heads: int | None = None
+    intermediate_size: int | None = None
     max_seq_len: int = 4096
     tie_word_embeddings: bool = True
 
@@ -58,14 +58,14 @@ class ModelConfig(BaseModel):
     # == 0`. 1 checkpoints every layer (equivalent to the old
     # gradient_checkpointing=True); None or 0 disables checkpointing entirely
     # (equivalent to the old gradient_checkpointing=False, and the default).
-    checkpoint_every_n_layers: Optional[int] = None
+    checkpoint_every_n_layers: int | None = None
 
     use_swa: bool = False
     swa_window_size: int = 4096
     swa_full_attention_interval: int = 4
 
     use_mla: bool = False
-    mla_latent_dim: Optional[int] = None
+    mla_latent_dim: int | None = None
     mla_compression_ratio: float = 0.25
 
     use_mamba: bool = False
@@ -110,7 +110,7 @@ class ModelConfig(BaseModel):
 
     @field_validator("checkpoint_every_n_layers")
     @classmethod
-    def _validate_checkpoint_every_n_layers(cls, v: Optional[int]) -> Optional[int]:
+    def _validate_checkpoint_every_n_layers(cls, v: int | None) -> int | None:
         if v is not None and v <= 0:
             raise ConfigError(
                 f"model.checkpoint_every_n_layers must be a positive integer or None, "
@@ -223,7 +223,13 @@ class ModelConfig(BaseModel):
             )
         return v
 
-    @field_validator("mamba_d_state", "mamba_d_conv", "mamba_expand", "mamba_every_n_layers", "mamba_chunk_size")
+    @field_validator(
+        "mamba_d_state",
+        "mamba_d_conv",
+        "mamba_expand",
+        "mamba_every_n_layers",
+        "mamba_chunk_size",
+    )
     @classmethod
     def _validate_mamba_positive(cls, v: int) -> int:
         if v <= 0:
@@ -247,7 +253,7 @@ class ModelConfig(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _check_mtp_diffusion_incompatible(self) -> "ModelConfig":
+    def _check_mtp_diffusion_incompatible(self) -> ModelConfig:
         if self.use_mtp and self.model_type == "diffusion":
             raise ConfigError(
                 "model.use_mtp=True is incompatible with model.model_type='diffusion': "
@@ -258,21 +264,27 @@ class ModelConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _check_heads(self) -> "ModelConfig":
-        if self.num_heads is not None and self.num_kv_heads is not None:
-            if self.num_heads % self.num_kv_heads != 0:
-                raise ConfigError(
-                    f"model.num_heads ({self.num_heads}) must be divisible by "
-                    f"model.num_kv_heads ({self.num_kv_heads}) for grouped-query "
-                    f"attention. Fix: choose num_kv_heads that evenly divides num_heads."
-                )
-        if self.hidden_size is not None and self.num_heads is not None:
-            if self.hidden_size % self.num_heads != 0:
-                raise ConfigError(
-                    f"model.hidden_size ({self.hidden_size}) must be divisible by "
-                    f"model.num_heads ({self.num_heads}). "
-                    f"Fix: choose a hidden_size that is a multiple of num_heads."
-                )
+    def _check_heads(self) -> ModelConfig:
+        if (
+            self.num_heads is not None
+            and self.num_kv_heads is not None
+            and self.num_heads % self.num_kv_heads != 0
+        ):
+            raise ConfigError(
+                f"model.num_heads ({self.num_heads}) must be divisible by "
+                f"model.num_kv_heads ({self.num_kv_heads}) for grouped-query "
+                f"attention. Fix: choose num_kv_heads that evenly divides num_heads."
+            )
+        if (
+            self.hidden_size is not None
+            and self.num_heads is not None
+            and self.hidden_size % self.num_heads != 0
+        ):
+            raise ConfigError(
+                f"model.hidden_size ({self.hidden_size}) must be divisible by "
+                f"model.num_heads ({self.num_heads}). "
+                f"Fix: choose a hidden_size that is a multiple of num_heads."
+            )
         return self
 
     @property
@@ -298,8 +310,13 @@ class ModelConfig(BaseModel):
         return computed
 
     def is_resolved(self) -> bool:
-        required = (self.hidden_size, self.num_layers, self.num_heads,
-                    self.num_kv_heads, self.intermediate_size)
+        required = (
+            self.hidden_size,
+            self.num_layers,
+            self.num_heads,
+            self.num_kv_heads,
+            self.intermediate_size,
+        )
         return all(v is not None for v in required)
 
 
@@ -383,7 +400,7 @@ class TrainingConfig(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _check_warmup_vs_max_steps(self) -> "TrainingConfig":
+    def _check_warmup_vs_max_steps(self) -> TrainingConfig:
         if self.warmup_steps > self.max_steps:
             raise ConfigError(
                 f"training.warmup_steps ({self.warmup_steps}) cannot exceed "
@@ -420,19 +437,21 @@ class PeftConfig(BaseModel):
     enabled: bool = False
     lora_r: int = 8
     lora_alpha: int = 16
-    target_modules: List[str] = Field(default_factory=lambda: ["q_proj", "v_proj"])
+    target_modules: list[str] = Field(default_factory=lambda: ["q_proj", "v_proj"])
     lora_dropout: float = 0.05
 
     @field_validator("lora_r", "lora_alpha")
     @classmethod
     def _validate_positive(cls, v: int) -> int:
         if v <= 0:
-            raise ConfigError(f"peft.lora_r and peft.lora_alpha must be positive, got {v}.")
+            raise ConfigError(
+                f"peft.lora_r and peft.lora_alpha must be positive, got {v}."
+            )
         return v
 
     @field_validator("target_modules")
     @classmethod
-    def _validate_target_modules(cls, v: List[str]) -> List[str]:
+    def _validate_target_modules(cls, v: list[str]) -> list[str]:
         if not v:
             raise ConfigError(
                 "peft.target_modules must contain at least one module name, e.g. "
@@ -464,14 +483,14 @@ class DataSource(BaseModel):
 
 
 class DataConfig(BaseModel):
-    sources: List[DataSource]
+    sources: list[DataSource]
     seq_length: int
     tokenizer_name: str = "tiktoken:cl100k_base"
     streaming: bool = True
 
     @field_validator("sources")
     @classmethod
-    def _validate_sources(cls, v: List[DataSource]) -> List[DataSource]:
+    def _validate_sources(cls, v: list[DataSource]) -> list[DataSource]:
         if not v:
             raise ConfigError(
                 "data.sources must contain at least one entry. "
@@ -492,8 +511,13 @@ class DataConfig(BaseModel):
 
 class ParallelismConfig(BaseModel):
     strategy: Literal[
-        "auto", "deepspeed_zero0", "deepspeed_zero1", "deepspeed_zero2",
-        "deepspeed_zero3", "deepspeed_moe", "fsdp",
+        "auto",
+        "deepspeed_zero0",
+        "deepspeed_zero1",
+        "deepspeed_zero2",
+        "deepspeed_zero3",
+        "deepspeed_moe",
+        "fsdp",
     ] = "auto"
     gpus: int = 1
     nodes: int = 1
@@ -529,11 +553,11 @@ class LoggingConfig(BaseModel):
 class CheckpointConfig(BaseModel):
     output_dir: str = "./checkpoints"
     save_optimizer: bool = True
-    push_to_hub: Optional[str] = None
+    push_to_hub: str | None = None
 
     @field_validator("push_to_hub")
     @classmethod
-    def _validate_push_to_hub(cls, v: Optional[str]) -> Optional[str]:
+    def _validate_push_to_hub(cls, v: str | None) -> str | None:
         if v is not None and "/" not in v:
             raise ConfigError(
                 f"checkpoint.push_to_hub must look like 'org/model-name', got '{v}'. "
@@ -586,7 +610,7 @@ class AdaptiveConfig(BaseModel):
     lr_multiplier_decay: float = 0.995
 
     @model_validator(mode="after")
-    def _check_windows(self) -> "AdaptiveConfig":
+    def _check_windows(self) -> AdaptiveConfig:
         if self.history_size < 2 * self.spike_window:
             raise ConfigError(
                 f"adaptive.history_size ({self.history_size}) must be at least "
@@ -657,7 +681,7 @@ class AdaptiveConfig(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _check_multiplier_bounds(self) -> "AdaptiveConfig":
+    def _check_multiplier_bounds(self) -> AdaptiveConfig:
         if self.min_lr_multiplier >= self.max_lr_multiplier:
             raise ConfigError(
                 f"adaptive.min_lr_multiplier ({self.min_lr_multiplier}) must be less "
@@ -679,7 +703,7 @@ class ATSConfig(BaseModel):
     peft: PeftConfig = Field(default_factory=PeftConfig)
 
     @model_validator(mode="after")
-    def _check_moe_mod_consistency(self) -> "ATSConfig":
+    def _check_moe_mod_consistency(self) -> ATSConfig:
         if self.model.use_moe and self.model.num_experts < self.model.moe_top_k:
             raise ConfigError(
                 f"model.num_experts ({self.model.num_experts}) must be >= "

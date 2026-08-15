@@ -15,11 +15,26 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Protocol
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
+
+
+class _HiddenStateBackbone(Protocol):
+    """Structural type for the subset of ATSTransformer's interface
+    DiffusionLM actually depends on. Kept as a Protocol (rather than
+    importing ATSTransformer directly) so DiffusionLM stays decoupled from
+    one specific backbone implementation, while still giving mypy a real
+    signature for `forward_hidden` instead of falling back to
+    nn.Module.__getattr__'s generic Tensor|Module return type."""
+
+    def forward_hidden(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor: ...
 
 
 def cosine_alpha_bar(t: torch.Tensor, s: float = 0.008) -> torch.Tensor:
@@ -40,25 +55,37 @@ class DiffusionLM(nn.Module):
     `lm_head` is not used in the diffusion forward path) with the noising
     process, MSE training objective, and DDIM sampler."""
 
-    def __init__(self, backbone: nn.Module, hidden_size: int, num_timesteps: int = 1000) -> None:
+    def __init__(
+        self, backbone: nn.Module, hidden_size: int, num_timesteps: int = 1000
+    ) -> None:
         super().__init__()
         if num_timesteps < 2:
-            raise ValueError(f"DiffusionLM requires num_timesteps >= 2, got {num_timesteps}.")
-        self.backbone = backbone
+            raise ValueError(
+                f"DiffusionLM requires num_timesteps >= 2, got {num_timesteps}."
+            )
+        # backbone is stored under its structural Protocol type (see
+        # _HiddenStateBackbone above) even though the constructor accepts
+        # any nn.Module -- nn.Module.__setattr__ still registers it as a
+        # proper submodule at runtime either way.
+        self.backbone: _HiddenStateBackbone = backbone  # type: ignore[assignment]
         self.hidden_size = hidden_size
         self.num_timesteps = num_timesteps
         # Predicts the noise added to the embedding, conditioned implicitly
         # through the backbone's hidden states plus an explicit timestep
         # embedding added at the input.
         self.time_embed = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size), nn.SiLU(), nn.Linear(hidden_size, hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
         )
         self.noise_pred_head = nn.Linear(hidden_size, hidden_size, bias=False)
 
     def _sinusoidal_timestep_embedding(self, timesteps: torch.Tensor) -> torch.Tensor:
         half = self.hidden_size // 2
         freqs = torch.exp(
-            -math.log(10000.0) * torch.arange(half, device=timesteps.device, dtype=torch.float32) / half
+            -math.log(10000.0)
+            * torch.arange(half, device=timesteps.device, dtype=torch.float32)
+            / half
         )
         args = timesteps.float().unsqueeze(-1) * freqs.unsqueeze(0)
         emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
@@ -67,18 +94,25 @@ class DiffusionLM(nn.Module):
         return emb
 
     def add_noise(
-        self, clean_embeddings: torch.Tensor, timesteps: torch.Tensor,
-    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        self,
+        clean_embeddings: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward diffusion: x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise."""
         t_normalized = timesteps.float() / self.num_timesteps
         alpha_bar = cosine_alpha_bar(t_normalized).clamp(min=1e-5, max=1.0)
         alpha_bar = alpha_bar.view(-1, *([1] * (clean_embeddings.dim() - 1)))
         noise = torch.randn_like(clean_embeddings)
-        noisy = torch.sqrt(alpha_bar) * clean_embeddings + torch.sqrt(1 - alpha_bar) * noise
+        noisy = (
+            torch.sqrt(alpha_bar) * clean_embeddings + torch.sqrt(1 - alpha_bar) * noise
+        )
         return noisy, noise
 
     def forward(
-        self, input_ids: torch.Tensor, embed_tokens: nn.Embedding, timesteps: Optional[torch.Tensor] = None,
+        self,
+        input_ids: torch.Tensor,
+        embed_tokens: nn.Embedding,
+        timesteps: torch.Tensor | None = None,
     ) -> DiffusionOutput:
         if input_ids.dim() != 2:
             raise ValueError(
@@ -86,7 +120,9 @@ class DiffusionLM(nn.Module):
             )
         batch = input_ids.shape[0]
         if timesteps is None:
-            timesteps = torch.randint(0, self.num_timesteps, (batch,), device=input_ids.device)
+            timesteps = torch.randint(
+                0, self.num_timesteps, (batch,), device=input_ids.device
+            )
 
         clean_embeddings = embed_tokens(input_ids)
         noisy_embeddings, true_noise = self.add_noise(clean_embeddings, timesteps)
@@ -101,38 +137,55 @@ class DiffusionLM(nn.Module):
 
     @torch.no_grad()
     def sample(
-        self, embed_tokens: nn.Embedding, batch_size: int, seq_len: int,
-        num_inference_steps: int = 50, device: Optional[torch.device] = None,
+        self,
+        embed_tokens: nn.Embedding,
+        batch_size: int,
+        seq_len: int,
+        num_inference_steps: int = 50,
+        device: torch.device | None = None,
     ) -> torch.Tensor:
         """DDIM sampling: deterministic reverse process from Gaussian noise in
         embedding space, then nearest-neighbor lookup against the embedding
         table to recover discrete token ids."""
         if num_inference_steps < 1:
-            raise ValueError(f"num_inference_steps must be >= 1, got {num_inference_steps}.")
+            raise ValueError(
+                f"num_inference_steps must be >= 1, got {num_inference_steps}."
+            )
         device = device or next(self.parameters()).device
         hidden_size = embed_tokens.embedding_dim
 
         x_t = torch.randn(batch_size, seq_len, hidden_size, device=device)
-        step_indices = torch.linspace(self.num_timesteps - 1, 0, num_inference_steps, device=device).long()
+        step_indices = torch.linspace(
+            self.num_timesteps - 1, 0, num_inference_steps, device=device
+        ).long()
 
         for i, t in enumerate(step_indices):
             t_batch = t.expand(batch_size)
             t_normalized = t_batch.float() / self.num_timesteps
-            alpha_bar_t = cosine_alpha_bar(t_normalized).clamp(min=1e-5, max=1.0).view(-1, 1, 1)
+            alpha_bar_t = (
+                cosine_alpha_bar(t_normalized).clamp(min=1e-5, max=1.0).view(-1, 1, 1)
+            )
 
             time_emb = self.time_embed(self._sinusoidal_timestep_embedding(t_batch))
             model_input = x_t + time_emb.unsqueeze(1)
             backbone_output = self.backbone.forward_hidden(inputs_embeds=model_input)
             predicted_noise = self.noise_pred_head(backbone_output)
 
-            x0_pred = (x_t - torch.sqrt(1 - alpha_bar_t) * predicted_noise) / torch.sqrt(alpha_bar_t)
+            x0_pred = (
+                x_t - torch.sqrt(1 - alpha_bar_t) * predicted_noise
+            ) / torch.sqrt(alpha_bar_t)
 
             if i + 1 < len(step_indices):
                 t_next = step_indices[i + 1].expand(batch_size)
-                alpha_bar_next = cosine_alpha_bar(t_next.float() / self.num_timesteps).clamp(
-                    min=1e-5, max=1.0
-                ).view(-1, 1, 1)
-                x_t = torch.sqrt(alpha_bar_next) * x0_pred + torch.sqrt(1 - alpha_bar_next) * predicted_noise
+                alpha_bar_next = (
+                    cosine_alpha_bar(t_next.float() / self.num_timesteps)
+                    .clamp(min=1e-5, max=1.0)
+                    .view(-1, 1, 1)
+                )
+                x_t = (
+                    torch.sqrt(alpha_bar_next) * x0_pred
+                    + torch.sqrt(1 - alpha_bar_next) * predicted_noise
+                )
             else:
                 x_t = x0_pred
 

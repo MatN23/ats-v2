@@ -20,13 +20,12 @@ kernel shape.
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import torch
 
 try:
     import triton
     import triton.language as tl
+
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
@@ -36,10 +35,21 @@ if HAS_TRITON:
 
     @triton.jit
     def _matmul_kernel(
-        a_ptr, b_ptr, c_ptr,
-        M, N, K,
-        stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
@@ -70,7 +80,9 @@ if HAS_TRITON:
         M, K = a.shape
         K2, N = b.shape
         if K != K2:
-            raise ValueError(f"_triton_matmul: inner dims must match, got {K} and {K2}.")
+            raise ValueError(
+                f"_triton_matmul: inner dims must match, got {K} and {K2}."
+            )
         a = a.contiguous()
         b = b.contiguous()
         out = torch.empty((M, N), device=a.device, dtype=torch.float32)
@@ -78,16 +90,30 @@ if HAS_TRITON:
         BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
         _matmul_kernel[grid](
-            a, b, out, M, N, K,
-            a.stride(0), a.stride(1), b.stride(0), b.stride(1), out.stride(0), out.stride(1),
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+            a,
+            b,
+            out,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            out.stride(0),
+            out.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
         )
         return out.to(a.dtype)
 
 
 def fused_mla_kv_decompress(
-    c: torch.Tensor, w_uk: torch.Tensor, w_uv: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    c: torch.Tensor,
+    w_uk: torch.Tensor,
+    w_uv: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Computes (k, v) = (c @ w_uk.T, c @ w_uv.T) from the shared compressed
     latent `c`. When Triton is available and c is on CUDA, does this as a
     single matmul against the concatenated [w_uk; w_uv] weight; otherwise

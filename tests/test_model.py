@@ -3,8 +3,6 @@ MoE routing, MoD capacity, SWA masking, MLA cache size."""
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 
@@ -12,8 +10,8 @@ from ats.config.schema import ModelConfig
 from ats.model.attention import GroupedQueryAttention
 from ats.model.mamba import MambaBlock
 from ats.model.mla import MLAAttention
-from ats.model.moe import MoELayer
 from ats.model.mod import MixtureOfDepths
+from ats.model.moe import MoELayer
 from ats.model.norm import RMSNorm
 from ats.model.rope import RotaryEmbedding, apply_rotary_pos_emb
 from ats.model.swa import generate_swa_mask, is_full_attention_layer
@@ -44,7 +42,7 @@ def test_forward_rejects_out_of_range_token_ids(dummy_model, dummy_model_config)
 def test_rope_angles_match_closed_form():
     dim, max_len, theta = 8, 16, 10000.0
     rope = RotaryEmbedding(dim, max_len, theta)
-    cos, sin = rope(seq_len=4, device=torch.device("cpu"), dtype=torch.float32)
+    cos, _sin = rope(seq_len=4, device=torch.device("cpu"), dtype=torch.float32)
     inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     expected_freqs_pos2 = 2 * inv_freq  # position index 2
     expected_cos = torch.cat([expected_freqs_pos2.cos(), expected_freqs_pos2.cos()])
@@ -66,7 +64,9 @@ def test_rmsnorm_matches_finite_difference_gradient():
     torch.manual_seed(0)
     norm = RMSNorm(hidden_size=6, eps=1e-6).double()
     x = torch.randn(3, 6, dtype=torch.float64, requires_grad=True)
-    assert torch.autograd.gradcheck(lambda inp: norm(inp).sum(), (x,), eps=1e-6, atol=1e-4)
+    assert torch.autograd.gradcheck(
+        lambda inp: norm(inp).sum(), (x,), eps=1e-6, atol=1e-4
+    )
 
 
 def test_rmsnorm_rejects_wrong_last_dim():
@@ -76,7 +76,9 @@ def test_rmsnorm_rejects_wrong_last_dim():
 
 
 def test_moe_fallback_output_shape_and_aux_loss():
-    layer = MoELayer(hidden_size=32, intermediate_size=64, num_experts=4, num_layers=2, top_k=2)
+    layer = MoELayer(
+        hidden_size=32, intermediate_size=64, num_experts=4, num_layers=2, top_k=2
+    )
     x = torch.randn(2, 5, 32)
     out, aux_loss = layer(x)
     assert out.shape == x.shape
@@ -88,9 +90,13 @@ def test_moe_gating_weights_sum_to_one():
     """Exercises the REAL MoELayer's routing math (via compute_routing on its
     fallback module), not a standalone reimplementation, so a bug in the
     actual gating normalization would be caught here."""
-    layer = MoELayer(hidden_size=16, intermediate_size=32, num_experts=4, num_layers=2, top_k=2)
+    layer = MoELayer(
+        hidden_size=16, intermediate_size=32, num_experts=4, num_layers=2, top_k=2
+    )
     if layer.uses_deepspeed:
-        pytest.skip("deepspeed is installed; this test targets the PyTorch fallback router.")
+        pytest.skip(
+            "deepspeed is installed; this test targets the PyTorch fallback router."
+        )
 
     flat_x = torch.randn(5, 16)
     top_k_probs, top_k_idx, router_probs = layer.moe.compute_routing(flat_x)
@@ -112,9 +118,13 @@ def test_moe_layer_forward_uses_real_gating_end_to_end():
     via distinct random seeds producing different gate weights) produces
     different outputs, i.e. the gate isn't a no-op."""
     torch.manual_seed(1)
-    layer_a = MoELayer(hidden_size=16, intermediate_size=32, num_experts=4, num_layers=2, top_k=2)
+    layer_a = MoELayer(
+        hidden_size=16, intermediate_size=32, num_experts=4, num_layers=2, top_k=2
+    )
     torch.manual_seed(2)
-    layer_b = MoELayer(hidden_size=16, intermediate_size=32, num_experts=4, num_layers=2, top_k=2)
+    layer_b = MoELayer(
+        hidden_size=16, intermediate_size=32, num_experts=4, num_layers=2, top_k=2
+    )
 
     x = torch.randn(1, 3, 16)
     out_a, _ = layer_a(x)
@@ -158,8 +168,15 @@ def test_mod_forward_does_not_crash_wrapping_a_real_transformer_block():
     This exercises MoD wrapping a REAL TransformerBlock end-to-end, the way
     ATSTransformer actually constructs it when model.use_mod=True."""
     config = ModelConfig(
-        hidden_size=32, num_layers=1, num_heads=4, num_kv_heads=2, intermediate_size=64,
-        vocab_size=50, max_seq_len=32, use_mod=True, mod_capacity_factor=0.5,
+        hidden_size=32,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=64,
+        vocab_size=50,
+        max_seq_len=32,
+        use_mod=True,
+        mod_capacity_factor=0.5,
         use_flash_attention=False,
     )
     model = ATSTransformer(config)
@@ -211,8 +228,13 @@ def test_gqa_with_swa_restricts_attention_span():
     unchanged, since the windowed mask should make it unreachable."""
     torch.manual_seed(0)
     attn = GroupedQueryAttention(
-        hidden_size=32, num_heads=4, num_kv_heads=2, max_seq_len=64,
-        use_flash_attention=False, use_swa=True, swa_window_size=2,
+        hidden_size=32,
+        num_heads=4,
+        num_kv_heads=2,
+        max_seq_len=64,
+        use_flash_attention=False,
+        use_swa=True,
+        swa_window_size=2,
     )
     attn.eval()
 
@@ -241,8 +263,12 @@ def test_gqa_without_swa_has_full_attention_span():
     not some unrelated bug that zeroes out early-token influence generally."""
     torch.manual_seed(0)
     attn = GroupedQueryAttention(
-        hidden_size=32, num_heads=4, num_kv_heads=2, max_seq_len=64,
-        use_flash_attention=False, use_swa=False,
+        hidden_size=32,
+        num_heads=4,
+        num_kv_heads=2,
+        max_seq_len=64,
+        use_flash_attention=False,
+        use_swa=False,
     )
     attn.eval()
 
@@ -260,25 +286,31 @@ def test_mla_cache_smaller_than_gqa_cache():
     head_dim = hidden_size // num_heads
     gqa_cache_per_token = 2 * num_kv_heads * head_dim  # K + V
 
-    mla = MLAAttention(hidden_size=hidden_size, num_heads=num_heads, latent_dim=hidden_size // 4)
+    mla = MLAAttention(
+        hidden_size=hidden_size, num_heads=num_heads, latent_dim=hidden_size // 4
+    )
     assert mla.cache_size_per_token() < gqa_cache_per_token
 
 
 def test_mla_forward_shape_matches_gqa():
     hidden_size, num_heads = 64, 4
-    mla = MLAAttention(hidden_size=hidden_size, num_heads=num_heads, latent_dim=16, max_seq_len=32)
+    mla = MLAAttention(
+        hidden_size=hidden_size, num_heads=num_heads, latent_dim=16, max_seq_len=32
+    )
     x = torch.randn(2, 6, hidden_size)
     out, past = mla(x, use_cache=True)
     assert out.shape == x.shape
     assert past is not None
-    latent_cache, rope_cache = past
+    latent_cache, _rope_cache = past
     assert latent_cache.shape == (2, 6, 16)
 
 
 def test_mla_incremental_decode_matches_full_forward():
     torch.manual_seed(0)
     hidden_size, num_heads = 32, 4
-    mla = MLAAttention(hidden_size=hidden_size, num_heads=num_heads, latent_dim=8, max_seq_len=32)
+    mla = MLAAttention(
+        hidden_size=hidden_size, num_heads=num_heads, latent_dim=8, max_seq_len=32
+    )
     mla.eval()
     x = torch.randn(1, 4, hidden_size)
 
@@ -287,7 +319,7 @@ def test_mla_incremental_decode_matches_full_forward():
     past = None
     step_outs = []
     for t in range(4):
-        step_out, past = mla(x[:, t:t + 1, :], past_key_value=past, use_cache=True)
+        step_out, past = mla(x[:, t : t + 1, :], past_key_value=past, use_cache=True)
         step_outs.append(step_out)
     incremental_out = torch.cat(step_outs, dim=1)
 
@@ -296,8 +328,16 @@ def test_mla_incremental_decode_matches_full_forward():
 
 def test_transformer_with_swa_and_hybrid_layers_forward():
     config = ModelConfig(
-        hidden_size=32, num_layers=4, num_heads=4, num_kv_heads=2, intermediate_size=64,
-        vocab_size=50, max_seq_len=32, use_swa=True, swa_window_size=2, swa_full_attention_interval=2,
+        hidden_size=32,
+        num_layers=4,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=64,
+        vocab_size=50,
+        max_seq_len=32,
+        use_swa=True,
+        swa_window_size=2,
+        swa_full_attention_interval=2,
         use_flash_attention=False,
     )
     model = ATSTransformer(config)
@@ -308,8 +348,15 @@ def test_transformer_with_swa_and_hybrid_layers_forward():
 
 def test_transformer_with_mla_forward():
     config = ModelConfig(
-        hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2, intermediate_size=64,
-        vocab_size=50, max_seq_len=32, use_mla=True, mla_latent_dim=8,
+        hidden_size=32,
+        num_layers=2,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=64,
+        vocab_size=50,
+        max_seq_len=32,
+        use_mla=True,
+        mla_latent_dim=8,
     )
     model = ATSTransformer(config)
     input_ids = torch.randint(0, 50, (1, 6))
@@ -318,6 +365,7 @@ def test_transformer_with_mla_forward():
 
 
 # --- Mamba / MTP / diffusion / quantization / config-driven composition ---
+
 
 def test_mamba_block_output_shape():
     from ats.model.mamba import MambaBlock
@@ -351,8 +399,15 @@ def test_mamba_block_has_recurrent_state_dependence():
 
 def test_mamba_transformer_composition():
     config = ModelConfig(
-        hidden_size=16, num_layers=4, num_heads=2, num_kv_heads=2, intermediate_size=32,
-        vocab_size=30, max_seq_len=16, use_mamba=True, mamba_every_n_layers=2,
+        hidden_size=16,
+        num_layers=4,
+        num_heads=2,
+        num_kv_heads=2,
+        intermediate_size=32,
+        vocab_size=30,
+        max_seq_len=16,
+        use_mamba=True,
+        mamba_every_n_layers=2,
         use_flash_attention=False,
     )
     model = ATSTransformer(config)
@@ -393,8 +448,16 @@ def test_mtp_loss_is_mean_of_offset_losses():
 
 def test_mtp_transformer_produces_mtp_logits():
     config = ModelConfig(
-        hidden_size=16, num_layers=2, num_heads=2, num_kv_heads=2, intermediate_size=32,
-        vocab_size=30, max_seq_len=16, use_mtp=True, mtp_num_tokens=2, use_flash_attention=False,
+        hidden_size=16,
+        num_layers=2,
+        num_heads=2,
+        num_kv_heads=2,
+        intermediate_size=32,
+        vocab_size=30,
+        max_seq_len=16,
+        use_mtp=True,
+        mtp_num_tokens=2,
+        use_flash_attention=False,
     )
     model = ATSTransformer(config)
     input_ids = torch.randint(0, 30, (1, 8))
@@ -407,8 +470,14 @@ def test_diffusion_loss_is_mse_not_cross_entropy():
     from ats.model.diffusion import DiffusionLM
 
     config = ModelConfig(
-        hidden_size=16, num_layers=2, num_heads=2, num_kv_heads=2, intermediate_size=32,
-        vocab_size=30, max_seq_len=16, use_flash_attention=False,
+        hidden_size=16,
+        num_layers=2,
+        num_heads=2,
+        num_kv_heads=2,
+        intermediate_size=32,
+        vocab_size=30,
+        max_seq_len=16,
+        use_flash_attention=False,
     )
     backbone = ATSTransformer(config)
     diffusion_model = DiffusionLM(backbone=backbone, hidden_size=16, num_timesteps=100)
@@ -421,20 +490,33 @@ def test_diffusion_loss_is_mse_not_cross_entropy():
     # produced by squared-error semantics (non-negative, no log-softmax).
     assert output.loss.dim() == 0
     assert output.loss.item() >= 0.0
-    assert output.predicted_noise.shape == (2, 6, 16)  # embedding-space, not vocab-space
+    assert output.predicted_noise.shape == (
+        2,
+        6,
+        16,
+    )  # embedding-space, not vocab-space
 
 
 def test_diffusion_sampling_produces_valid_token_ids():
     from ats.model.diffusion import DiffusionLM
 
     config = ModelConfig(
-        hidden_size=8, num_layers=1, num_heads=2, num_kv_heads=2, intermediate_size=16,
-        vocab_size=25, max_seq_len=8, use_flash_attention=False,
+        hidden_size=8,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=2,
+        intermediate_size=16,
+        vocab_size=25,
+        max_seq_len=8,
+        use_flash_attention=False,
     )
     backbone = ATSTransformer(config)
     diffusion_model = DiffusionLM(backbone=backbone, hidden_size=8, num_timesteps=50)
     tokens = diffusion_model.sample(
-        embed_tokens=backbone.embed_tokens, batch_size=1, seq_len=4, num_inference_steps=3,
+        embed_tokens=backbone.embed_tokens,
+        batch_size=1,
+        seq_len=4,
+        num_inference_steps=3,
     )
     assert tokens.shape == (1, 4)
     assert (tokens >= 0).all() and (tokens < 25).all()
@@ -474,11 +556,15 @@ def test_quantized_linear_fp8_without_backend_raises_import_error():
 
     try:
         import transformer_engine  # noqa: F401
-        pytest.skip("transformer_engine is installed; fp8 path would succeed, not raise.")
+
+        pytest.skip(
+            "transformer_engine is installed; fp8 path would succeed, not raise."
+        )
     except ImportError:
         pass
     try:
         import torchao  # noqa: F401
+
         pytest.skip("torchao is installed; fp8 path would succeed, not raise.")
     except ImportError:
         pass
@@ -488,6 +574,7 @@ def test_quantized_linear_fp8_without_backend_raises_import_error():
 
 
 # --- Regression tests: initialization double-init bug ---
+
 
 def test_init_residual_projection_marks_weight_to_prevent_overwrite():
     from ats.model.initialization import init_residual_projection
@@ -525,8 +612,14 @@ def test_transformer_block_residual_projections_survive_full_model_construction(
 
     num_layers = 48  # deep enough that depth-scaled and generic std differ by >10x
     config = ModelConfig(
-        hidden_size=64, num_layers=num_layers, num_heads=8, num_kv_heads=8,
-        intermediate_size=128, vocab_size=100, max_seq_len=32, use_flash_attention=False,
+        hidden_size=64,
+        num_layers=num_layers,
+        num_heads=8,
+        num_kv_heads=8,
+        intermediate_size=128,
+        vocab_size=100,
+        max_seq_len=32,
+        use_flash_attention=False,
     )
     model = ATSTransformer(config)
 
@@ -546,12 +639,20 @@ def test_transformer_block_residual_projections_survive_full_model_construction(
 
 # --- Regression tests: quantization actually wired into the model (C3) ---
 
+
 def test_quantization_none_produces_plain_linear_everywhere():
     from ats.model.quantization import QuantizedLinear
 
     config = ModelConfig(
-        hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2, intermediate_size=64,
-        vocab_size=50, max_seq_len=32, use_flash_attention=False, quantization="none",
+        hidden_size=32,
+        num_layers=2,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=64,
+        vocab_size=50,
+        max_seq_len=32,
+        use_flash_attention=False,
+        quantization="none",
     )
     model = ATSTransformer(config)
     block = model.layers[0]
@@ -563,8 +664,15 @@ def test_quantization_int8_produces_quantized_linear_in_attention_and_ffn():
     from ats.model.quantization import QuantizedLinear
 
     config = ModelConfig(
-        hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2, intermediate_size=64,
-        vocab_size=50, max_seq_len=32, use_flash_attention=False, quantization="int8",
+        hidden_size=32,
+        num_layers=2,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=64,
+        vocab_size=50,
+        max_seq_len=32,
+        use_flash_attention=False,
+        quantization="int8",
     )
     model = ATSTransformer(config)
     block = model.layers[0]
@@ -585,8 +693,15 @@ def test_quantization_int8_state_dict_keys_match_plain_linear():
     exact key remapping (ats/export/huggingface.py) would silently break
     the moment quantization was enabled."""
     config = ModelConfig(
-        hidden_size=32, num_layers=1, num_heads=4, num_kv_heads=2, intermediate_size=64,
-        vocab_size=50, max_seq_len=32, use_flash_attention=False, quantization="int8",
+        hidden_size=32,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=64,
+        vocab_size=50,
+        max_seq_len=32,
+        use_flash_attention=False,
+        quantization="int8",
     )
     model = ATSTransformer(config)
     state_dict_keys = set(model.state_dict().keys())
@@ -598,12 +713,23 @@ def test_quantization_int8_state_dict_keys_match_plain_linear():
 
 def test_quantization_int8_forward_pass_shape(dummy_batch):
     config = ModelConfig(
-        hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2, intermediate_size=64,
-        vocab_size=100, max_seq_len=32, use_flash_attention=False, quantization="int8",
+        hidden_size=32,
+        num_layers=2,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=64,
+        vocab_size=100,
+        max_seq_len=32,
+        use_flash_attention=False,
+        quantization="int8",
     )
     model = ATSTransformer(config)
     output = model(dummy_batch["input_ids"])
-    assert output.logits.shape == (dummy_batch["input_ids"].shape[0], dummy_batch["input_ids"].shape[1], 100)
+    assert output.logits.shape == (
+        dummy_batch["input_ids"].shape[0],
+        dummy_batch["input_ids"].shape[1],
+        100,
+    )
 
 
 def test_quantization_int8_forward_differs_numerically_from_none():
@@ -611,13 +737,27 @@ def test_quantization_int8_forward_differs_numerically_from_none():
     behave identically to quantization='none')."""
     torch.manual_seed(0)
     config_none = ModelConfig(
-        hidden_size=32, num_layers=1, num_heads=4, num_kv_heads=2, intermediate_size=64,
-        vocab_size=50, max_seq_len=32, use_flash_attention=False, quantization="none",
+        hidden_size=32,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=64,
+        vocab_size=50,
+        max_seq_len=32,
+        use_flash_attention=False,
+        quantization="none",
     )
     torch.manual_seed(0)
     config_int8 = ModelConfig(
-        hidden_size=32, num_layers=1, num_heads=4, num_kv_heads=2, intermediate_size=64,
-        vocab_size=50, max_seq_len=32, use_flash_attention=False, quantization="int8",
+        hidden_size=32,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=64,
+        vocab_size=50,
+        max_seq_len=32,
+        use_flash_attention=False,
+        quantization="int8",
     )
     torch.manual_seed(1)
     model_none = ATSTransformer(config_none)
@@ -644,15 +784,23 @@ def test_moe_expert_uses_quantization():
     from ats.model.quantization import QuantizedLinear
 
     layer = MoELayer(
-        hidden_size=16, intermediate_size=32, num_experts=2, num_layers=2, top_k=1, quantization="int8",
+        hidden_size=16,
+        intermediate_size=32,
+        num_experts=2,
+        num_layers=2,
+        top_k=1,
+        quantization="int8",
     )
     if layer.uses_deepspeed:
-        pytest.skip("deepspeed is installed; this test targets the PyTorch fallback experts.")
+        pytest.skip(
+            "deepspeed is installed; this test targets the PyTorch fallback experts."
+        )
     expert = layer.moe.experts[0]
     assert isinstance(expert.down_proj, QuantizedLinear)
 
 
 # --- Regression test: Mamba chunked scan matches sequential ground truth ---
+
 
 def test_mamba_chunked_scan_matches_naive_sequential_reference():
     """MambaBlock now uses a chunked parallel scan instead of a Python loop
@@ -664,7 +812,13 @@ def test_mamba_chunked_scan_matches_naive_sequential_reference():
     the standalone numpy prototype used during development."""
     torch.manual_seed(0)
     hidden_size, d_state, d_conv, expand = 16, 8, 3, 2
-    block = MambaBlock(hidden_size=hidden_size, d_state=d_state, d_conv=d_conv, expand=expand, chunk_size=5)
+    block = MambaBlock(
+        hidden_size=hidden_size,
+        d_state=d_state,
+        d_conv=d_conv,
+        expand=expand,
+        chunk_size=5,
+    )
     block.eval()
 
     batch, seq_len = 2, 23  # not a multiple of chunk_size=5, on purpose
@@ -677,7 +831,7 @@ def test_mamba_chunked_scan_matches_naive_sequential_reference():
     # reference is updated to match the new causal conv path.
     with torch.no_grad():
         x_and_gate = block.in_proj(x)
-        x_main, gate = x_and_gate.chunk(2, dim=-1)
+        x_main, _gate = x_and_gate.chunk(2, dim=-1)
         x_main_t = torch.nn.functional.pad(x_main.transpose(1, 2), (d_conv - 1, 0))
         x_conv = block.conv1d(x_main_t)
         x_conv = torch.nn.functional.silu(x_conv.transpose(1, 2))
@@ -697,7 +851,6 @@ def test_mamba_chunked_scan_matches_naive_sequential_reference():
             state = state * dA + dB * x_conv[:, t, :].unsqueeze(-1)
             ys.append(torch.einsum("bdn,bn->bd", state, C[:, t, :]))
         sequential_y = torch.stack(ys, dim=1)
-        sequential_states = None  # not needed; comparing y directly below
 
         # Now call the actual shipped chunked-scan implementation.
         chunked_states = block._chunked_scan(dt, A, B, x_conv)
@@ -720,7 +873,13 @@ def test_mamba_chunked_scan_various_chunk_sizes_agree():
     outputs = {}
     for chunk_size in [1, 4, 6, 17, 100]:
         torch.manual_seed(42)  # same weight init every time
-        block = MambaBlock(hidden_size=hidden_size, d_state=d_state, d_conv=2, expand=2, chunk_size=chunk_size)
+        block = MambaBlock(
+            hidden_size=hidden_size,
+            d_state=d_state,
+            d_conv=2,
+            expand=2,
+            chunk_size=chunk_size,
+        )
         block.eval()
         torch.manual_seed(7)  # same input every time
         x = torch.randn(1, seq_len, hidden_size)
@@ -741,9 +900,17 @@ def test_mamba_block_rejects_non_positive_chunk_size():
 
 def test_mamba_config_chunk_size_field_wired_through():
     config = ModelConfig(
-        hidden_size=16, num_layers=2, num_heads=2, num_kv_heads=2, intermediate_size=32,
-        vocab_size=30, max_seq_len=16, use_mamba=True, mamba_every_n_layers=1,
-        mamba_chunk_size=8, use_flash_attention=False,
+        hidden_size=16,
+        num_layers=2,
+        num_heads=2,
+        num_kv_heads=2,
+        intermediate_size=32,
+        vocab_size=30,
+        max_seq_len=16,
+        use_mamba=True,
+        mamba_every_n_layers=1,
+        mamba_chunk_size=8,
+        use_flash_attention=False,
     )
     model = ATSTransformer(config)
     from ats.model.transformer import MambaLayer
@@ -759,23 +926,50 @@ def test_mla_quantization_int8_produces_quantized_linear_everywhere():
     from ats.model.quantization import QuantizedLinear
 
     config = ModelConfig(
-        hidden_size=32, num_layers=1, num_heads=4, num_kv_heads=4, intermediate_size=64,
-        vocab_size=50, max_seq_len=32, use_mla=True, mla_latent_dim=8, quantization="int8",
+        hidden_size=32,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=4,
+        intermediate_size=64,
+        vocab_size=50,
+        max_seq_len=32,
+        use_mla=True,
+        mla_latent_dim=8,
+        quantization="int8",
     )
     model = ATSTransformer(config)
     attn = model.layers[0].attention
-    for proj_name in ("w_dkv", "w_uk", "w_uv", "w_dq", "w_uq", "w_qr", "w_kr", "o_proj"):
+    for proj_name in (
+        "w_dkv",
+        "w_uk",
+        "w_uv",
+        "w_dq",
+        "w_uq",
+        "w_qr",
+        "w_kr",
+        "o_proj",
+    ):
         proj = getattr(attn, proj_name)
         assert isinstance(proj, QuantizedLinear), f"{proj_name} was not quantized"
-        assert isinstance(proj, torch.nn.Linear), f"{proj_name} broke the nn.Linear isinstance contract"
+        assert isinstance(proj, torch.nn.Linear), (
+            f"{proj_name} broke the nn.Linear isinstance contract"
+        )
 
 
 def test_mla_quantization_none_stays_plain_linear():
     from ats.model.quantization import QuantizedLinear
 
     config = ModelConfig(
-        hidden_size=32, num_layers=1, num_heads=4, num_kv_heads=4, intermediate_size=64,
-        vocab_size=50, max_seq_len=32, use_mla=True, mla_latent_dim=8, quantization="none",
+        hidden_size=32,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=4,
+        intermediate_size=64,
+        vocab_size=50,
+        max_seq_len=32,
+        use_mla=True,
+        mla_latent_dim=8,
+        quantization="none",
     )
     model = ATSTransformer(config)
     attn = model.layers[0].attention
@@ -784,8 +978,16 @@ def test_mla_quantization_none_stays_plain_linear():
 
 def test_mla_quantization_forward_pass_shape(dummy_batch):
     config = ModelConfig(
-        hidden_size=32, num_layers=1, num_heads=4, num_kv_heads=4, intermediate_size=64,
-        vocab_size=100, max_seq_len=32, use_mla=True, mla_latent_dim=8, quantization="int8",
+        hidden_size=32,
+        num_layers=1,
+        num_heads=4,
+        num_kv_heads=4,
+        intermediate_size=64,
+        vocab_size=100,
+        max_seq_len=32,
+        use_mla=True,
+        mla_latent_dim=8,
+        quantization="int8",
     )
     model = ATSTransformer(config)
     output = model(dummy_batch["input_ids"])
@@ -797,7 +999,9 @@ def test_moe_fallback_expert_utilization_sums_to_one():
     previously summed to top_k (not 1.0), inconsistent with the DeepSpeed
     backend's counts/total normalization -- the same metric reported on
     two different scales depending on which backend happened to be active."""
-    layer = MoELayer(hidden_size=16, intermediate_size=32, num_experts=4, num_layers=2, top_k=2)
+    layer = MoELayer(
+        hidden_size=16, intermediate_size=32, num_experts=4, num_layers=2, top_k=2
+    )
     if layer.uses_deepspeed:
         pytest.skip("deepspeed is installed; this test targets the PyTorch fallback.")
 
@@ -810,16 +1014,22 @@ def test_moe_fallback_expert_utilization_sums_to_one():
 
 # --- Regression tests: incremental (multi-token, with-cache) causal masking ---
 
+
 def test_build_incremental_causal_mask_basic_pattern():
     from ats.model.attention import build_incremental_causal_mask
 
-    mask = build_incremental_causal_mask(seq_len=3, past_len=5, device=torch.device("cpu"))
+    mask = build_incremental_causal_mask(
+        seq_len=3, past_len=5, device=torch.device("cpu")
+    )
     assert mask.shape == (3, 8)
-    expected = torch.tensor([
-        [1, 1, 1, 1, 1, 1, 0, 0],
-        [1, 1, 1, 1, 1, 1, 1, 0],
-        [1, 1, 1, 1, 1, 1, 1, 1],
-    ], dtype=torch.bool)
+    expected = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1, 1, 1],
+        ],
+        dtype=torch.bool,
+    )
     assert torch.equal(mask, expected)
 
 
@@ -827,13 +1037,19 @@ def test_build_incremental_causal_mask_with_window():
     from ats.model.attention import build_incremental_causal_mask
 
     mask = build_incremental_causal_mask(
-        seq_len=3, past_len=5, device=torch.device("cpu"), window_size=3,
+        seq_len=3,
+        past_len=5,
+        device=torch.device("cpu"),
+        window_size=3,
     )
-    expected = torch.tensor([
-        [0, 0, 0, 1, 1, 1, 0, 0],
-        [0, 0, 0, 0, 1, 1, 1, 0],
-        [0, 0, 0, 0, 0, 1, 1, 1],
-    ], dtype=torch.bool)
+    expected = torch.tensor(
+        [
+            [0, 0, 0, 1, 1, 1, 0, 0],
+            [0, 0, 0, 0, 1, 1, 1, 0],
+            [0, 0, 0, 0, 0, 1, 1, 1],
+        ],
+        dtype=torch.bool,
+    )
     assert torch.equal(mask, expected)
 
 
@@ -847,7 +1063,11 @@ def test_gqa_multi_token_continuation_with_cache_does_not_leak_future_tokens():
     masking)."""
     torch.manual_seed(0)
     attn = GroupedQueryAttention(
-        hidden_size=32, num_heads=4, num_kv_heads=2, max_seq_len=64, use_flash_attention=False,
+        hidden_size=32,
+        num_heads=4,
+        num_kv_heads=2,
+        max_seq_len=64,
+        use_flash_attention=False,
     )
     attn.eval()
 
@@ -877,7 +1097,11 @@ def test_gqa_multi_token_continuation_still_sees_full_cache():
     prefix must change every new token's output."""
     torch.manual_seed(0)
     attn = GroupedQueryAttention(
-        hidden_size=32, num_heads=4, num_kv_heads=2, max_seq_len=64, use_flash_attention=False,
+        hidden_size=32,
+        num_heads=4,
+        num_kv_heads=2,
+        max_seq_len=64,
+        use_flash_attention=False,
     )
     attn.eval()
 
@@ -927,10 +1151,16 @@ def test_moe_expert_down_proj_gets_depth_scaled_residual_init():
 
     num_layers = 32
     layer = MoELayer(
-        hidden_size=64, intermediate_size=128, num_experts=4, num_layers=num_layers, top_k=2,
+        hidden_size=64,
+        intermediate_size=128,
+        num_experts=4,
+        num_layers=num_layers,
+        top_k=2,
     )
     if layer.uses_deepspeed:
-        pytest.skip("deepspeed is installed; this test targets the PyTorch fallback experts.")
+        pytest.skip(
+            "deepspeed is installed; this test targets the PyTorch fallback experts."
+        )
 
     expected_std = residual_output_std(num_layers)
     for expert in layer.moe.experts:
@@ -950,14 +1180,24 @@ def test_moe_layer_transformer_block_experts_get_residual_init():
 
     num_layers = 24
     config = ModelConfig(
-        hidden_size=32, num_layers=num_layers, num_heads=4, num_kv_heads=2, intermediate_size=64,
-        vocab_size=50, max_seq_len=32, use_moe=True, num_experts=4, moe_top_k=2,
+        hidden_size=32,
+        num_layers=num_layers,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=64,
+        vocab_size=50,
+        max_seq_len=32,
+        use_moe=True,
+        num_experts=4,
+        moe_top_k=2,
         use_flash_attention=False,
     )
     model = ATSTransformer(config)
     moe_layer = model.layers[0].ffn
     if moe_layer.uses_deepspeed:
-        pytest.skip("deepspeed is installed; this test targets the PyTorch fallback experts.")
+        pytest.skip(
+            "deepspeed is installed; this test targets the PyTorch fallback experts."
+        )
 
     expected_std = residual_output_std(num_layers)
     empirical_std = moe_layer.moe.experts[0].down_proj.weight.std().item()

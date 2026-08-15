@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 EMBEDDING_STD = 0.02
 BASE_LINEAR_STD = 0.02
@@ -68,4 +68,6 @@ def init_residual_projection(module: nn.Linear, num_layers: int) -> None:
     # Mark this weight tensor so a later blanket init_weights() pass (e.g.
     # ATSTransformer's `self.apply(...)`) skips it instead of overwriting
     # this depth-scaled init with the generic one.
-    module.weight._ats_residual_init = True
+    # Deliberate dynamic attribute: PyTorch Tensors allow arbitrary Python
+    # attribute assignment at runtime, but the type stubs don't model it.
+    module.weight._ats_residual_init = True  # type: ignore[attr-defined]

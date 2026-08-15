@@ -5,15 +5,27 @@ from __future__ import annotations
 
 import pytest
 
-from ats.config.schema import ATSConfig, DataConfig, DataSource, ModelConfig, ParallelismConfig, TrainingConfig
+from ats.config.schema import (
+    ATSConfig,
+    DataConfig,
+    DataSource,
+    ModelConfig,
+    ParallelismConfig,
+    TrainingConfig,
+)
 from ats.parallelism.auto_parallel import estimate_param_count, resolve_strategy
 
 
 def _model_config(**overrides) -> ModelConfig:
-    defaults = dict(
-        hidden_size=512, num_layers=8, num_heads=8, num_kv_heads=8,
-        intermediate_size=2048, vocab_size=32000, max_seq_len=2048,
-    )
+    defaults = {
+        "hidden_size": 512,
+        "num_layers": 8,
+        "num_heads": 8,
+        "num_kv_heads": 8,
+        "intermediate_size": 2048,
+        "vocab_size": 32000,
+        "max_seq_len": 2048,
+    }
     return ModelConfig(**{**defaults, **overrides})
 
 
@@ -46,7 +58,12 @@ def test_estimate_param_count_positive_and_scales_with_layers():
     # proportions) makes that approximation hold. This has no runtime cost:
     # estimate_param_count is pure arithmetic on config fields, it never
     # constructs an actual model.
-    kwargs = dict(hidden_size=8192, num_heads=64, num_kv_heads=8, intermediate_size=28672)
+    kwargs = {
+        "hidden_size": 8192,
+        "num_heads": 64,
+        "num_kv_heads": 8,
+        "intermediate_size": 28672,
+    }
     small = estimate_param_count(_model_config(num_layers=4, **kwargs))
     large = estimate_param_count(_model_config(num_layers=8, **kwargs))
     assert small > 0
@@ -79,8 +96,12 @@ def test_estimate_param_count_mla_scales_with_latent_dim():
 
 
 def test_estimate_param_count_moe_scales_with_num_experts():
-    few_experts = estimate_param_count(_model_config(use_moe=True, num_experts=2, moe_top_k=1))
-    many_experts = estimate_param_count(_model_config(use_moe=True, num_experts=16, moe_top_k=1))
+    few_experts = estimate_param_count(
+        _model_config(use_moe=True, num_experts=2, moe_top_k=1)
+    )
+    many_experts = estimate_param_count(
+        _model_config(use_moe=True, num_experts=16, moe_top_k=1)
+    )
     assert many_experts > few_experts
 
 
@@ -104,7 +125,9 @@ def test_resolve_strategy_single_gpu_is_zero0():
 def test_resolve_strategy_moe_multi_node_is_deepspeed_moe():
     config = _ats_config(
         _model_config(use_moe=True, num_experts=8, moe_top_k=2),
-        strategy="auto", gpus=8, nodes=2,
+        strategy="auto",
+        gpus=8,
+        nodes=2,
     )
     assert resolve_strategy(config) == "deepspeed_moe"
 
@@ -115,7 +138,13 @@ def test_resolve_strategy_small_model_multi_gpu_is_zero2():
 
 
 def test_resolve_strategy_large_model_is_zero3():
-    huge = _model_config(hidden_size=8192, num_layers=80, num_heads=64, num_kv_heads=8, intermediate_size=28672)
+    huge = _model_config(
+        hidden_size=8192,
+        num_layers=80,
+        num_heads=64,
+        num_kv_heads=8,
+        intermediate_size=28672,
+    )
     config = _ats_config(huge, strategy="auto", gpus=16, nodes=2)
     assert resolve_strategy(config) == "deepspeed_zero3"
 

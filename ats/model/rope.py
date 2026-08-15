@@ -10,14 +10,14 @@ longer than the cached max_seq_len is requested, cos/sin are recomputed.
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int = 4096, theta: float = 10000.0) -> None:
+    def __init__(
+        self, dim: int, max_seq_len: int = 4096, theta: float = 10000.0
+    ) -> None:
         super().__init__()
         if dim % 2 != 0:
             raise ValueError(
@@ -27,6 +27,7 @@ class RotaryEmbedding(nn.Module):
         self.dim = dim
         self.theta = theta
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.inv_freq: torch.Tensor
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._cached_seq_len = 0
         self._cached_cos: torch.Tensor
@@ -41,7 +42,9 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("_cached_sin", emb.sin(), persistent=False)
         self._cached_seq_len = seq_len
 
-    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, seq_len: int, device: torch.device, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if seq_len <= 0:
             raise ValueError(f"RotaryEmbedding requires seq_len > 0, got {seq_len}.")
         if seq_len > self._cached_seq_len:
@@ -49,7 +52,10 @@ class RotaryEmbedding(nn.Module):
             # incremental decoding (seq_len creeping up one token at a time)
             # rebuilds the whole cache on every single step. Doubling
             # instead amortizes that rebuild cost across many steps.
-            new_len = max(seq_len, self._cached_seq_len * 2 if self._cached_seq_len > 0 else seq_len)
+            new_len = max(
+                seq_len,
+                self._cached_seq_len * 2 if self._cached_seq_len > 0 else seq_len,
+            )
             self._build_cache(new_len)
         cos = self._cached_cos[:seq_len].to(device=device, dtype=dtype)
         sin = self._cached_sin[:seq_len].to(device=device, dtype=dtype)
@@ -63,8 +69,11 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """q, k: [batch, num_heads, seq_len, head_dim]. cos, sin: [seq_len, head_dim]."""
     if q.shape[-1] != cos.shape[-1]:
         raise ValueError(

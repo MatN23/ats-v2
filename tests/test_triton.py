@@ -29,6 +29,7 @@ _CUDA_AND_TRITON_AVAILABLE = torch.cuda.is_available() and NORM_HAS_TRITON
 
 # --- Fallback correctness (always runs, no GPU required) ---
 
+
 def test_fused_rmsnorm_residual_fallback_matches_manual_computation():
     torch.manual_seed(0)
     x = torch.randn(2, 5, 16)
@@ -87,7 +88,9 @@ def test_fused_moe_dispatch_returns_valid_routing():
     torch.manual_seed(0)
     gate_logits = torch.randn(6, 4)
     hidden_states = torch.randn(6, 16)
-    probs, idx = fused_moe_dispatch(gate_logits, hidden_states, top_k=2, capacity_factor=1.25)
+    probs, idx = fused_moe_dispatch(
+        gate_logits, hidden_states, top_k=2, capacity_factor=1.25
+    )
     assert probs.shape == (6, 2)
     assert idx.shape == (6, 2)
     assert torch.allclose(probs.sum(dim=-1), torch.ones(6), atol=1e-5)
@@ -125,6 +128,7 @@ def test_fused_mla_kv_decompress_rejects_dim_mismatch():
 
 # --- Triton-vs-fallback parity (only meaningful with real CUDA + Triton) ---
 
+
 @pytest.mark.skipif(
     not _CUDA_AND_TRITON_AVAILABLE,
     reason="Requires a CUDA GPU and a working Triton install; not available here.",
@@ -135,7 +139,10 @@ def test_triton_rmsnorm_residual_matches_pytorch_within_tolerance():
     residual = torch.randn(4, 32, device="cuda")
     weight = torch.randn(32, device="cuda")
 
-    from ats.model.norm_triton import _pytorch_rmsnorm_residual, _triton_rmsnorm_residual
+    from ats.model.norm_triton import (
+        _pytorch_rmsnorm_residual,
+        _triton_rmsnorm_residual,
+    )
 
     triton_out = _triton_rmsnorm_residual(x, residual, weight, eps=1e-6)
     pytorch_out = _pytorch_rmsnorm_residual(x, residual, weight, eps=1e-6)
@@ -174,7 +181,9 @@ def test_triton_moe_routing_matches_pytorch_within_tolerance():
     pytorch_probs, pytorch_idx = _pytorch_moe_routing(gate_logits, top_k=2)
     assert torch.equal(triton_idx.sort(dim=-1).values, pytorch_idx.sort(dim=-1).values)
     assert torch.allclose(
-        triton_probs.sort(dim=-1).values, pytorch_probs.sort(dim=-1).values, atol=1e-5,
+        triton_probs.sort(dim=-1).values,
+        pytorch_probs.sort(dim=-1).values,
+        atol=1e-5,
     )
 
 
@@ -186,7 +195,7 @@ def test_triton_mla_matmul_matches_pytorch_within_tolerance():
     torch.manual_seed(0)
     c = torch.randn(2, 8, 16, device="cuda")
     w_uk = torch.randn(32, 16, device="cuda")
-    w_uv = torch.randn(32, 16, device="cuda")
+    torch.randn(32, 16, device="cuda")
 
     from ats.model.mla_triton import _triton_matmul
 

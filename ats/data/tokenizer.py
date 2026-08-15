@@ -5,7 +5,7 @@ id 0, since 0 is frequently a real content token."""
 
 from __future__ import annotations
 
-from typing import List, Literal
+from typing import Literal
 
 from ats.config.schema import ConfigError
 
@@ -56,7 +56,8 @@ class Tokenizer:
                 )
             self.eos_token_id = self._hf_tok.eos_token_id
             self.pad_token_id = (
-                self._hf_tok.pad_token_id if self._hf_tok.pad_token_id is not None
+                self._hf_tok.pad_token_id
+                if self._hf_tok.pad_token_id is not None
                 else self._hf_tok.eos_token_id
             )
         else:
@@ -66,12 +67,12 @@ class Tokenizer:
                 f"'hf:<model_id>' (e.g. 'hf:meta-llama/Llama-2-7b-hf')."
             )
 
-    def encode(self, text: str) -> List[int]:
+    def encode(self, text: str) -> list[int]:
         if self._backend == "tiktoken":
             return self._enc.encode(text, allowed_special="all")
         return self._hf_tok.encode(text, add_special_tokens=False)
 
-    def decode(self, token_ids: List[int]) -> str:
+    def decode(self, token_ids: list[int]) -> str:
         # Filters both out-of-range-high ids AND negative ids: the latter
         # matters because label arrays (which legitimately contain -100 at
         # masked/padded positions, see IGNORE_INDEX in ats.data.dataset)
@@ -83,10 +84,15 @@ class Tokenizer:
         return self._hf_tok.decode(real_ids, skip_special_tokens=True)
 
     def truncate(
-        self, token_ids: List[int], max_length: int, strategy: TruncationStrategy = "right",
-    ) -> List[int]:
+        self,
+        token_ids: list[int],
+        max_length: int,
+        strategy: TruncationStrategy = "right",
+    ) -> list[int]:
         if max_length <= 0:
-            raise ConfigError(f"truncate() max_length must be positive, got {max_length}.")
+            raise ConfigError(
+                f"truncate() max_length must be positive, got {max_length}."
+            )
         if len(token_ids) <= max_length:
             return token_ids
 
@@ -104,7 +110,7 @@ class Tokenizer:
             keep = max_length - 1
             head = keep // 2
             tail = keep - head
-            return token_ids[:head] + [marker_id] + token_ids[len(token_ids) - tail:]
+            return token_ids[:head] + [marker_id] + token_ids[len(token_ids) - tail :]
         raise ConfigError(
             f"Unknown truncation strategy '{strategy}'. Fix: use 'left', 'right', or 'middle'."
         )

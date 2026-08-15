@@ -4,9 +4,9 @@ DeepSpeed engine. This is the only place ats calls deepspeed.initialize().
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
-import torch.nn as nn
+from torch import nn
 
 from ats.config.schema import ATSConfig, ConfigError
 from ats.parallelism.auto_parallel import resolve_strategy
@@ -23,7 +23,9 @@ _ZERO_STAGE_BY_STRATEGY = {
 }
 
 
-def get_param_groups(model: nn.Module, lr: float, weight_decay: float) -> List[Dict[str, Any]]:
+def get_param_groups(
+    model: nn.Module, lr: float, weight_decay: float
+) -> list[dict[str, Any]]:
     """Splits parameters into a weight-decayed group (matrix-shaped weights:
     attention/FFN/MoE projections, embeddings) and a non-decayed group
     (biases and normalization scale parameters). Weight decay on 1D
@@ -56,7 +58,7 @@ def get_param_groups(model: nn.Module, lr: float, weight_decay: float) -> List[D
     return groups
 
 
-def build_deepspeed_config(config: ATSConfig, micro_batch_size: int) -> Dict[str, Any]:
+def build_deepspeed_config(config: ATSConfig, micro_batch_size: int) -> dict[str, Any]:
     """Programmatically build a DeepSpeed config dict from ATSConfig fields.
     No hardcoded values that ignore the user's YAML: every field here is
     derived from `config`.
@@ -77,7 +79,7 @@ def build_deepspeed_config(config: ATSConfig, micro_batch_size: int) -> Dict[str
 
     zero_stage = _ZERO_STAGE_BY_STRATEGY[strategy]
 
-    ds_config: Dict[str, Any] = {
+    ds_config: dict[str, Any] = {
         "train_micro_batch_size_per_gpu": micro_batch_size,
         "gradient_accumulation_steps": config.training.grad_accum_steps,
         "gradient_clipping": config.training.grad_clip_norm,
@@ -147,7 +149,9 @@ def build_deepspeed_config(config: ATSConfig, micro_batch_size: int) -> Dict[str
     return ds_config
 
 
-def _build_bitsandbytes_optimizer(config: ATSConfig, param_groups: List[Dict[str, Any]]) -> Any:
+def _build_bitsandbytes_optimizer(
+    config: ATSConfig, param_groups: list[dict[str, Any]]
+) -> Any:
     """Builds a bitsandbytes 8-bit Adam optimizer over `param_groups`. Raises
     ConfigError with an actionable message if bitsandbytes is not installed,
     rather than silently falling back to fp32 AdamW."""
@@ -169,8 +173,10 @@ def _build_bitsandbytes_optimizer(config: ATSConfig, param_groups: List[Dict[str
 
 
 def initialize_engine(
-    model: nn.Module, config: ATSConfig, micro_batch_size: int,
-) -> Tuple[Any, Any, Any, Any]:
+    model: nn.Module,
+    config: ATSConfig,
+    micro_batch_size: int,
+) -> tuple[Any, Any, Any, Any]:
     """Calls deepspeed.initialize() with a config generated from `config`.
 
     Returns (model_engine, optimizer, _, lr_scheduler) exactly as DeepSpeed does.
@@ -200,11 +206,15 @@ def initialize_engine(
     logger.info("Initializing DeepSpeed engine with config: %s", ds_config)
 
     param_groups = get_param_groups(
-        model, lr=config.training.learning_rate, weight_decay=config.training.weight_decay,
+        model,
+        lr=config.training.learning_rate,
+        weight_decay=config.training.weight_decay,
     )
 
     client_optimizer = (
-        _build_bitsandbytes_optimizer(config, param_groups) if config.optimizer.bits == 8 else None
+        _build_bitsandbytes_optimizer(config, param_groups)
+        if config.optimizer.bits == 8
+        else None
     )
 
     model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(

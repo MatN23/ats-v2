@@ -6,10 +6,11 @@ scheduler/checkpoint/monitor/adaptive-controller infrastructure."""
 
 from __future__ import annotations
 
-from typing import Any, Iterator, Optional
+from collections.abc import Iterable
+from typing import Any
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from ats.config.schema import ATSConfig
 from ats.model.diffusion import DiffusionLM
@@ -38,35 +39,52 @@ def _preflight_memory_check(config: ATSConfig, micro_batch_size: int) -> None:
         logger.info(
             "Pre-flight memory estimate: model=%.1fGB optimizer=%.1fGB "
             "activations=%.1fGB total=%.1fGB (no GPU detected to compare against)",
-            report.model_gb, report.optimizer_gb, report.activation_gb, report.total_gb,
+            report.model_gb,
+            report.optimizer_gb,
+            report.activation_gb,
+            report.total_gb,
         )
         return
 
     logger.info(
         "Pre-flight memory estimate: model=%.1fGB optimizer=%.1fGB "
         "activations=%.1fGB total=%.1fGB / %.1fGB available",
-        report.model_gb, report.optimizer_gb, report.activation_gb,
-        report.total_gb, report.available_gb,
+        report.model_gb,
+        report.optimizer_gb,
+        report.activation_gb,
+        report.total_gb,
+        report.available_gb,
     )
     if not report.fits_on_single_gpu:
         logger.warning(
             "Estimated memory (%.1fGB) exceeds 80%% of available GPU memory (%.1fGB). "
             "Suggested fix: --micro-batch-size %d --grad-accum-steps %d, or "
             "--parallelism-strategy deepspeed_zero%d, or --checkpoint-every-n-layers 1.",
-            report.total_gb, report.available_gb,
-            report.suggested_batch_size, report.suggested_grad_accum, report.suggested_zero_stage,
+            report.total_gb,
+            report.available_gb,
+            report.suggested_batch_size,
+            report.suggested_grad_accum,
+            report.suggested_zero_stage,
         )
 
 
 def _log_oom_and_reraise(
-    config: ATSConfig, micro_batch_size: int, grad_accum_steps: int, step: int, exc: Exception,
+    config: ATSConfig,
+    micro_batch_size: int,
+    grad_accum_steps: int,
+    step: int,
+    exc: Exception,
 ) -> None:
     """Logs an actionable OOM message (estimated memory breakdown + concrete
     suggested flags) and re-raises the original exception immediately --
     this is NOT a bare except that swallows the error."""
     try:
         report = estimate_memory(config, target_batch_size=micro_batch_size)
-        model_gb, opt_gb, act_gb = report.model_gb, report.optimizer_gb, report.activation_gb
+        model_gb, opt_gb, act_gb = (
+            report.model_gb,
+            report.optimizer_gb,
+            report.activation_gb,
+        )
     except ValueError:
         model_gb = opt_gb = act_gb = float("nan")
 
@@ -76,13 +94,19 @@ def _log_oom_and_reraise(
         "Try: --micro-batch-size %d --grad-accum-steps %d\n"
         "Or:  --checkpoint-every-n-layers 1\n"
         "Or:  --parallelism-strategy deepspeed_zero3",
-        step, model_gb, opt_gb, act_gb,
-        max(1, micro_batch_size // 2), grad_accum_steps * 2,
+        step,
+        model_gb,
+        opt_gb,
+        act_gb,
+        max(1, micro_batch_size // 2),
+        grad_accum_steps * 2,
     )
     raise exc
 
 
-def _preflight_chinchilla_check(model: nn.Module, config: ATSConfig, micro_batch_size: int) -> None:
+def _preflight_chinchilla_check(
+    model: nn.Module, config: ATSConfig, micro_batch_size: int
+) -> None:
     """Logs the configured total training-token budget against the
     Chinchilla-optimal ratio of ~20 tokens per parameter (Hoffmann et al.
     2022), warning if it's off by more than 2x in either direction. This is
@@ -108,7 +132,10 @@ def _preflight_chinchilla_check(model: nn.Module, config: ATSConfig, micro_batch
     logger.info(
         "Chinchilla check: %.1fM params, %.2fB configured training tokens "
         "(%.2fx the ~20 tok/param Chinchilla-optimal budget of %.2fB tokens).",
-        num_params / 1e6, total_tokens / 1e9, ratio, chinchilla_optimal_tokens / 1e9,
+        num_params / 1e6,
+        total_tokens / 1e9,
+        ratio,
+        chinchilla_optimal_tokens / 1e9,
     )
     if ratio < 0.5 or ratio > 2.0:
         logger.warning(
@@ -116,10 +143,11 @@ def _preflight_chinchilla_check(model: nn.Module, config: ATSConfig, micro_batch
             "model's %.1fM parameters. %s "
             "Fix: adjust training.max_steps (or grad_accum_steps / micro_batch_size / "
             "parallelism.gpus) to change the token budget, if this wasn't intentional.",
-            ratio, num_params / 1e6,
+            ratio,
+            num_params / 1e6,
             "This significantly under-trains the model relative to its size."
-            if ratio < 0.5 else
-            "This significantly over-trains the model relative to its size "
+            if ratio < 0.5
+            else "This significantly over-trains the model relative to its size "
             "(diminishing returns on loss, though it can still be worthwhile for a "
             "smaller model that's cheaper to run at inference).",
         )
@@ -142,8 +170,8 @@ class Trainer:
         self,
         model: nn.Module,
         config: ATSConfig,
-        train_dataloader: Iterator[Any],
-        eval_dataloader: Optional[Iterator[Any]] = None,
+        train_dataloader: Iterable[Any],
+        eval_dataloader: Iterable[Any] | None = None,
         micro_batch_size: int = 1,
     ) -> None:
         self.config = config
@@ -236,13 +264,19 @@ class Trainer:
             logger.warning(
                 "AdaptiveController applied %s at step %d: lr %.3e -> %.3e "
                 "(multiplier %.3f -> %.3f)",
-                action.type, self.global_step, old_lr, new_lr,
-                prev_multiplier, new_multiplier,
+                action.type,
+                self.global_step,
+                old_lr,
+                new_lr,
+                prev_multiplier,
+                new_multiplier,
             )
 
     def train_step(self, batch: Any) -> TrainingMetrics:
         batch = _move_batch_to_device(batch, self.model_engine.local_rank)
-        output = self.model_engine(batch["input_ids"], attention_mask=batch.get("attention_mask"))
+        output = self.model_engine(
+            batch["input_ids"], attention_mask=batch.get("attention_mask")
+        )
         # Bug 12 fix: .reshape() handles non-contiguous tensors itself (it
         # only copies when the view can't be expressed as a stride change),
         # so the explicit .contiguous() calls before .view() were an
@@ -250,7 +284,8 @@ class Trainer:
         shift_logits = output.logits[..., :-1, :]
         shift_labels = batch["labels"][..., 1:]
         ce_loss = torch.nn.functional.cross_entropy(
-            shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1),
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
             ignore_index=-100,
         )
         total_loss = ce_loss + output.aux_loss
@@ -264,7 +299,9 @@ class Trainer:
         # clips -- clipping already happens inside model_engine.step() via
         # the gradient_clipping value in the DeepSpeed config.
         pre_step_grad_norm = float(
-            torch.nn.utils.clip_grad_norm_(self.model_engine.parameters(), max_norm=float("inf"))
+            torch.nn.utils.clip_grad_norm_(
+                self.model_engine.parameters(), max_norm=float("inf")
+            )
         )
 
         # Let any active adaptive multiplier from a previous step relax a
@@ -281,7 +318,9 @@ class Trainer:
         # would immediately overwrite them again next step, before the
         # optimizer ever took a step at the intended value. See the
         # AdaptiveController-related comment in __init__.
-        scheduled_lr = self.scheduler.get_lr(self.global_step) * self._adaptive_lr_multiplier
+        scheduled_lr = (
+            self.scheduler.get_lr(self.global_step) * self._adaptive_lr_multiplier
+        )
         self._set_lr(scheduled_lr)
 
         self.model_engine.step()
@@ -310,12 +349,16 @@ class Trainer:
         # this degrades to a no-op rather than crashing if unavailable.
         if self.global_step % self.config.logging.log_every == 0:
             fp16_opt = self.model_engine.optimizer
-            cur_scale = getattr(fp16_opt, "cur_scale", getattr(fp16_opt, "loss_scale", None))
+            cur_scale = getattr(
+                fp16_opt, "cur_scale", getattr(fp16_opt, "loss_scale", None)
+            )
             overflow = getattr(fp16_opt, "overflow", None)
             if cur_scale is not None:
                 logger.info(
                     "fp16 loss scale at step %d: cur_scale=%s overflow_this_step=%s",
-                    self.global_step, cur_scale, overflow,
+                    self.global_step,
+                    cur_scale,
+                    overflow,
                 )
 
         metrics = TrainingMetrics(
@@ -336,8 +379,10 @@ class Trainer:
 
         return metrics
 
-    def train(self, max_steps: Optional[int] = None) -> None:
-        target_steps = max_steps if max_steps is not None else self.config.training.max_steps
+    def train(self, max_steps: int | None = None) -> None:
+        target_steps = (
+            max_steps if max_steps is not None else self.config.training.max_steps
+        )
         train_iter = iter(self.train_dataloader)
 
         while self.global_step < target_steps:
@@ -352,24 +397,39 @@ class Trainer:
                 metrics = self.train_step(batch)
             except torch.cuda.OutOfMemoryError as exc:
                 _log_oom_and_reraise(
-                    self.config, self.micro_batch_size, self.config.training.grad_accum_steps,
-                    self.global_step, exc,
+                    self.config,
+                    self.micro_batch_size,
+                    self.config.training.grad_accum_steps,
+                    self.global_step,
+                    exc,
                 )
             tokens_per_step = int(batch["input_ids"].numel())
             self.monitor.log(
                 self.global_step,
-                {"loss": metrics.loss, "grad_norm": metrics.grad_norm, "lr": metrics.learning_rate},
+                {
+                    "loss": metrics.loss,
+                    "grad_norm": metrics.grad_norm,
+                    "lr": metrics.learning_rate,
+                },
                 tokens_per_step,
             )
 
             self.global_step += 1
 
-            if self.config.training.eval_every > 0 and self.global_step % self.config.training.eval_every == 0:
-                if self.eval_dataloader is not None:
-                    self.evaluate()
+            if (
+                self.config.training.eval_every > 0
+                and self.global_step % self.config.training.eval_every == 0
+                and self.eval_dataloader is not None
+            ):
+                self.evaluate()
 
-            if self.config.training.save_every > 0 and self.global_step % self.config.training.save_every == 0:
-                self.checkpoint_manager.save(self.model_engine, self.global_step, self.epoch)
+            if (
+                self.config.training.save_every > 0
+                and self.global_step % self.config.training.save_every == 0
+            ):
+                self.checkpoint_manager.save(
+                    self.model_engine, self.global_step, self.epoch
+                )
 
         self.monitor.close()
 
@@ -385,14 +445,18 @@ class Trainer:
         with torch.no_grad():
             for batch in self.eval_dataloader:
                 batch = _move_batch_to_device(batch, self.model_engine.local_rank)
-                output = self.model_engine(batch["input_ids"], attention_mask=batch.get("attention_mask"))
+                output = self.model_engine(
+                    batch["input_ids"], attention_mask=batch.get("attention_mask")
+                )
                 # Bug 12 fix: same .contiguous()+.view() -> .reshape() cleanup
                 # as Trainer.train_step, applied here in evaluate() too.
                 shift_logits = output.logits[..., :-1, :]
                 shift_labels = batch["labels"][..., 1:]
                 loss = torch.nn.functional.cross_entropy(
-                    shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1),
-                    ignore_index=-100, reduction="sum",
+                    shift_logits.reshape(-1, shift_logits.size(-1)),
+                    shift_labels.reshape(-1),
+                    ignore_index=-100,
+                    reduction="sum",
                 )
                 num_valid = (shift_labels != -100).sum().item()
                 total_loss += float(loss.item())
@@ -406,7 +470,12 @@ class Trainer:
             )
         avg_loss = total_loss / total_tokens
         perplexity = float(torch.exp(torch.tensor(avg_loss)))
-        logger.info("Eval at step %d: loss=%.4f, perplexity=%.4f", self.global_step, avg_loss, perplexity)
+        logger.info(
+            "Eval at step %d: loss=%.4f, perplexity=%.4f",
+            self.global_step,
+            avg_loss,
+            perplexity,
+        )
         return perplexity
 
 
@@ -421,8 +490,8 @@ class DiffusionTrainer:
         self,
         model: nn.Module,
         config: ATSConfig,
-        train_dataloader: Iterator[Any],
-        eval_dataloader: Optional[Iterator[Any]] = None,
+        train_dataloader: Iterable[Any],
+        eval_dataloader: Iterable[Any] | None = None,
         micro_batch_size: int = 1,
     ) -> None:
         if config.model.model_type != "diffusion":
@@ -443,6 +512,11 @@ class DiffusionTrainer:
         # without having to reach through model_engine.module each step.
         self._embed_tokens = model.embed_tokens
 
+        # config.model.hidden_size is guaranteed resolved here: `model` was
+        # already constructed from this same config (ATSTransformer's own
+        # constructor requires is_resolved()), but mypy can't see across
+        # that earlier construction, so narrow again explicitly.
+        assert config.model.hidden_size is not None
         diffusion_model = DiffusionLM(
             backbone=model,
             hidden_size=config.model.hidden_size,
@@ -507,19 +581,27 @@ class DiffusionTrainer:
             logger.warning(
                 "AdaptiveController applied %s at step %d: lr %.3e -> %.3e "
                 "(multiplier %.3f -> %.3f)",
-                action.type, self.global_step, old_lr, new_lr,
-                prev_multiplier, new_multiplier,
+                action.type,
+                self.global_step,
+                old_lr,
+                new_lr,
+                prev_multiplier,
+                new_multiplier,
             )
 
     def train_step(self, batch: Any) -> TrainingMetrics:
         batch = _move_batch_to_device(batch, self.model_engine.local_rank)
         output = self.model_engine(batch["input_ids"], embed_tokens=self._embed_tokens)
-        mse_loss = output.loss  # DiffusionOutput.loss, computed via MSE in DiffusionLM.forward
+        mse_loss = (
+            output.loss
+        )  # DiffusionOutput.loss, computed via MSE in DiffusionLM.forward
 
         self.model_engine.backward(mse_loss)
         # See Trainer.train_step: measure before step() clears gradients.
         pre_step_grad_norm = float(
-            torch.nn.utils.clip_grad_norm_(self.model_engine.parameters(), max_norm=float("inf"))
+            torch.nn.utils.clip_grad_norm_(
+                self.model_engine.parameters(), max_norm=float("inf")
+            )
         )
 
         self._adaptive_lr_multiplier = (
@@ -528,7 +610,9 @@ class DiffusionTrainer:
 
         # See Trainer.train_step: LR must be set before step(), not after,
         # so this step's update actually uses it.
-        scheduled_lr = self.scheduler.get_lr(self.global_step) * self._adaptive_lr_multiplier
+        scheduled_lr = (
+            self.scheduler.get_lr(self.global_step) * self._adaptive_lr_multiplier
+        )
         self._set_lr(scheduled_lr)
 
         self.model_engine.step()
@@ -554,8 +638,10 @@ class DiffusionTrainer:
 
         return metrics
 
-    def train(self, max_steps: Optional[int] = None) -> None:
-        target_steps = max_steps if max_steps is not None else self.config.training.max_steps
+    def train(self, max_steps: int | None = None) -> None:
+        target_steps = (
+            max_steps if max_steps is not None else self.config.training.max_steps
+        )
         train_iter = iter(self.train_dataloader)
 
         while self.global_step < target_steps:
@@ -570,24 +656,39 @@ class DiffusionTrainer:
                 metrics = self.train_step(batch)
             except torch.cuda.OutOfMemoryError as exc:
                 _log_oom_and_reraise(
-                    self.config, self.micro_batch_size, self.config.training.grad_accum_steps,
-                    self.global_step, exc,
+                    self.config,
+                    self.micro_batch_size,
+                    self.config.training.grad_accum_steps,
+                    self.global_step,
+                    exc,
                 )
             tokens_per_step = int(batch["input_ids"].numel())
             self.monitor.log(
                 self.global_step,
-                {"mse_loss": metrics.loss, "grad_norm": metrics.grad_norm, "lr": metrics.learning_rate},
+                {
+                    "mse_loss": metrics.loss,
+                    "grad_norm": metrics.grad_norm,
+                    "lr": metrics.learning_rate,
+                },
                 tokens_per_step,
             )
 
             self.global_step += 1
 
-            if self.config.training.eval_every > 0 and self.global_step % self.config.training.eval_every == 0:
-                if self.eval_dataloader is not None:
-                    self.evaluate()
+            if (
+                self.config.training.eval_every > 0
+                and self.global_step % self.config.training.eval_every == 0
+                and self.eval_dataloader is not None
+            ):
+                self.evaluate()
 
-            if self.config.training.save_every > 0 and self.global_step % self.config.training.save_every == 0:
-                self.checkpoint_manager.save(self.model_engine, self.global_step, self.epoch)
+            if (
+                self.config.training.save_every > 0
+                and self.global_step % self.config.training.save_every == 0
+            ):
+                self.checkpoint_manager.save(
+                    self.model_engine, self.global_step, self.epoch
+                )
 
         self.monitor.close()
 
@@ -603,7 +704,9 @@ class DiffusionTrainer:
         with torch.no_grad():
             for batch in self.eval_dataloader:
                 batch = _move_batch_to_device(batch, self.model_engine.local_rank)
-                output = self.model_engine(batch["input_ids"], embed_tokens=self._embed_tokens)
+                output = self.model_engine(
+                    batch["input_ids"], embed_tokens=self._embed_tokens
+                )
                 total_loss += float(output.loss.item())
                 num_batches += 1
         self.model_engine.train()
@@ -611,5 +714,7 @@ class DiffusionTrainer:
         if num_batches == 0:
             raise ValueError("Diffusion eval dataloader produced zero batches.")
         avg_loss = total_loss / num_batches
-        logger.info("Diffusion eval at step %d: mse_loss=%.6f", self.global_step, avg_loss)
+        logger.info(
+            "Diffusion eval at step %d: mse_loss=%.6f", self.global_step, avg_loss
+        )
         return avg_loss

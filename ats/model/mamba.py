@@ -35,8 +35,8 @@ pre-norm residual wrapping: `x + MambaBlock(norm(x))`.
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 
 class MambaBlock(nn.Module):
@@ -50,14 +50,18 @@ class MambaBlock(nn.Module):
     ) -> None:
         super().__init__()
         if hidden_size <= 0:
-            raise ValueError(f"MambaBlock hidden_size must be positive, got {hidden_size}.")
+            raise ValueError(
+                f"MambaBlock hidden_size must be positive, got {hidden_size}."
+            )
         if d_state <= 0 or d_conv <= 0 or expand <= 0:
             raise ValueError(
                 f"MambaBlock d_state, d_conv, expand must all be positive, got "
                 f"d_state={d_state}, d_conv={d_conv}, expand={expand}."
             )
         if chunk_size <= 0:
-            raise ValueError(f"MambaBlock chunk_size must be positive, got {chunk_size}.")
+            raise ValueError(
+                f"MambaBlock chunk_size must be positive, got {chunk_size}."
+            )
         self.hidden_size = hidden_size
         self.d_state = d_state
         self.d_conv = d_conv
@@ -78,14 +82,20 @@ class MambaBlock(nn.Module):
         # F.pad(..., (d_conv - 1, 0)) in forward(), gets the same strictly
         # causal result without the wasted right-side computation.
         self.conv1d = nn.Conv1d(
-            in_channels=self.d_inner, out_channels=self.d_inner, kernel_size=d_conv,
-            groups=self.d_inner, padding=0, bias=True,
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            padding=0,
+            bias=True,
         )
 
         # Input-dependent (selective) SSM parameters: dt, B, C are all
         # functions of the current activations, not fixed weights — this is
         # what makes it "selective" rather than a plain linear SSM.
-        self.x_proj = nn.Linear(self.d_inner, d_state * 2 + 1, bias=False)  # -> (B, C, dt_raw)
+        self.x_proj = nn.Linear(
+            self.d_inner, d_state * 2 + 1, bias=False
+        )  # -> (B, C, dt_raw)
         self.dt_proj = nn.Linear(1, self.d_inner, bias=True)
 
         # A is a learned, per-channel, per-state negative-definite matrix
@@ -98,7 +108,11 @@ class MambaBlock(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, hidden_size, bias=False)
 
     def _chunked_scan(
-        self, dt: torch.Tensor, A: torch.Tensor, B: torch.Tensor, x_conv: torch.Tensor,
+        self,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        x_conv: torch.Tensor,
     ) -> torch.Tensor:
         """Computes state_t at every position via a chunked parallel scan.
         dt, x_conv: [batch, seq_len, d_inner]. A: [d_inner, d_state].
@@ -108,27 +122,35 @@ class MambaBlock(nn.Module):
         d_state = A.shape[-1]
         device, dtype = dt.device, dt.dtype
 
-        all_states = torch.empty(batch, seq_len, d_inner, d_state, device=device, dtype=dtype)
+        all_states = torch.empty(
+            batch, seq_len, d_inner, d_state, device=device, dtype=dtype
+        )
         carry = torch.zeros(batch, d_inner, d_state, device=device, dtype=dtype)
 
         for start in range(0, seq_len, self.chunk_size):
             end = min(start + self.chunk_size, seq_len)
             L = end - start
 
-            dt_chunk = dt[:, start:end, :]          # [batch, L, d_inner]
-            x_chunk = x_conv[:, start:end, :]        # [batch, L, d_inner]
-            B_chunk = B[:, start:end, :]              # [batch, L, d_state]
+            dt_chunk = dt[:, start:end, :]  # [batch, L, d_inner]
+            x_chunk = x_conv[:, start:end, :]  # [batch, L, d_inner]
+            B_chunk = B[:, start:end, :]  # [batch, L, d_state]
 
             # log_a[b,t,d,n] = dt[b,t,d] * A[d,n]  (since a_t = exp(dt_t * A), this
             # IS log(a_t) directly -- no log(exp(...)) round trip needed).
-            log_a = dt_chunk.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0)  # [batch, L, d_inner, d_state]
+            log_a = dt_chunk.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(
+                0
+            )  # [batch, L, d_inner, d_state]
             log_decay = torch.cumsum(log_a, dim=1)  # [batch, L, d_inner, d_state]
 
             # b_t[b,t,d,n] = dt[b,t,d] * x_conv[b,t,d] * B[b,t,n]
-            b_term = (dt_chunk * x_chunk).unsqueeze(-1) * B_chunk.unsqueeze(2)  # [batch, L, d_inner, d_state]
+            b_term = (dt_chunk * x_chunk).unsqueeze(-1) * B_chunk.unsqueeze(
+                2
+            )  # [batch, L, d_inner, d_state]
 
             # Contribution carried in from the previous chunk's final state.
-            carry_contrib = carry.unsqueeze(1) * torch.exp(log_decay)  # [batch, L, d_inner, d_state]
+            carry_contrib = carry.unsqueeze(1) * torch.exp(
+                log_decay
+            )  # [batch, L, d_inner, d_state]
 
             # Intra-chunk contribution via the lower-triangular decay-ratio
             # matrix: decay_ratio[b,t,k,d,n] = exp(log_decay[t] - log_decay[k])
@@ -140,7 +162,11 @@ class MambaBlock(nn.Module):
             tri_mask = torch.tril(torch.ones(L, L, device=device, dtype=torch.bool))
             tri_mask = tri_mask.view(1, L, L, 1, 1)
             log_diff = torch.clamp(log_decay_t - log_decay_k, max=0.0)
-            decay_ratio = torch.where(tri_mask, torch.exp(log_diff), torch.zeros((), device=device, dtype=dtype))
+            decay_ratio = torch.where(
+                tri_mask,
+                torch.exp(log_diff),
+                torch.zeros((), device=device, dtype=dtype),
+            )
 
             # intra[b,t,d,n] = sum_k decay_ratio[b,t,k,d,n] * b_term[b,k,d,n]
             intra = torch.einsum("btkdn,bkdn->btdn", decay_ratio, b_term)
@@ -157,7 +183,7 @@ class MambaBlock(nn.Module):
                 f"MambaBlock expected input of shape [batch, seq_len, hidden_size], "
                 f"got shape {tuple(x.shape)}."
             )
-        batch, seq_len, hidden_size = x.shape
+        _batch, _seq_len, hidden_size = x.shape
         if hidden_size != self.hidden_size:
             raise ValueError(
                 f"MambaBlock expected hidden_size={self.hidden_size}, got {hidden_size}."
@@ -178,11 +204,15 @@ class MambaBlock(nn.Module):
         # Selective parameters, input-dependent per position.
         proj = self.x_proj(x_conv)  # [batch, seq_len, 2*d_state + 1]
         B, C, dt_raw = torch.split(proj, [self.d_state, self.d_state, 1], dim=-1)
-        dt = F.softplus(self.dt_proj(dt_raw))  # [batch, seq_len, d_inner], always positive
+        dt = F.softplus(
+            self.dt_proj(dt_raw)
+        )  # [batch, seq_len, d_inner], always positive
 
         A = -torch.exp(self.A_log)  # [d_inner, d_state], negative for stability
 
-        states = self._chunked_scan(dt, A, B, x_conv)  # [batch, seq_len, d_inner, d_state]
+        states = self._chunked_scan(
+            dt, A, B, x_conv
+        )  # [batch, seq_len, d_inner, d_state]
         y = torch.einsum("btdn,btn->btd", states, C)  # [batch, seq_len, d_inner]
         y = y + x_conv * self.D  # skip connection (D is a per-channel scalar)
 

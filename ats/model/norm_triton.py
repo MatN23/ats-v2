@@ -15,13 +15,12 @@ caller crashes.
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import torch
 
 try:
     import triton
     import triton.language as tl
+
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
@@ -31,8 +30,12 @@ if HAS_TRITON:
 
     @triton.jit
     def _rmsnorm_residual_kernel(
-        x_ptr, residual_ptr, weight_ptr, out_ptr,
-        n_cols, eps,
+        x_ptr,
+        residual_ptr,
+        weight_ptr,
+        out_ptr,
+        n_cols,
+        eps,
         BLOCK_SIZE: tl.constexpr,
     ):
         row_idx = tl.program_id(0)
@@ -40,8 +43,12 @@ if HAS_TRITON:
         mask = col_offsets < n_cols
 
         row_start = row_idx * n_cols
-        x = tl.load(x_ptr + row_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        residual = tl.load(residual_ptr + row_start + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_ptr + row_start + col_offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        residual = tl.load(
+            residual_ptr + row_start + col_offsets, mask=mask, other=0.0
+        ).to(tl.float32)
         weight = tl.load(weight_ptr + col_offsets, mask=mask, other=1.0).to(tl.float32)
 
         variance = tl.sum(x * x, axis=0) / n_cols
@@ -52,7 +59,10 @@ if HAS_TRITON:
         tl.store(out_ptr + row_start + col_offsets, out, mask=mask)
 
     def _triton_rmsnorm_residual(
-        x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
     ) -> torch.Tensor:
         orig_shape = x.shape
         hidden_size = orig_shape[-1]
@@ -64,13 +74,22 @@ if HAS_TRITON:
         block_size = triton.next_power_of_2(hidden_size)
         grid = (num_rows,)
         _rmsnorm_residual_kernel[grid](
-            x_flat, residual_flat, weight, out, hidden_size, eps, BLOCK_SIZE=block_size,
+            x_flat,
+            residual_flat,
+            weight,
+            out,
+            hidden_size,
+            eps,
+            BLOCK_SIZE=block_size,
         )
         return out.reshape(orig_shape)
 
 
 def _pytorch_rmsnorm_residual(
-    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
 ) -> torch.Tensor:
     input_dtype = x.dtype
     x_fp32 = x.to(torch.float32)
@@ -80,7 +99,10 @@ def _pytorch_rmsnorm_residual(
 
 
 def fused_rmsnorm_residual(
-    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
     """Computes `residual + rms_norm(x) * weight` in as few memory passes as
     possible. Uses a fused Triton kernel when available and running on CUDA;

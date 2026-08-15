@@ -38,20 +38,22 @@ def estimate_param_count(model) -> int:
         if rope_head_dim % 2 != 0:
             rope_head_dim += 1
         attn_params_per_layer = (
-            (h * latent_dim)      # w_dkv
-            + (latent_dim * h)    # w_uk
-            + (latent_dim * h)    # w_uv
-            + (h * latent_dim)    # w_dq
-            + (latent_dim * h)    # w_uq
+            (h * latent_dim)  # w_dkv
+            + (latent_dim * h)  # w_uk
+            + (latent_dim * h)  # w_uv
+            + (h * latent_dim)  # w_dq
+            + (latent_dim * h)  # w_uq
             + (h * model.num_heads * rope_head_dim)  # w_qr
             + (h * rope_head_dim)  # w_kr
-            + (h * h)              # o_proj
+            + (h * h)  # o_proj
         )
     else:
         kv_dim = (model.hidden_size // model.num_heads) * model.num_kv_heads
         attn_params_per_layer = (h * h) + (h * kv_dim) + (h * kv_dim) + (h * h)
 
-    ffn_params_per_layer = (h * 2 * model.intermediate_size) + (model.intermediate_size * h)
+    ffn_params_per_layer = (h * 2 * model.intermediate_size) + (
+        model.intermediate_size * h
+    )
     per_layer = attn_params_per_layer + ffn_params_per_layer
     total = per_layer * model.num_layers
 

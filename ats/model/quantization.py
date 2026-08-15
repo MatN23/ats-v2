@@ -31,15 +31,18 @@ from __future__ import annotations
 from typing import Literal
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 QuantizationMode = Literal["none", "int8", "fp8"]
 
 
 class QuantizedLinear(nn.Linear):
     def __init__(
-        self, in_features: int, out_features: int, quantization: QuantizationMode = "none",
+        self,
+        in_features: int,
+        out_features: int,
+        quantization: QuantizationMode = "none",
         bias: bool = False,
     ) -> None:
         if quantization not in ("none", "int8", "fp8"):
@@ -53,7 +56,10 @@ class QuantizedLinear(nn.Linear):
 
         if quantization == "int8":
             try:
-                from torch.ao.quantization import FakeQuantize, MovingAverageMinMaxObserver
+                from torch.ao.quantization import (
+                    FakeQuantize,
+                    MovingAverageMinMaxObserver,
+                )
             except ImportError as exc:
                 raise ImportError(
                     "int8 quantization-aware training requires torch.ao.quantization "
@@ -62,12 +68,16 @@ class QuantizedLinear(nn.Linear):
                 ) from exc
             self._weight_fake_quant = FakeQuantize.with_args(
                 observer=MovingAverageMinMaxObserver,
-                quant_min=-128, quant_max=127, dtype=torch.qint8,
+                quant_min=-128,
+                quant_max=127,
+                dtype=torch.qint8,
                 qscheme=torch.per_tensor_symmetric,
             )()
             self._act_fake_quant = FakeQuantize.with_args(
                 observer=MovingAverageMinMaxObserver,
-                quant_min=-128, quant_max=127, dtype=torch.qint8,
+                quant_min=-128,
+                quant_max=127,
+                dtype=torch.qint8,
                 qscheme=torch.per_tensor_affine,
             )()
 
@@ -82,6 +92,7 @@ class QuantizedLinear(nn.Linear):
         # fp8 GEMM path is used on every subsequent forward() call.
         try:
             import torchao  # noqa: F401
+
             return "torchao"
         except ImportError:
             pass
@@ -102,6 +113,7 @@ class QuantizedLinear(nn.Linear):
         # docstring on why state_dict compatibility matters here).
         try:
             import transformer_engine.pytorch  # noqa: F401
+
             te_installed = True
         except ImportError:
             te_installed = False
@@ -161,7 +173,9 @@ class QuantizedLinear(nn.Linear):
 
 
 def make_linear(
-    in_features: int, out_features: int, quantization: QuantizationMode = "none",
+    in_features: int,
+    out_features: int,
+    quantization: QuantizationMode = "none",
     bias: bool = False,
 ) -> nn.Linear:
     """Factory used throughout ats.model to construct a Linear layer:
@@ -174,4 +188,6 @@ def make_linear(
     """
     if quantization == "none":
         return nn.Linear(in_features, out_features, bias=bias)
-    return QuantizedLinear(in_features, out_features, quantization=quantization, bias=bias)
+    return QuantizedLinear(
+        in_features, out_features, quantization=quantization, bias=bias
+    )

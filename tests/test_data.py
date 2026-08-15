@@ -3,7 +3,10 @@ loss at boundaries, and dataloader collation shapes."""
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -18,6 +21,29 @@ try:
     _TIKTOKEN_AVAILABLE = True
 except ImportError:
     _TIKTOKEN_AVAILABLE = False
+
+
+def _load_preprocess_module() -> types.ModuleType:
+    """Load the repo-root preprocess.py script as a module, by absolute
+    path rather than `import preprocess`.
+
+    preprocess.py is a top-level script, not part of the installed `ats`
+    package, so it's only importable by name when the repo root happens to
+    be on sys.path. That's true under `python -m pytest` (which always
+    prepends cwd to sys.path) but NOT under a bare `pytest` invocation
+    with the package installed via `pip install -e .` -- a PEP 660
+    editable install only maps the `ats` package itself (see
+    __editable___ats_v2_*_finder.py's MAPPING dict), so a bare `pytest`
+    run (exactly what CI's `run: pytest -v --cov=ats ...` does) raises
+    ModuleNotFoundError here. Loading by absolute file path sidesteps
+    sys.path entirely, so this works the same way regardless of cwd,
+    invocation mode, or installation method."""
+    preprocess_path = Path(__file__).resolve().parent.parent / "preprocess.py"
+    spec = importlib.util.spec_from_file_location("preprocess", preprocess_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _tiktoken_usable() -> bool:
@@ -241,7 +267,7 @@ def test_preprocess_packed_output_round_trips(tmp_path):
     the fake character-level tokenizer's package-free logic pattern, but
     via the actual module this time (tiktoken not required: uses a
     monkeypatched Tokenizer)."""
-    import preprocess as preprocess_module
+    preprocess_module = _load_preprocess_module()
 
     input_path = tmp_path / "docs.jsonl"
     with open(input_path, "w") as f:

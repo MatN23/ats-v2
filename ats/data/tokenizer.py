@@ -81,7 +81,15 @@ class Tokenizer:
         real_ids = [t for t in token_ids if 0 <= t < self.vocab_size]
         if self._backend == "tiktoken":
             return self._enc.decode(real_ids)
-        return self._hf_tok.decode(real_ids, skip_special_tokens=True)
+        decoded = self._hf_tok.decode(real_ids, skip_special_tokens=True)
+        # HF's decode() is typed to return str | list[str] (it has a
+        # batch-decode overload for nested sequences), but real_ids is
+        # always a flat list[int] here, so the runtime result is always a
+        # single str. Assert rather than `# type: ignore` so this also
+        # catches it at runtime if that assumption ever stops holding
+        # (e.g. a future change accidentally passes a nested list).
+        assert isinstance(decoded, str)
+        return decoded
 
     def truncate(
         self,

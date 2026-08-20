@@ -8,6 +8,9 @@ from __future__ import annotations
 from typing import Literal
 
 from ats.config.schema import ConfigError
+from ats.utils.logging_utils import get_logger
+
+logger = get_logger("ats.data.tokenizer")
 
 TruncationStrategy = Literal["left", "right", "middle"]
 
@@ -34,7 +37,16 @@ class Tokenizer:
                 ) from exc
             self.vocab_size = self._enc.n_vocab + 1  # +1 reserved slot for pad/eos
             self.eos_token_id = self._enc.n_vocab  # last valid index: vocab_size - 1
+            # tiktoken has no separate pad token, so pad_token_id intentionally
+            # aliases eos_token_id: padded positions decode as EOS and are
+            # masked out of the loss via labels==-100 rather than needing a
+            # distinct id, which keeps vocab_size at n_vocab + 1 instead of + 2.
             self.pad_token_id = self._enc.n_vocab
+            logger.info(
+                "tiktoken tokenizer '%s': pad_token_id == eos_token_id == %d "
+                "(no distinct pad token; this is intentional).",
+                encoding_name, self.pad_token_id,
+            )
 
         elif tokenizer_name.startswith("hf:"):
             self._backend = "hf"
@@ -79,6 +91,12 @@ class Tokenizer:
         # could otherwise be passed here directly and crash the underlying
         # tiktoken/HF decoder instead of gracefully skipping those positions.
         real_ids = [t for t in token_ids if 0 <= t < self.vocab_size]
+        dropped = len(token_ids) - len(real_ids)
+        if dropped:
+            logger.debug(
+                "decode() dropped %d out-of-vocab/negative id(s) out of %d "
+                "(vocab_size=%d).", dropped, len(token_ids), self.vocab_size,
+            )
         if self._backend == "tiktoken":
             return self._enc.decode(real_ids)
         decoded = self._hf_tok.decode(real_ids, skip_special_tokens=True)

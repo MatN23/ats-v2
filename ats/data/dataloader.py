@@ -62,7 +62,7 @@ class _TorchMixedDataset(IterableDataset):
 
 def _collate(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
     if not batch:
-        raise ConfigError("collate_fn received an empty batch.")
+        raise ValueError("collate_fn received an empty batch.")
     seq_len = len(batch[0]["input_ids"])
     for example in batch:
         if len(example["input_ids"]) != seq_len:
@@ -106,6 +106,16 @@ def build_dataloader(
         seed=seed,
     )
     torch_dataset = _TorchMixedDataset(mixed_dataset, rank=rank, world_size=world_size)
+
+    # If something upstream swaps torch_dataset for a plain (non-sharding)
+    # dataset, every rank would silently iterate the identical stream with
+    # no error -- just duplicated data and a quietly wrong effective epoch
+    # count. Fail loudly instead of letting that pass unnoticed.
+    if world_size > 1:
+        assert isinstance(torch_dataset, _TorchMixedDataset), (
+            f"world_size={world_size} requires _TorchMixedDataset for correct "
+            f"sharding, got {type(torch_dataset).__name__}."
+        )
 
     return DataLoader(
         torch_dataset,

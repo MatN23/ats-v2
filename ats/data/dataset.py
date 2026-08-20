@@ -80,6 +80,14 @@ def _iter_preprocessed_examples(
         )
     num_blocks = meta["num_blocks"]
     seq_length = meta["seq_length"]
+    # Older preprocess.py runs never wrote "padding_side"; default to "right"
+    # to match their (only supported) behavior for backward compatibility.
+    padding_side = meta.get("padding_side", "right")
+    if padding_side not in ("left", "right"):
+        raise ConfigError(
+            f"Preprocessed source {bin_path} has meta.json padding_side="
+            f"'{padding_side}'. Fix: padding_side must be 'left' or 'right'."
+        )
 
     tokens = np.memmap(
         bin_path,
@@ -103,8 +111,13 @@ def _iter_preprocessed_examples(
         block = tokens[block_idx].tolist()
         valid_len = int(valid_lengths[block_idx])
         labels = list(block)
-        for i in range(valid_len, seq_length):
-            labels[i] = IGNORE_INDEX
+        if padding_side == "right":
+            for i in range(valid_len, seq_length):
+                labels[i] = IGNORE_INDEX
+        else:  # "left": padding occupies the front of the block, not the back
+            pad_len = seq_length - valid_len
+            for i in range(pad_len):
+                labels[i] = IGNORE_INDEX
         yield {"input_ids": block, "labels": labels}
 
 

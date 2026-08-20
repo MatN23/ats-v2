@@ -6,6 +6,7 @@ scheduler/checkpoint/monitor/adaptive-controller infrastructure."""
 
 from __future__ import annotations
 
+import math
 import torch.distributed as dist
 from collections.abc import Iterable
 from typing import Any
@@ -118,6 +119,32 @@ def _distributed_sum(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _capture_controller_state(controller: AdaptiveController) -> dict[str, Any]:
+    """Snapshots the AdaptiveController's mutable internal counters so they
+    survive a checkpoint/resume cycle. Without this, a resumed run forgets
+    how many consecutive emergency cuts or plateau boosts already fired and
+    the cooldown clock (_last_lr_adjust_step) resets to "never adjusted",
+    which can immediately re-trigger an action that had just been cooled
+    down before the checkpoint was taken."""
+    return {
+        "controller_last_lr_adjust_step": controller._last_lr_adjust_step,
+        "controller_consecutive_emergency_cuts": controller._consecutive_emergency_cuts,
+        "controller_consecutive_plateau_boosts": controller._consecutive_plateau_boosts,
+    }
+
+
+def _restore_controller_state(controller: AdaptiveController, client_state: dict[str, Any]) -> None:
+    controller._last_lr_adjust_step = client_state.get(
+        "controller_last_lr_adjust_step", controller._last_lr_adjust_step
+    )
+    controller._consecutive_emergency_cuts = client_state.get(
+        "controller_consecutive_emergency_cuts", controller._consecutive_emergency_cuts
+    )
+    controller._consecutive_plateau_boosts = client_state.get(
+        "controller_consecutive_plateau_boosts", controller._consecutive_plateau_boosts
+    )
+
+
 class Trainer:
     def __init__(
         self, model: nn.Module, config: ATSConfig,
@@ -175,6 +202,7 @@ class Trainer:
         raw_accum = client_state.get("accumulation_step", 0)
         self._accumulation_step = min(raw_accum, self.grad_accum_steps - 1)
         self._accumulated_tokens = client_state.get("accumulated_tokens", 0)
+        _restore_controller_state(self.adaptive_controller, client_state)
         logger.info(
             "Resumed at step %d, epoch %d, adaptive_multiplier=%.4f, accum_step=%d/%d",
             self.global_step, self.epoch, self._adaptive_lr_multiplier,
@@ -186,12 +214,20 @@ class Trainer:
             param_group["lr"] = lr
 
     def _apply_adaptive_action(self, action) -> None:
+        if action is not None and action.type == "warn_expert_collapse":
+            logger.warning(
+                "MoE expert collapse warning at step %d: min_usage=%.4f max_usage=%.4f",
+                self.global_step, action.params["min_usage"], action.params["max_usage"],
+            )
         if action is None or not action.apply:
             return
         if action.type == "training_halt":
             # Reset accumulation state so resume doesn't carry stale partial gradients
             self._accumulation_step = 0
             self._accumulated_tokens = 0
+            # Clear any partial gradients from the incomplete accumulation
+            # window so they can't leak into a subsequent resumed run.
+            self.model_engine.zero_grad()
             raise TrainingHaltError(
                 f"AdaptiveController halted training at step {self.global_step}: "
                 f"3 consecutive emergency LR cuts were triggered. Fix: lower "
@@ -273,6 +309,16 @@ class Trainer:
             grad_norm = pre_step_grad_norm
         else:
             grad_norm = float(grad_norm)
+            # get_global_grad_norm() reflects DeepSpeed's post-clip gradients,
+            # while pre_step_grad_norm was measured before that clipping was
+            # applied. Surface both when they diverge so a report of "grad
+            # norm looks fine" doesn't hide that clipping is doing a lot of
+            # work every step (a sign the LR or grad_clip_norm may be off).
+            if not math.isclose(pre_step_grad_norm, grad_norm, rel_tol=1e-3):
+                logger.info(
+                    "Grad norm at step %d: pre-clip=%.4f post-clip=%.4f",
+                    self.global_step, pre_step_grad_norm, grad_norm,
+                )
 
         if self.global_step % self.config.logging.log_every == 0:
             fp16_opt = self.model_engine.optimizer
@@ -338,11 +384,11 @@ class Trainer:
                     and self.global_step % self.config.training.save_every == 0):
                 self.checkpoint_manager.save(
                     self.model_engine, self.global_step, self.epoch,
-                    client_state={
-                        "global_step": self.global_step, "epoch": self.epoch,
+                    extra_client_state={
                         "adaptive_lr_multiplier": self._adaptive_lr_multiplier,
                         "accumulation_step": self._accumulation_step,
                         "accumulated_tokens": self._accumulated_tokens,
+                        **_capture_controller_state(self.adaptive_controller),
                     },
                 )
 
@@ -448,17 +494,24 @@ class DiffusionTrainer:
         raw_accum = client_state.get("accumulation_step", 0)
         self._accumulation_step = min(raw_accum, self.grad_accum_steps - 1)
         self._accumulated_tokens = client_state.get("accumulated_tokens", 0)
+        _restore_controller_state(self.adaptive_controller, client_state)
 
     def _set_lr(self, lr: float) -> None:
         for param_group in self.model_engine.optimizer.param_groups:
             param_group["lr"] = lr
 
     def _apply_adaptive_action(self, action) -> None:
+        if action is not None and action.type == "warn_expert_collapse":
+            logger.warning(
+                "MoE expert collapse warning at step %d: min_usage=%.4f max_usage=%.4f",
+                self.global_step, action.params["min_usage"], action.params["max_usage"],
+            )
         if action is None or not action.apply:
             return
         if action.type == "training_halt":
             self._accumulation_step = 0
             self._accumulated_tokens = 0
+            self.model_engine.zero_grad()
             raise TrainingHaltError(
                 f"AdaptiveController halted diffusion training at step {self.global_step}. "
                 f"Fix: lower training.learning_rate and resume from last good checkpoint."
@@ -482,7 +535,10 @@ class DiffusionTrainer:
             else torch.device(f"cuda:{self.model_engine.local_rank}")
         batch = _move_batch_to_device(batch, device)
 
-        output = self.model_engine(batch["input_ids"], embed_tokens=self._embed_tokens)
+        output = self.model_engine(
+            batch["input_ids"], embed_tokens=self._embed_tokens,
+            attention_mask=batch.get("attention_mask"),
+        )
         mse_loss = output.loss
 
         scaled_loss = mse_loss / self.grad_accum_steps
@@ -510,7 +566,15 @@ class DiffusionTrainer:
         self._accumulated_tokens = 0
 
         grad_norm = self.model_engine.get_global_grad_norm()
-        grad_norm = pre_step_grad_norm if grad_norm is None else float(grad_norm)
+        if grad_norm is None:
+            grad_norm = pre_step_grad_norm
+        else:
+            grad_norm = float(grad_norm)
+            if not math.isclose(pre_step_grad_norm, grad_norm, rel_tol=1e-3):
+                logger.info(
+                    "Grad norm at step %d: pre-clip=%.4f post-clip=%.4f",
+                    self.global_step, pre_step_grad_norm, grad_norm,
+                )
 
         metrics = TrainingMetrics(
             step=self.global_step, loss=float(mse_loss.detach().item()),
@@ -563,11 +627,11 @@ class DiffusionTrainer:
                     and self.global_step % self.config.training.save_every == 0):
                 self.checkpoint_manager.save(
                     self.model_engine, self.global_step, self.epoch,
-                    client_state={
-                        "global_step": self.global_step, "epoch": self.epoch,
+                    extra_client_state={
                         "adaptive_lr_multiplier": self._adaptive_lr_multiplier,
                         "accumulation_step": self._accumulation_step,
                         "accumulated_tokens": self._accumulated_tokens,
+                        **_capture_controller_state(self.adaptive_controller),
                     },
                 )
 
@@ -581,26 +645,32 @@ class DiffusionTrainer:
             else torch.device(f"cuda:{self.model_engine.local_rank}")
 
         total_loss = torch.tensor(0.0, device=device)
-        total_tokens = torch.tensor(0, dtype=torch.long, device=device)
+        num_batches = torch.tensor(0, dtype=torch.long, device=device)
 
+        # Diffusion's MSE objective is already a mean over every element of
+        # the noise tensor (see DiffusionLM.forward), so each batch's
+        # output.loss is already a proper per-batch average -- combining
+        # batches with a plain mean of those means is the correct
+        # normalization here. Weighting by a token count (as the
+        # cross-entropy Trainer.evaluate() does) would double-count the
+        # hidden dimension baked into each batch's already-averaged MSE and
+        # is not the right normalization for a continuous objective.
         with torch.no_grad():
             for batch in self.eval_dataloader:
                 batch = _move_batch_to_device(batch, device)
-                output = self.model_engine(batch["input_ids"], embed_tokens=self._embed_tokens)
-                # Normalize diffusion MSE by valid token positions for cross-run comparability
-                valid_mask = batch["labels"] != -100
-                num_valid = valid_mask.sum()
-                # MSE loss from DiffusionLM is already per-sample mean; re-sum over valid positions
-                # If output.loss is scalar (mean over batch), multiply by valid count to get sum
-                total_loss += output.loss * num_valid.float()
-                total_tokens += num_valid
+                output = self.model_engine(
+                    batch["input_ids"], embed_tokens=self._embed_tokens,
+                    attention_mask=batch.get("attention_mask"),
+                )
+                total_loss += output.loss
+                num_batches += 1
 
         total_loss = _distributed_sum(total_loss)
-        total_tokens = _distributed_sum(total_tokens)
+        num_batches = _distributed_sum(num_batches)
         self.model_engine.train()
 
-        if total_tokens.item() == 0:
-            raise ValueError("Diffusion eval produced zero valid tokens.")
-        avg_loss = (total_loss / total_tokens).item()
+        if num_batches.item() == 0:
+            raise ValueError("Diffusion eval produced zero batches.")
+        avg_loss = (total_loss / num_batches).item()
         logger.info("Diffusion eval at step %d: mse_loss=%.6f", self.global_step, avg_loss)
         return avg_loss

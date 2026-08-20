@@ -113,6 +113,7 @@ class DiffusionLM(nn.Module):
         input_ids: torch.Tensor,
         embed_tokens: nn.Embedding,
         timesteps: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> DiffusionOutput:
         if input_ids.dim() != 2:
             raise ValueError(
@@ -130,9 +131,22 @@ class DiffusionLM(nn.Module):
         time_emb = self.time_embed(self._sinusoidal_timestep_embedding(timesteps))
         model_input = noisy_embeddings + time_emb.unsqueeze(1)
 
-        backbone_output = self.backbone.forward_hidden(inputs_embeds=model_input)
+        # Without passing attention_mask through, padded positions would
+        # attend freely to each other (and to real tokens) inside the
+        # backbone, and their noise predictions would also count toward the
+        # MSE loss below, both of which corrupt training on padded batches.
+        backbone_output = self.backbone.forward_hidden(
+            inputs_embeds=model_input, attention_mask=attention_mask
+        )
         predicted_noise = self.noise_pred_head(backbone_output)
-        loss = F.mse_loss(predicted_noise, true_noise)
+
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(-1).to(predicted_noise.dtype)
+            valid_elements = mask.sum() * predicted_noise.size(-1)
+            per_element = F.mse_loss(predicted_noise, true_noise, reduction="none") * mask
+            loss = per_element.sum() / valid_elements.clamp(min=1)
+        else:
+            loss = F.mse_loss(predicted_noise, true_noise)
         return DiffusionOutput(predicted_noise=predicted_noise, loss=loss)
 
     @torch.no_grad()

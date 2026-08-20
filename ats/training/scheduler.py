@@ -30,6 +30,12 @@ class WarmupCosineScheduler:
         self.min_lr = base_lr * min_lr_ratio
 
     def get_lr(self, step: int) -> float:
+        """Returns the LR for `step`. Note that during warmup the schedule
+        starts at base_lr * 1/warmup_steps rather than 0 at step 0 (since
+        the numerator is `step + 1`, not `step`): a literal 0 LR on the
+        first step would waste that step entirely, and this off-by-one
+        matches the convention used by most modern implementations (e.g.
+        LLaMA, GPT-NeoX), so it is intentional, not an approximation."""
         if step < 0:
             raise ValueError(f"step must be >= 0, got {step}.")
         if self.warmup_steps > 0 and step < self.warmup_steps:

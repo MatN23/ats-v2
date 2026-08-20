@@ -417,7 +417,13 @@ class ATSTransformer(nn.Module):
         if not per_layer_utilization:
             return None
 
-        num_experts = len(per_layer_utilization[0])
+        # self.config.num_experts, not len(per_layer_utilization[0]): every
+        # MoE layer should have the same expert count, but deriving it from
+        # whichever layer happened to be first in the list would silently
+        # under/over-count if a future change ever let per-layer expert
+        # counts vary, or if the first collected layer's dict happened to be
+        # missing entries for some reason.
+        num_experts = self.config.num_experts
         averaged = {
             expert_id: sum(u.get(expert_id, 0.0) for u in per_layer_utilization)
             / len(per_layer_utilization)

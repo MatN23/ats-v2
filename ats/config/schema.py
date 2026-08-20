@@ -77,6 +77,7 @@ class ModelConfig(BaseModel):
 
     use_mtp: bool = False
     mtp_num_tokens: int = 2
+    mtp_loss_weight: float = 1.0
 
     model_type: Literal["autoregressive", "diffusion"] = "autoregressive"
     diffusion_num_timesteps: int = 1000
@@ -200,6 +201,16 @@ class ModelConfig(BaseModel):
             raise ConfigError(
                 f"model.moe_top_k must be >= 1, got {v}. "
                 f"Fix: set model.moe_top_k to at least 1."
+            )
+        return v
+
+    @field_validator("mtp_loss_weight")
+    @classmethod
+    def _validate_mtp_loss_weight(cls, v: float) -> float:
+        if v < 0:
+            raise ConfigError(
+                f"model.mtp_loss_weight must be >= 0, got {v}. "
+                f"Fix: use a non-negative float, e.g. 1.0."
             )
         return v
 
@@ -718,5 +729,9 @@ class ATSConfig(BaseModel):
         """Stable hash of the resolved config, used to validate checkpoint resumption."""
         import hashlib
 
-        payload = self.model_dump_json(exclude={"logging"}).encode("utf-8")
+        # checkpoint.output_dir is excluded alongside logging: neither affects
+        # the resolved architecture/training semantics, so changing either
+        # between runs (e.g. pointing --resume at a different output
+        # directory) must not cause a spurious config_hash mismatch on resume.
+        payload = self.model_dump_json(exclude={"logging", "checkpoint"}).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()[:16]

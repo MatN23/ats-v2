@@ -102,7 +102,13 @@ class CheckpointManager:
     def _tag(self, global_step: int) -> str:
         return f"step_{global_step}"
 
-    def save(self, model_engine: Any, global_step: int, epoch: int) -> Path:
+    def save(
+        self,
+        model_engine: Any,
+        global_step: int,
+        epoch: int,
+        extra_client_state: dict[str, Any] | None = None,
+    ) -> Path:
         tag = self._tag(global_step)
         ckpt_dir = self.output_dir / tag
         rank = _current_rank()
@@ -113,6 +119,12 @@ class CheckpointManager:
             "config_hash": self.config.config_hash(),
             "rng_state": _capture_rng_state(),
         }
+        # Merge in caller-supplied state (e.g. trainer.py's adaptive LR
+        # multiplier, gradient-accumulation counters, and AdaptiveController
+        # internals) without trainer.py needing to know about or duplicate
+        # the fields this method already tracks.
+        if extra_client_state:
+            client_state.update(extra_client_state)
         # DeepSpeed's own save_checkpoint() already coordinates correctly
         # across ranks for its ZeRO-sharded optimizer/model checkpoint --
         # that rank coordination is DeepSpeed's responsibility and is left

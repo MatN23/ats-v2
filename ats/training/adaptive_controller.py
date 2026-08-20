@@ -167,6 +167,13 @@ class AdaptiveController:
                     apply=True,
                 )
         else:
+            # factor >= 0.5 covers loss_spike_lr_cut (0.5) and
+            # plateau_lr_boost (1.5): both reset the emergency-cut streak to
+            # 0 here. Only a genuine emergency_lr_cut (factor=0.1, the sole
+            # caller that passes factor < 0.5) increments the streak, so the
+            # 3-in-a-row halt threshold only fires on consecutive severe
+            # cuts -- a milder spike cut or an LR boost in between is
+            # treated as recovery, not as part of an emergency streak.
             self._consecutive_emergency_cuts = 0
 
         return AdaptiveAction(

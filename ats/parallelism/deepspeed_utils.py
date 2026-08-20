@@ -81,7 +81,16 @@ def build_deepspeed_config(config: ATSConfig, micro_batch_size: int) -> dict[str
 
     ds_config: dict[str, Any] = {
         "train_micro_batch_size_per_gpu": micro_batch_size,
-        "gradient_accumulation_steps": config.training.grad_accum_steps,
+        # Deliberately 1, NOT config.training.grad_accum_steps: trainer.py's
+        # Trainer/DiffusionTrainer.train_step() owns gradient accumulation
+        # manually (dividing the loss by grad_accum_steps itself and only
+        # calling model_engine.step() every grad_accum_steps micro-batches,
+        # so the AdaptiveController sees one call per real optimizer step).
+        # If this were also set to grad_accum_steps, DeepSpeed would
+        # internally scale the loss by 1/N and defer step() on its own
+        # schedule ON TOP OF trainer.py's manual 1/N scaling and step-gating,
+        # so gradients would end up scaled by 1/N^2 instead of 1/N.
+        "gradient_accumulation_steps": 1,
         "gradient_clipping": config.training.grad_clip_norm,
         "steps_per_print": config.logging.log_every,
         "zero_optimization": {

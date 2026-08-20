@@ -45,7 +45,8 @@ class Tokenizer:
             logger.info(
                 "tiktoken tokenizer '%s': pad_token_id == eos_token_id == %d "
                 "(no distinct pad token; this is intentional).",
-                encoding_name, self.pad_token_id,
+                encoding_name,
+                self.pad_token_id,
             )
 
         elif tokenizer_name.startswith("hf:"):
@@ -95,7 +96,10 @@ class Tokenizer:
         if dropped:
             logger.debug(
                 "decode() dropped %d out-of-vocab/negative id(s) out of %d "
-                "(vocab_size=%d).", dropped, len(token_ids), self.vocab_size,
+                "(vocab_size=%d).",
+                dropped,
+                len(token_ids),
+                self.vocab_size,
             )
         if self._backend == "tiktoken":
             return self._enc.decode(real_ids)

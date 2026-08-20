@@ -733,5 +733,7 @@ class ATSConfig(BaseModel):
         # the resolved architecture/training semantics, so changing either
         # between runs (e.g. pointing --resume at a different output
         # directory) must not cause a spurious config_hash mismatch on resume.
-        payload = self.model_dump_json(exclude={"logging", "checkpoint"}).encode("utf-8")
+        payload = self.model_dump_json(exclude={"logging", "checkpoint"}).encode(
+            "utf-8"
+        )
         return hashlib.sha256(payload).hexdigest()[:16]

@@ -143,7 +143,9 @@ class DiffusionLM(nn.Module):
         if attention_mask is not None:
             mask = attention_mask.unsqueeze(-1).to(predicted_noise.dtype)
             valid_elements = mask.sum() * predicted_noise.size(-1)
-            per_element = F.mse_loss(predicted_noise, true_noise, reduction="none") * mask
+            per_element = (
+                F.mse_loss(predicted_noise, true_noise, reduction="none") * mask
+            )
             loss = per_element.sum() / valid_elements.clamp(min=1)
         else:
             loss = F.mse_loss(predicted_noise, true_noise)

@@ -5,6 +5,30 @@ file controls model size, architecture (dense / SWA / MLA / MoE / MoD),
 parallelism strategy, and training hyperparameters — no Python edits required
 for standard runs.
 
+This is a research project for small teams. It is not an alternative to
+LLM Foundry, NeMo, or Megatron-LM, and does not target their scale or
+hardware-fleet regime (see "Scale limitations" below).
+
+## Status
+
+- **CI:** green on `main` — `ruff check`, `ruff format --check`, `mypy`, and
+  `pytest` (Python 3.10–3.12) all pass.
+- **Trained end-to-end on Colab GPU runtimes:** dense, SWA, MLA, MTP, and
+  diffusion (`--model-type diffusion`) have each completed successful
+  training runs.
+- **Not yet trained/verified on any GPU:** MoE, MoD, and Mamba. The code
+  passes review and unit tests, but nobody has run an actual training loop
+  through these architectures yet. Treat them as less trustworthy than the
+  five modes above until someone does.
+- **Triton kernels (`ats/model/*_triton.py`): status unconfirmed.** A Colab
+  run used a GPU with the `[triton]` extra installed, but there's no
+  Triton-specific log (compile/autotune output) confirming the kernels
+  actually executed rather than silently falling back to the tested
+  PyTorch path — which every kernel here does automatically, with no
+  warning, if Triton isn't available or errors. Don't take "trained
+  successfully on a GPU with Triton installed" as proof the Triton code
+  itself ran; see [Known limitations](#known-limitations) for how to check.
+
 ## Installation
 
 ```bash
@@ -148,6 +172,11 @@ on-the-fly tokenization.
 python -m ats.cli.train --config configs/7b.yaml --use-moe --moe-num-experts 8 --moe-top-k 2
 ```
 
+> MoE has not yet been trained end-to-end on real hardware (see
+> [Status](#status)) — the CLI/config path works and is unit-tested, but
+> treat a real run through this as the first verification of it, not a
+> repeat of one that's already happened.
+
 ## Checkpoint resume example
 
 ```bash
@@ -230,6 +259,9 @@ pytest tests/
 
 ```bash
 # Replace every 4th block with a Mamba selective-SSM block (pure PyTorch, no custom CUDA):
+# NOTE: Mamba has not yet completed a real training run (see Status above) —
+# the scan math is verified numerically against a sequential reference, but
+# that's not the same as this path having actually been trained.
 python -m ats.cli.train --config configs/7b.yaml --use-mamba --mamba-every-n-layers 4
 
 # Predict 3 future tokens in parallel instead of 1:
@@ -381,16 +413,19 @@ run out of RAM.
   compatible) export today, which also means `ats-eval`'s lm-eval-harness
   path only works for those architectures; use `--config` (perplexity mode)
   for the others.
-- **Triton kernels (`ats/model/*_triton.py`) are unverified on real
-  hardware.** They were written without access to a GPU or a Triton
-  installation to compile, run, or benchmark them. Each one is gated behind
-  `HAS_TRITON` and falls back to a plain PyTorch implementation that *is*
-  tested, so a missing/broken Triton install never crashes anything — but
-  the Triton code paths themselves have not been proven correct by
-  execution, only by careful review. Two of the four (MoE routing dispatch,
-  MLA KV decompression) are also only *partially* fused, by design — see the
-  docstring in each file for exactly what is and isn't fused, rather than
-  taking "Triton kernel" to mean the whole pipeline is.
+- **Triton kernels (`ats/model/*_triton.py`) status is unconfirmed, not
+  confirmed-working.** Each one is gated behind `HAS_TRITON` and falls back
+  silently (no warning) to a plain PyTorch implementation that *is* tested —
+  a real safety net, but one that also means a training run completing
+  successfully on a GPU with Triton installed proves nothing about whether
+  the Triton code actually ran. If you want to check on your own GPU:
+  temporarily force the `HAS_TRITON` gate to skip the fallback (so a broken
+  kernel raises instead of silently substituting) and confirm training
+  still runs, or add a print/log inside the Triton branch and check it fires.
+  Two of the four (MoE routing dispatch, MLA KV decompression) are also only
+  *partially* fused, by design — see the docstring in each file for exactly
+  what is and isn't fused, rather than taking "Triton kernel" to mean the
+  whole pipeline is.
 - `ats/cli/align.py` is placeholder structure — it parses arguments and
   prints a clear "not implemented" message, it does not train anything.
   `ats/cli/finetune.py` (LoRA fine-tuning via `peft`) is implemented and was
@@ -418,9 +453,12 @@ run out of RAM.
   verified directly: `torch.utils.checkpoint.checkpoint()` fires exactly on
   layers where `layer_idx % n == 0` during training, and not at all when
   disabled or when `use_cache=True` (incremental decoding).
-- This repository was written and reviewed by eye in a sandboxed environment
-  without network access, so most of it **has not been executed here** — no
-  `pytest`, no real training run, no `pip install -e .` (the sandbox can't
-  reach PyPI). A few package-free pieces *were* actually run and verified —
-  see the status note at the top of this file for exactly which ones. Run
-  the full verification commands below yourself before relying on this.
+- The bullets above describing specific things as "verified" (8-bit Adam
+  plumbing, selective checkpointing, the Mamba chunked-scan math,
+  `preprocess.py` streaming) were checked by code review and/or standalone
+  logic tests in a sandbox without a GPU, `deepspeed`, or PyPI access — not
+  by running `ats-train` itself. That's a narrower claim than an end-to-end
+  training run and is called out per-bullet above rather than implied by a
+  blanket statement. See [Status](#status) at the top of this file for
+  which architectures have actually completed real training runs, and which
+  (MoE, MoD, Mamba, and the Triton kernels) have not yet.

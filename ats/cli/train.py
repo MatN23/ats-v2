@@ -60,6 +60,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--resume", default=None, help="Checkpoint directory to resume from."
     )
     parser.add_argument(
+        "--init-weights",
+        default=None,
+        help="Checkpoint directory or .safetensors file to load model weights from "
+        "before training starts, with no optimizer state, global_step, RNG state, or "
+        "config_hash match required. Mutually exclusive with --resume. For "
+        "population-based-training-style weight transplants between runs whose "
+        "hyperparameters (not architecture) differ; see ats.pbt.",
+    )
+    parser.add_argument(
         "--micro-batch-size",
         type=int,
         default=None,
@@ -372,6 +381,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
+    if args.resume is not None and args.init_weights is not None:
+        logger.error(
+            "Config error: --resume and --init-weights are mutually exclusive "
+            "(--resume restores optimizer/global_step/RNG state and requires a "
+            "matching config_hash; --init-weights loads only model weights and "
+            "allows hyperparameters to differ). Pass at most one."
+        )
+        return 1
+
     try:
         config = load_config(args.config)
         config = apply_cli_overrides(config, args)
@@ -400,6 +418,15 @@ def main(argv: list[str] | None = None) -> int:
     model = ATSTransformer(
         config.model, ep_size=max(1, config.parallelism.gpus * config.parallelism.nodes)
     )
+
+    if args.init_weights is not None:
+        from ats.training.checkpoint import load_initial_weights
+
+        try:
+            load_initial_weights(model, args.init_weights)
+        except ConfigError as exc:
+            logger.error("--init-weights failed: %s", exc)
+            return 1
 
     # DeepSpeed/torchrun launchers set RANK (global) and LOCAL_RANK (per-node)
     # environment variables. We shard the data stream by global rank across

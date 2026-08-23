@@ -146,7 +146,56 @@ numerics, not silently pass through), and `"fp8"`, which requires
 `transformer-engine` or `torchao` and raises `ImportError` immediately if
 neither is installed rather than silently falling back to bf16/fp16.
 
-## (l) Full CLI override matrix
+## (l) Population Based Training / "breeding" (`ats/pbt/`, `ats-breed`)
+
+`ats-breed` runs `population_size` independent copies of a model config
+side by side (`ats/pbt/orchestrator.py::PBTOrchestrator`). Every
+`steps_per_generation` steps, each member is evaluated (held-out perplexity,
+via a new `ats/training/perplexity.py::compute_perplexity` shared with
+`ats-eval`'s existing perplexity mode — extracted rather than duplicated, so
+the two can't silently drift into computing loss differently), the bottom
+`cull_fraction` are culled, and each culled member's weights + a perturbed
+copy of a surviving winner's hyperparameters take its place — the standard
+PBT exploit/explore step (Jaderberg et al., 2017).
+
+Two deliberate design choices worth stating plainly rather than leaving
+implicit:
+
+- **Cost**: this multiplies training cost by `population_size`. It's scoped
+  to small models (`configs/debug.yaml` through `configs/350m.yaml`-ish)
+  where running that many copies on one machine is affordable. Nothing
+  technically stops pointing `--config` at `configs/7b.yaml` or larger, but
+  doing so just multiplies an already-large job by `population_size` — see
+  `ats/pbt/orchestrator.py`'s module docstring.
+- **Every generation is a fresh training segment, for every member,
+  survivors included.** A culled member's Adam moments were accumulated
+  under hyperparameters it no longer has, so resetting them on transplant is
+  correct — but for consistency (and because tracking DeepSpeed's own
+  `config_hash`-gated resume through a run where sibling members'
+  hyperparameters keep diverging is far more failure-prone than a plain
+  weights-only reload), **surviving members reset their optimizer state
+  every generation too**, loaded via a new `ats.cli.train --init-weights`
+  flag (`ats/training/checkpoint.py::load_initial_weights` — weights only,
+  no optimizer/global_step/RNG state, no `config_hash` match required, since
+  hyperparameters are expected to differ). This trades some sample
+  efficiency a survivor could otherwise keep for a much simpler, more
+  robust implementation. See "Known gaps" below.
+
+Two real bugs turned up while writing the tests for this (`tests/test_pbt.py`,
+`tests/test_training.py`), both now fixed:
+- `ats/pbt/population.py::initialize_population` seeded each member's RNG
+  with `random.Random((seed, member_id))` — a tuple is not a valid seed type
+  for `random.Random` (`None`/`int`/`float`/`str`/`bytes`/`bytearray` only)
+  and raised `TypeError` on first use. Fixed to seed from a per-member
+  string (`f"{seed}-{member_id}"`).
+- `ats/training/checkpoint.py::load_initial_weights` initially relied on
+  `model.load_state_dict(weights, strict=False)` to catch an architecture
+  mismatch between a transplant's source and destination. `strict=False`
+  only tolerates missing/extra *keys*; a shape mismatch on a key present in
+  both still raises a raw `RuntimeError` with a torch-internal message. Now
+  caught explicitly and re-raised as a `ConfigError` with an actionable fix.
+
+## (m) Full CLI override matrix
 
 `train.py::apply_cli_overrides` merges every CLI flag into the loaded
 `ATSConfig` with strict precedence (CLI > YAML > size preset > Pydantic
@@ -182,6 +231,16 @@ separate config.
   the authoring sandbox, so it has not been executed (no `pytest`, no real
   training run, no `pip install -e .`) in that environment. Run the
   verification checklist yourself before relying on it.
+- `ats-breed` (PBT) resets every member's optimizer state every generation,
+  including members that survived the cull unchanged — see (l) above for
+  why. A future version could preserve a survivor's Adam state across
+  generations it wasn't culled in (only resetting it for members that were
+  actually just cloned), which would likely improve sample efficiency, but
+  isn't implemented here.
+- `ats-breed` doesn't persist population state to disk, so an interrupted
+  run can't be resumed from the last completed generation — a fresh
+  invocation always starts over at generation 0. Each member's own
+  per-generation training does still checkpoint normally.
 
 ## Bug-fix pass (external review)
 

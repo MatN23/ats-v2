@@ -162,63 +162,16 @@ def _run_lm_eval(export_dir: Path, args: argparse.Namespace) -> int:
 def _run_perplexity_mode(
     config_path: str, checkpoint_dir: str, micro_batch_size_arg: int | None
 ) -> int:
-    import torch
-
-    from ats.data.dataloader import build_dataloader
+    from ats.training.perplexity import compute_perplexity
 
     config = load_config(config_path)
-    micro_batch_size = (
-        micro_batch_size_arg
-        if micro_batch_size_arg is not None
-        else config.training.micro_batch_size
-    )
-
-    # Bug 4 fix: thread ep_size through from parallelism config (see
-    # ats/cli/train.py for the full explanation).
-    model = ATSTransformer(
-        config.model, ep_size=max(1, config.parallelism.gpus * config.parallelism.nodes)
-    )
-    model_engine, _optimizer, _, _ = initialize_engine(model, config, micro_batch_size)
-
-    checkpoint_manager = CheckpointManager(config)
-    client_state = checkpoint_manager.load(model_engine, checkpoint_dir)
-    logger.info(
-        "Loaded checkpoint from step %d (epoch %d).",
-        client_state["global_step"],
-        client_state["epoch"],
-    )
-    model_engine.eval()
-
-    eval_dataloader = build_dataloader(
-        config.data,
-        batch_size=micro_batch_size,
-        rank=0,
-        world_size=1,
-        seed=config.training.seed,
-    )
-    total_loss = 0.0
-    total_tokens = 0
-    with torch.no_grad():
-        for batch in eval_dataloader:
-            output = model_engine(
-                batch["input_ids"], attention_mask=batch.get("attention_mask")
-            )
-            shift_logits = output.logits[..., :-1, :].contiguous()
-            shift_labels = batch["labels"][..., 1:].contiguous()
-            loss = torch.nn.functional.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-                reduction="sum",
-            )
-            num_valid = (shift_labels != -100).sum().item()
-            total_loss += float(loss.item())
-            total_tokens += int(num_valid)
-
-    if total_tokens == 0:
-        logger.error("Eval dataloader produced zero valid tokens.")
+    try:
+        perplexity, _client_state = compute_perplexity(
+            config, checkpoint_dir, micro_batch_size_arg
+        )
+    except ConfigError as exc:
+        logger.error("%s", exc)
         return 1
-    perplexity = float(torch.exp(torch.tensor(total_loss / total_tokens)))
     logger.info("Perplexity: %.4f", perplexity)
     return 0
 

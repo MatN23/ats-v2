@@ -41,6 +41,7 @@ ats-export = "ats.cli.export:main"
 ats-doctor = "ats.cli.doctor:main"
 ats-finetune = "ats.cli.finetune:main"
 ats-align = "ats.cli.align:main"
+ats-breed = "ats.cli.breed:main"
 
 [tool.setuptools.packages.find]
 include = ["ats", "ats.*"]

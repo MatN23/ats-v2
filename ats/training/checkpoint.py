@@ -93,6 +93,76 @@ def load_model_weights_safetensors(checkpoint_dir: str) -> dict[str, torch.Tenso
     return safetensors_load_file(str(path))
 
 
+def load_initial_weights(model: Any, path: str) -> None:
+    """Loads model weights only -- no optimizer state, no global_step, no RNG
+    state, and no config_hash match requirement -- from either a checkpoint
+    directory (containing model.safetensors) or a direct .safetensors file
+    path, straight into an already-constructed model in place.
+
+    This is deliberately a different, narrower operation than
+    CheckpointManager.load()/resume(): it exists for population-based
+    training ("breeding"), where a losing population member's weights are
+    replaced with a winning member's weights but the losing member's
+    hyperparameters (learning rate, weight decay, dropout, ...) are then
+    perturbed and therefore intentionally no longer match the source
+    checkpoint's config_hash. Resetting the optimizer state on transplant is
+    correct here, not a bug: Adam's moments were accumulated under the old
+    hyperparameters and shouldn't carry over to the new ones.
+
+    Raises ConfigError if the destination model's parameter names/shapes
+    don't match the source weights exactly -- a transplant is only valid
+    between members with identical architecture (hidden_size, num_layers,
+    etc.); only training-level hyperparameters are expected to differ.
+    """
+    p = Path(path)
+    if p.is_dir():
+        weights = load_model_weights_safetensors(str(p))
+        source_desc = str(p / _SAFETENSORS_FILENAME)
+    elif p.suffix == ".safetensors":
+        if not p.exists():
+            raise ConfigError(
+                f"--init-weights path does not exist: {p}. "
+                f"Fix: point it at a checkpoint directory or a .safetensors file "
+                f"produced by CheckpointManager.save."
+            )
+        weights = safetensors_load_file(str(p))
+        source_desc = str(p)
+    else:
+        raise ConfigError(
+            f"--init-weights path {p} is neither a directory containing "
+            f"{_SAFETENSORS_FILENAME} nor a .safetensors file. "
+            f"Fix: point it at a checkpoint directory (e.g. checkpoints/run/step_5000) "
+            f"or a *.safetensors file."
+        )
+
+    try:
+        missing, unexpected = model.load_state_dict(weights, strict=False)
+    except RuntimeError as exc:
+        # strict=False only tolerates missing/extra KEYS -- torch still
+        # raises RuntimeError for a shape mismatch on a key present in both,
+        # which is exactly the case we need to turn into a clear
+        # ConfigError instead of a passthrough torch stack trace.
+        raise ConfigError(
+            f"--init-weights source {source_desc} does not match the destination "
+            f"model's architecture (shape mismatch): {exc}. Fix: --init-weights is "
+            f"only valid between members with identical model architecture "
+            f"(hidden_size, num_layers, num_heads, use_moe/use_mla/etc. must all "
+            f"match); only training-level hyperparameters (learning rate, weight "
+            f"decay, dropout, ...) may differ between source and destination."
+        ) from exc
+    if missing or unexpected:
+        raise ConfigError(
+            f"--init-weights source {source_desc} does not match the destination "
+            f"model's architecture: {len(missing)} missing key(s), "
+            f"{len(unexpected)} unexpected key(s). Fix: --init-weights is only valid "
+            f"between members with identical model architecture (hidden_size, "
+            f"num_layers, num_heads, use_moe/use_mla/etc. must all match); only "
+            f"training-level hyperparameters (learning rate, weight decay, dropout, "
+            f"...) may differ between source and destination."
+        )
+    logger.info("Loaded initial weights from %s", source_desc)
+
+
 class CheckpointManager:
     def __init__(self, config: ATSConfig) -> None:
         self.config = config

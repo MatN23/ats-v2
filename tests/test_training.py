@@ -279,6 +279,77 @@ def test_checkpoint_save_writes_safetensors(tmp_path):
     assert torch.allclose(loaded_weights["bias"], model.bias.detach())
 
 
+def test_load_initial_weights_transplants_matching_architecture(tmp_path):
+    """Regression/spec test for PBT weight transplants (ats.pbt): loading
+    weights via load_initial_weights must work from a plain checkpoint
+    directory, requires no config_hash match, and must not touch
+    optimizer state (there is none here -- this only touches the model)."""
+    from ats.training.checkpoint import load_initial_weights
+
+    config = _make_config(tmp_path)
+    source_model = torch.nn.Linear(8, 8)
+    engine = _TinyModelEngine(source_model)
+    manager = CheckpointManager(config)
+    ckpt_dir = manager.save(engine, global_step=1, epoch=0)
+
+    # A destination model with different hyperparameters upstream (a
+    # different learning_rate/config_hash) but the IDENTICAL architecture --
+    # exactly the PBT scenario: same shapes, different training-level
+    # hyperparameters.
+    dest_model = torch.nn.Linear(8, 8)
+    with torch.no_grad():
+        dest_model.weight.add_(999.0)
+    assert not torch.allclose(dest_model.weight, source_model.weight)
+
+    load_initial_weights(dest_model, str(ckpt_dir))
+
+    assert torch.allclose(dest_model.weight, source_model.weight.detach())
+    assert torch.allclose(dest_model.bias, source_model.bias.detach())
+
+
+def test_load_initial_weights_accepts_direct_safetensors_path(tmp_path):
+    from ats.training.checkpoint import load_initial_weights
+
+    config = _make_config(tmp_path)
+    source_model = torch.nn.Linear(8, 8)
+    engine = _TinyModelEngine(source_model)
+    manager = CheckpointManager(config)
+    ckpt_dir = manager.save(engine, global_step=1, epoch=0)
+
+    dest_model = torch.nn.Linear(8, 8)
+    load_initial_weights(dest_model, str(ckpt_dir / "model.safetensors"))
+    assert torch.allclose(dest_model.weight, source_model.weight.detach())
+
+
+def test_load_initial_weights_rejects_mismatched_architecture(tmp_path):
+    """Unlike CheckpointManager.load(), load_initial_weights doesn't check
+    config_hash (hyperparameters are EXPECTED to differ in PBT) -- but it
+    must still refuse a transplant between genuinely different
+    architectures (mismatched parameter shapes/names), since that would
+    silently corrupt the destination model instead of raising."""
+    from ats.config.schema import ConfigError
+    from ats.training.checkpoint import load_initial_weights
+
+    config = _make_config(tmp_path)
+    source_model = torch.nn.Linear(8, 8)
+    engine = _TinyModelEngine(source_model)
+    manager = CheckpointManager(config)
+    ckpt_dir = manager.save(engine, global_step=1, epoch=0)
+
+    incompatible_model = torch.nn.Linear(8, 16)  # different output shape
+    with pytest.raises(ConfigError):
+        load_initial_weights(incompatible_model, str(ckpt_dir))
+
+
+def test_load_initial_weights_rejects_bad_path(tmp_path):
+    from ats.config.schema import ConfigError
+    from ats.training.checkpoint import load_initial_weights
+
+    model = torch.nn.Linear(8, 8)
+    with pytest.raises(ConfigError):
+        load_initial_weights(model, str(tmp_path / "not_a_real_path"))
+
+
 def test_checkpoint_save_only_rank_zero_writes_files(tmp_path, monkeypatch):
     """Regression test for a checkpoint I/O race condition: under
     distributed training (e.g. ZeRO-3, where every rank has the full

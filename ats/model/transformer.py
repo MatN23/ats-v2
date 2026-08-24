@@ -356,13 +356,28 @@ class ATSTransformer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_values: list[PastKeyValue | None] | None = None,
         use_cache: bool = False,
+        validate_input_ids: bool | None = None,
     ) -> TransformerOutput:
         if input_ids.dim() != 2:
             raise ValueError(
                 f"ATSTransformer expected input_ids of shape [batch, seq_len], "
                 f"got shape {tuple(input_ids.shape)}."
             )
-        if (
+        # validate_input_ids=None (the default) means "validate on CPU,
+        # skip on CUDA": input_ids.max()/.min().item() force a synchronous
+        # GPU->CPU transfer, which on every single training-loop forward
+        # pass is a real, silent throughput cost (this check has no
+        # sync cost at all on CPU tensors, so it stays on by default there
+        # -- e.g. for the test suite and for CPU-only smoke tests). Pass
+        # True/False explicitly to force the check on/off regardless of
+        # device -- e.g. one-off debugging of a suspected tokenizer/vocab
+        # mismatch on a GPU run.
+        should_validate = (
+            validate_input_ids
+            if validate_input_ids is not None
+            else not input_ids.is_cuda
+        )
+        if should_validate and (
             input_ids.max().item() >= self.config.vocab_size
             or input_ids.min().item() < 0
         ):

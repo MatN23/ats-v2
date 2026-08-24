@@ -68,8 +68,26 @@ def _load_preprocessed_meta(bin_path: Path) -> dict[str, Any]:
 
 
 def _iter_preprocessed_examples(
-    bin_path: Path, expected_seq_length: int
+    bin_path: Path,
+    expected_seq_length: int,
+    shard_id: int = 0,
+    num_shards: int = 1,
 ) -> Iterator[dict[str, Any]]:
+    """shard_id/num_shards let a caller (build_dataloader, via
+    _TorchMixedDataset) read only this shard's own blocks directly, via
+    index striding -- an O(1)-per-block operation on this memmap-backed
+    source, with no wasted reads of blocks that belong to another shard.
+    This is what makes real sharding possible for the preprocessed path
+    specifically (see the module docstring and CHANGES.md): unlike the
+    raw-text path's stochastic, weighted packing (where a given output
+    chunk's contents depend on the whole mixing history and can't be
+    predicted by index alone), preprocessed blocks are already fixed-size
+    and directly addressable by index, so "give me every num_shards-th
+    block starting at shard_id" is both correct and cheap.
+    """
+    if not (0 <= shard_id < num_shards):
+        raise ValueError(f"shard_id ({shard_id}) must be in [0, num_shards={num_shards})")
+
     meta = _load_preprocessed_meta(bin_path)
     if meta["seq_length"] != expected_seq_length:
         raise ConfigError(
@@ -107,7 +125,7 @@ def _iter_preprocessed_examples(
             f"expected {num_blocks} (one per block)."
         )
 
-    for block_idx in range(num_blocks):
+    for block_idx in range(shard_id, num_blocks, num_shards):
         block = tokens[block_idx].tolist()
         valid_len = int(valid_lengths[block_idx])
         labels = list(block)
@@ -176,7 +194,37 @@ class MixedDataset:
         total_weight = sum(s.weight for s in sources)
         self._probs = [s.weight / total_weight for s in sources]
 
+    def is_fully_shardable(self) -> bool:
+        """True only when every source is a preprocessed (.bin) source --
+        the only case where per-source index-striding can replace the
+        iterate-everything-then-filter approach without changing which
+        examples a given (shard_id, num_shards) gets relative to the
+        others. See iter_shard's docstring for why raw-text sources can't
+        be handled the same way."""
+        return all(_resolve_source(s)[0] == "preprocessed" for s in self.sources)
+
     def __iter__(self) -> Iterator[dict[str, Any]]:
+        return self.iter_shard()
+
+    def iter_shard(
+        self, shard_id: int = 0, num_shards: int = 1
+    ) -> Iterator[dict[str, Any]]:
+        """When every source in this mixture is preprocessed (see
+        is_fully_shardable), shards by direct index striding within each
+        source (O(1) per rank, no wasted memmap reads -- see
+        _iter_preprocessed_examples). When any source is raw text, that
+        isn't safely possible: a raw-text source's output chunk boundaries
+        depend on a stochastic, weighted interleaving of all active
+        sources plus a shared token-accumulation buffer, so which output
+        chunk a given input line ends up in isn't knowable by index alone
+        without actually running the mixing process. In that case this
+        yields the FULL, unsharded stream regardless of shard_id/num_shards
+        (same as the no-argument case), and the caller
+        (_TorchMixedDataset) falls back to the coarser
+        iterate-everything-then-filter approach for correctness.
+        """
+        fully_shardable = num_shards > 1 and self.is_fully_shardable()
+
         rng = random.Random(self.seed)
         kinds: list[SourceKind] = []
         source_iters: list[Iterator[Any]] = []
@@ -188,9 +236,19 @@ class MixedDataset:
             # separately-unpacked variables from a discriminated union, so
             # narrow on payload's own type directly.
             if isinstance(payload, Path):
-                source_iters.append(
-                    _iter_preprocessed_examples(payload, self.seq_length)
-                )
+                if fully_shardable:
+                    source_iters.append(
+                        _iter_preprocessed_examples(
+                            payload,
+                            self.seq_length,
+                            shard_id=shard_id,
+                            num_shards=num_shards,
+                        )
+                    )
+                else:
+                    source_iters.append(
+                        _iter_preprocessed_examples(payload, self.seq_length)
+                    )
             else:
                 source_iters.append(payload)
 

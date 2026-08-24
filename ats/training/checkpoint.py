@@ -63,12 +63,43 @@ def _capture_rng_state() -> dict[str, Any]:
     return state
 
 
+def _lists_to_tuples(value: Any) -> Any:
+    """Recursively converts lists (and their nested lists) to tuples.
+    random.getstate() returns nested tuples (version, big-tuple-of-ints,
+    gauss_next); a JSON round-trip turns every level of nesting into a
+    list, and random.setstate() requires the inner structure to be tuples
+    too, not just the outermost container."""
+    if isinstance(value, list):
+        return tuple(_lists_to_tuples(v) for v in value)
+    return value
+
+
 def _restore_rng_state(state: dict[str, Any]) -> None:
-    random.setstate(
-        tuple(state["python"]) if isinstance(state["python"], list) else state["python"]
-    )
+    python_state = state["python"]
+    if isinstance(python_state, list):
+        # Defensive path for RNG state that went through JSON at some point
+        # (see the comment on the numpy branch below for why the real
+        # CheckpointManager.save/load path doesn't do this). A single
+        # outer tuple(...) isn't enough: random.getstate() is nested
+        # (version, big-tuple-of-ints, gauss_next), and JSON flattens every
+        # level to a list, while random.setstate() requires the inner
+        # structure to be tuples too.
+        python_state = _lists_to_tuples(python_state)
+    random.setstate(python_state)
+
     np_state = state["numpy"]
-    if isinstance(np_state, list):
+    if isinstance(np_state, (list, tuple)):
+        # Defensive path for a hypothetical caller that hands this function
+        # RNG state that went through JSON at some point (the real
+        # CheckpointManager.save/load path does NOT do this -- client_state
+        # goes through DeepSpeed's own checkpoint_engine, which is
+        # torch.save/torch.load (pickle) by default and preserves the numpy
+        # ndarray exactly). `tuple(np_state)` alone leaves the inner array
+        # (element 1) as a plain Python list, which np.random.set_state
+        # rejects; convert it back to a real ndarray with the dtype
+        # np.random.get_state() actually produces (uint32) before use.
+        np_state = list(np_state)
+        np_state[1] = np.array(np_state[1], dtype=np.uint32)
         np_state = tuple(np_state)
     np.random.set_state(np_state)
     torch.set_rng_state(torch.tensor(state["torch"], dtype=torch.uint8))
@@ -214,9 +245,22 @@ class CheckpointManager:
         module = (
             model_engine.module if hasattr(model_engine, "module") else model_engine
         )
-        state_dict = {
-            k: v.detach().cpu().contiguous() for k, v in module.state_dict().items()
-        }
+        # BUG FIX: only rank 0 actually needs a full CPU copy of the model.
+        # The original code built `{k: v.detach().cpu().contiguous() for k, v
+        # in module.state_dict().items()}` on EVERY rank -- meaning every
+        # rank's host process retained a full desharded copy of the model in
+        # CPU RAM, not just rank 0's (for a 70B model in bf16, ~140GB of host
+        # RAM per node). Every rank must still call module.state_dict()
+        # itself (the collective gather), but only rank 0 needs to move it
+        # to CPU and keep it around afterward; other ranks let the gathered
+        # GPU tensors get freed immediately.
+        full_state_dict = module.state_dict()
+
+        if rank == 0:
+            state_dict = {
+                k: v.detach().cpu().contiguous() for k, v in full_state_dict.items()
+            }
+        del full_state_dict
 
         if rank == 0:
             state_path = ckpt_dir / _TRAINING_STATE_FILENAME

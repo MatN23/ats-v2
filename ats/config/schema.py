@@ -512,10 +512,19 @@ class DataConfig(BaseModel):
     @field_validator("seq_length")
     @classmethod
     def _validate_seq_length(cls, v: int) -> int:
-        if v <= 0:
+        # >= 2, not just > 0: autoregressive training shifts labels by 1
+        # (shift_labels = labels[..., 1:]); at seq_length == 1 that's a
+        # zero-length tensor, and F.cross_entropy over an empty batch
+        # doesn't error -- it silently returns NaN (0/0 in the mean
+        # reduction), which is worse than a crash since it can go unnoticed
+        # deep in a training run. Reject it here with a clear message
+        # instead.
+        if v < 2:
             raise ConfigError(
-                f"data.seq_length must be positive, got {v}. "
-                f"Fix: set data.seq_length to a positive integer, e.g. 4096."
+                f"data.seq_length must be at least 2, got {v}. Autoregressive "
+                f"training shifts labels by 1 position, so seq_length=1 produces "
+                f"zero valid (input, target) pairs. Fix: set data.seq_length to a "
+                f"positive integer >= 2, e.g. 4096."
             )
         return v
 

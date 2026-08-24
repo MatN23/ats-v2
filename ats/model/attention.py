@@ -224,7 +224,21 @@ class GroupedQueryAttention(nn.Module):
         # meaning SWA models attended to the entire KV cache instead of just
         # the trailing window during generation. Dropping "seq_len > 1" here
         # covers seq_len == 1 the same way as multi-token continuation.
-        needs_incremental_mask = past_key_value is not None and attention_mask is None
+        # BUG FIX (BUG-008): this used to additionally require
+        # `attention_mask is None`, so batched multi-token continuation that
+        # also supplied a padding mask (e.g. left-padded prompts in a
+        # generation batch) fell through to the `else` branch below, which
+        # calls build_padding_causal_mask -- that returns a
+        # [batch,1,seq_len,seq_len] mask, but k/v here are already
+        # total_len = past_len + seq_len long, so SDPA raised a shape-
+        # mismatch RuntimeError. Even where shapes happened to coincide
+        # (past_len == 0), is_causal was still forced False without
+        # attention_mask's own causal component being added back in,
+        # letting new tokens see each other non-causally. Both are fixed by
+        # routing every past_key_value-is-not-None case through this branch
+        # and folding attention_mask's padding info into the incremental
+        # mask when given, instead of only handling the no-mask case here.
+        needs_incremental_mask = past_key_value is not None
 
         if needs_incremental_mask:
             incremental_mask = build_incremental_causal_mask(
@@ -232,12 +246,28 @@ class GroupedQueryAttention(nn.Module):
                 past_len,
                 x.device,
                 window_size=self.swa_window_size if apply_swa else None,
-            )
+            )  # [seq_len, total_len], True = attend
+            if attention_mask is not None:
+                # attention_mask is the padding mask for the seq_len NEW
+                # tokens only (not the cached past_len positions) -- the
+                # standard convention during incremental decoding, since by
+                # the time positions are cached they were already validated
+                # as real (non-pad) tokens on a prior step. Cached positions
+                # are therefore always treated as attendable; only the new
+                # tokens' own padding status is folded in.
+                new_token_mask = attention_mask.to(device=x.device, dtype=torch.bool)
+                past_ok = torch.ones(batch, past_len, dtype=torch.bool, device=x.device)
+                full_key_mask = torch.cat([past_ok, new_token_mask], dim=1)  # [batch, total_len]
+                attn_mask_arg = incremental_mask.unsqueeze(0).unsqueeze(0) & full_key_mask[
+                    :, None, None, :
+                ]  # [batch, 1, seq_len, total_len]
+            else:
+                attn_mask_arg = incremental_mask  # [seq_len, total_len]; broadcasts fine without a batch dim
             attn_out = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
-                attn_mask=incremental_mask,
+                attn_mask=attn_mask_arg,
                 dropout_p=self.dropout_p if self.training else 0.0,
                 is_causal=False,
             )

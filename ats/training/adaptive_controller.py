@@ -24,6 +24,18 @@ class TrainingMetrics:
     grad_norm: float
     learning_rate: float
     expert_utilization: dict[int, float] | None = None
+    # BUG FIX: found while verifying the audit's BUG-001 -- unrelated to
+    # MTP, but in the same method (Trainer.train_step) a few lines below the
+    # MTP fix. TrainingMetrics is frozen (immutable by design, so metrics
+    # can't be silently mutated elsewhere), but train_step used to do
+    # `metrics.tokens_this_step = actual_tokens` directly on an already
+    # constructed instance -- which raises FrozenInstanceError immediately,
+    # on every successful optimizer step, for every training run regardless
+    # of MTP. This means Trainer.train_step could never actually complete a
+    # step and return metrics at all before this fix. Declaring the field
+    # properly (and setting it via dataclasses.replace, not attribute
+    # assignment -- see trainer.py) is what makes step completion possible.
+    tokens_this_step: int | None = None
 
 
 @dataclass(frozen=True)

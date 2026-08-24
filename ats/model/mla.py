@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ats.model.attention import build_incremental_causal_mask
+from ats.model.attention import build_incremental_causal_mask, build_padding_causal_mask
 from ats.model.quantization import QuantizationMode, make_linear
 from ats.model.rope import RotaryEmbedding, apply_rotary_pos_emb
 from ats.model.swa import generate_swa_mask
@@ -188,16 +188,52 @@ class MLAAttention(nn.Module):
         # explicit mask (see ats.model.attention.build_incremental_causal_mask
         # for the full rationale: neither is_causal=True nor False correctly
         # expresses "new tokens see all cached positions, causal among
-        # themselves" when past_key_value is set and seq_len > 1).
+        # themselves" when past_key_value is set).
+        #
+        # BUG FIX (found while verifying BUG-008, not itself in the audit):
+        # this used to require `attention_mask is None` to take the
+        # incremental-mask branch at all, AND used to require `seq_len > 1`
+        # too. When either condition failed -- i.e. any time an
+        # attention_mask was actually supplied alongside past_key_value, or
+        # for ordinary single-token decoding (seq_len == 1) -- it fell into
+        # the `else` branch and used `attn_mask = attention_mask` directly:
+        # a raw [batch, seq_len] long tensor handed straight to SDPA, which
+        # rejects it outright (wrong dtype, wrong rank) rather than merely
+        # mis-computing. That also affected the PLAIN (no cache) case
+        # whenever attention_mask was given, since the `else` branch runs
+        # there too -- meaning ANY forward pass with an attention_mask, MLA
+        # enabled, cached or not, previously raised. Fixed by routing every
+        # past_key_value-is-not-None case through the incremental branch
+        # (folding attention_mask's padding info in when given, same as
+        # GroupedQueryAttention's fix), and by reshaping attention_mask
+        # properly via build_padding_causal_mask for the plain case.
         attn_mask: torch.Tensor | None
-        if past_key_value is not None and seq_len > 1 and attention_mask is None:
-            attn_mask = build_incremental_causal_mask(seq_len, past_len, x.device)
+        if past_key_value is not None:
+            incremental_mask = build_incremental_causal_mask(
+                seq_len, past_len, x.device
+            )  # [seq_len, total_len], True = attend
+            if attention_mask is not None:
+                # attention_mask is the padding mask for the seq_len NEW
+                # tokens only; cached positions are assumed already-valid
+                # (see GroupedQueryAttention's matching fix for the same
+                # reasoning).
+                new_token_mask = attention_mask.to(device=x.device, dtype=torch.bool)
+                past_ok = torch.ones(batch, past_len, dtype=torch.bool, device=x.device)
+                full_key_mask = torch.cat([past_ok, new_token_mask], dim=1)
+                attn_mask = incremental_mask.unsqueeze(0).unsqueeze(0) & full_key_mask[
+                    :, None, None, :
+                ]
+            else:
+                attn_mask = incremental_mask
+            is_causal = False
+        elif attention_mask is not None:
+            attn_mask = build_padding_causal_mask(
+                attention_mask, seq_len, is_causal=seq_len > 1, device=x.device
+            )
             is_causal = False
         else:
-            attn_mask = attention_mask
-            is_causal = (
-                past_key_value is None and attention_mask is None and seq_len > 1
-            )
+            attn_mask = None
+            is_causal = seq_len > 1
 
         # Bug 2 fix: apply the hybrid SWA window to MLA the same way
         # GroupedQueryAttention does, so "full attention every N layers"

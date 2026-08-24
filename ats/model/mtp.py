@@ -13,6 +13,53 @@ from torch import nn
 IGNORE_INDEX = -100
 
 
+def compute_mtp_loss_from_logits(
+    logits_per_offset: list[torch.Tensor], labels: torch.Tensor, vocab_size: int
+) -> torch.Tensor:
+    """The per-offset shift-and-cross-entropy math shared by
+    MultiTokenPredictionHead.compute_loss (which computes logits_per_offset
+    itself via forward()) and any caller that already has logits_per_offset
+    from a prior forward pass on the same input -- e.g. Trainer.train_step,
+    which gets this list directly from TransformerOutput.mtp_logits and
+    must NOT call forward() a second time to get it again.
+
+    labels: [batch, seq_len] token ids, unshifted (the same shape as the
+    hidden_states/input_ids that produced logits_per_offset -- NOT
+    pre-shifted by 1 the way the main next-token CE loss's labels are).
+    For each offset k in [1..len(logits_per_offset)], offset k's logits
+    predict labels shifted by k, with positions that run past the end of
+    the sequence excluded rather than padded, since there is no valid
+    target for them.
+    """
+    if labels.dim() != 2:
+        raise ValueError(
+            f"compute_mtp_loss_from_logits expected labels of shape "
+            f"[batch, seq_len], got shape {tuple(labels.shape)}."
+        )
+    _batch, seq_len = labels.shape
+    losses = []
+    for k, logits in enumerate(logits_per_offset, start=1):
+        if k >= seq_len:
+            continue
+        pred = logits[:, : seq_len - k, :].contiguous()
+        target = labels[:, k:].contiguous()
+        loss_k = F.cross_entropy(
+            pred.reshape(-1, vocab_size),
+            target.reshape(-1),
+            ignore_index=IGNORE_INDEX,
+        )
+        losses.append(loss_k)
+
+    if not losses:
+        raise ValueError(
+            f"seq_len ({seq_len}) is too short for any of the "
+            f"{len(logits_per_offset)} MTP prediction offset(s) to have a valid "
+            f"target (offset k needs seq_len > k). Fix: use a longer sequence, "
+            f"or reduce model.mtp_num_tokens."
+        )
+    return torch.stack(losses).mean()
+
+
 class MultiTokenPredictionHead(nn.Module):
     def __init__(
         self, hidden_size: int, vocab_size: int, num_future_tokens: int = 2
@@ -66,26 +113,5 @@ class MultiTokenPredictionHead(nn.Module):
                 f"does not match hidden_states shape {tuple(hidden_states.shape)} on the "
                 f"batch/seq dimensions."
             )
-        _batch, seq_len = labels.shape
         logits_per_offset = self.forward(hidden_states)
-
-        losses = []
-        for k, logits in enumerate(logits_per_offset, start=1):
-            if k >= seq_len:
-                continue
-            pred = logits[:, : seq_len - k, :].contiguous()
-            target = labels[:, k:].contiguous()
-            loss_k = F.cross_entropy(
-                pred.view(-1, self.vocab_size),
-                target.view(-1),
-                ignore_index=IGNORE_INDEX,
-            )
-            losses.append(loss_k)
-
-        if not losses:
-            raise ValueError(
-                f"MultiTokenPredictionHead.compute_loss: seq_len ({seq_len}) is too short "
-                f"for any of the {self.num_future_tokens} prediction offsets to have a "
-                f"valid target. Fix: use a longer sequence length or fewer mtp_num_tokens."
-            )
-        return torch.stack(losses).mean()
+        return compute_mtp_loss_from_logits(logits_per_offset, labels, self.vocab_size)

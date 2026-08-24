@@ -55,7 +55,38 @@ class _TorchMixedDataset(IterableDataset):
         effective_id = self.rank * num_workers + worker_id
         effective_total = self.world_size * num_workers
 
-        for i, example in enumerate(self.mixed_dataset):
+        if getattr(self.mixed_dataset, "is_fully_shardable", lambda: False)():
+            # Every source is preprocessed: MixedDataset.iter_shard already
+            # shards by direct index striding, so what it yields here IS
+            # this shard's disjoint slice -- filtering it again with the
+            # modulo check below would incorrectly discard
+            # (effective_total - 1) / effective_total of an already
+            # correctly-sized stream. This is the case
+            # ats.data.dataloader's own former comment (and BUG-003) flagged
+            # as unnecessarily wasteful for -- fixed for exactly this case.
+            # (getattr with a fallback rather than a direct call: a plain
+            # iterable stream -- e.g. a test fake, or any future caller that
+            # doesn't implement MixedDataset's interface -- is treated as
+            # not shardable, matching this method's behavior before
+            # is_fully_shardable existed.)
+            yield from self.mixed_dataset.iter_shard(effective_id, effective_total)
+            return
+
+        # At least one raw-text source is mixed in (or mixed_dataset doesn't
+        # support native sharding at all): true index-based sharding isn't
+        # available (see MixedDataset.iter_shard's docstring), so fall back
+        # to iterating the full, deterministic (same-seed-every-rank)
+        # stream and filtering by position. This still requires every
+        # rank/worker to read and tokenize 100% of the raw text, discarding
+        # most of it -- a real, known cost with no full fix available
+        # without pre-splitting source files per shard (a larger change
+        # than this fix; see CHANGES.md).
+        stream = (
+            self.mixed_dataset.iter_shard()
+            if hasattr(self.mixed_dataset, "iter_shard")
+            else self.mixed_dataset
+        )
+        for i, example in enumerate(stream):
             if i % effective_total == effective_id:
                 yield example
 

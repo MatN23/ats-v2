@@ -215,6 +215,134 @@ means there is genuinely **one YAML file per model size**
 every architecture variant is a CLI flag on top of the same file, not a
 separate config.
 
+## (n) External bug-audit review: 7 confirmed, 2 not reproduced, 2 more found
+
+An external bug-audit report (9 claimed bugs, "BUG-001" through "BUG-009")
+was checked against the actual implementation before fixing anything, not
+taken on faith. Result: 7 real, 2 did not reproduce, and 2 additional real
+bugs turned up in the course of verifying the report that it didn't
+mention. Full detail and the reasoning behind each verdict lives in
+`tests/test_bug_audit_fixes.py`'s section comments; summary:
+
+**Confirmed and fixed:**
+- **BUG-001 (MTP loss crash + wrong label shift).** `Trainer.train_step`
+  called `.reshape()` directly on `output.mtp_logits`, which is a
+  `list[torch.Tensor]` (one per predicted offset), not a tensor, and used
+  the same 1-shifted labels for every offset instead of shifting by `k`
+  per offset `k`. Fixed by extracting the correct per-offset loss into
+  `ats/model/mtp.py::compute_mtp_loss_from_logits`, shared by both
+  `MultiTokenPredictionHead.compute_loss` and `Trainer.train_step` so
+  they can't drift apart again.
+- **BUG-004 (ZeRO-3 checkpoint save materializes full model on every
+  rank's host CPU).** `CheckpointManager.save` called
+  `module.state_dict()` (a required ZeRO-3 collective) on every rank, then
+  unconditionally did `.cpu()` and built a full Python dict from it on
+  every rank too — meaning every rank's host process retained a full
+  desharded copy of the model, not just rank 0's. Fixed: every rank still
+  participates in the collective call, but only rank 0 materializes and
+  keeps the CPU copy.
+- **BUG-006 (`.item()` forces GPU→CPU sync every forward pass).**
+  `ATSTransformer.forward` validated token ids via
+  `input_ids.max().item()` / `.min().item()` unconditionally. Fixed with a
+  `validate_input_ids` parameter defaulting to "on for CPU, off for CUDA"
+  (the check is free on CPU, and forced synchronous on CUDA) — explicit
+  `True`/`False` overrides the default either way.
+- **BUG-007 (empty dataloader crashes ungracefully).** Both `Trainer.train`
+  and `DiffusionTrainer.train` caught the first `StopIteration` (end of
+  epoch) but not a second one immediately after re-creating the iterator.
+  Fixed in both classes with a clear `RuntimeError` instead of an
+  unhandled `StopIteration`.
+- **BUG-008 (incremental decoding + attention_mask crashes or leaks
+  future tokens), confirmed AND found broader than reported.**
+  `GroupedQueryAttention`'s incremental-decoding branch only triggered
+  when `attention_mask is None`; supplying both `past_key_value` and
+  `attention_mask` (batched multi-token continuation with padding) fell
+  through to `build_padding_causal_mask`, which returns a
+  `[batch,1,seq_len,seq_len]` mask against k/v that are already
+  `total_len = past_len + seq_len` long — a guaranteed SDPA shape-mismatch
+  `RuntimeError`, and even where shapes coincided, `is_causal` was forced
+  `False` with no replacement causal component, leaking future new-token
+  information. Fixed by always building a `[.., seq_len, total_len]` mask
+  in the `past_key_value is not None` case, folding in the new tokens' own
+  padding mask (cached positions always treated as valid) when given.
+  **`MLAAttention` had a strictly worse, unreported version of the same
+  underlying issue**: it used the raw, un-reshaped `attention_mask`
+  directly as `attn_mask` for SDPA in BOTH the plain (no cache) and
+  incremental case — SDPA rejects this outright (wrong dtype/rank) rather
+  than merely mis-computing. Since `Trainer.train_step` always passes
+  `attention_mask` from the dataloader, **any real training run with
+  `use_mla=True` crashed on the first forward pass** before this fix —
+  not just the incremental-decoding case the report described. Fixed the
+  same way GQA's plain case already worked (`build_padding_causal_mask`),
+  plus the same incremental-mask combination for the cached case.
+- **BUG-009 (`seq_length=1` breaks autoregressive training).** Confirmed,
+  though the actual failure mode differs from the report: it doesn't raise
+  a `RuntimeError` — `F.cross_entropy` over the resulting zero-length
+  batch silently returns `NaN` (0/0 in the mean reduction), arguably worse
+  since it could go unnoticed deep in a run. Fixed by requiring
+  `seq_length >= 2` at the config layer with a clear error either way.
+
+**Confirmed, partially fixed (the honest limit of what a scoped fix can
+do):**
+- **BUG-003 (dataloader modulo-sharding wastes I/O).** Real, and already
+  half-documented in `ats/data/dataloader.py`'s own pre-existing comments.
+  A full fix isn't safely possible for the raw-text path without a much
+  larger redesign: a raw-text source's output chunk boundaries depend on a
+  stochastic, weighted interleaving of all active sources plus a shared
+  token-accumulation buffer, so which output chunk a given input line
+  lands in isn't knowable by index alone without actually running the
+  mixing process — pre-sharding would require splitting source files per
+  rank ahead of time, a materially bigger change. What's fixed: the
+  **preprocessed (`.bin`/memmap) path**, which `preprocess.py` already
+  recommends for production-scale training specifically because it skips
+  on-the-fly tokenization, now shards by direct block-index striding
+  (`shard_id`/`num_shards` on `_iter_preprocessed_examples` and
+  `MixedDataset.iter_shard`) — O(1) per rank, no wasted memmap reads, no
+  further post-hoc filtering needed. `_TorchMixedDataset` detects when a
+  `MixedDataset` is fully preprocessed (`is_fully_shardable()`) and uses
+  this path; it falls back to the original iterate-then-filter approach
+  the moment any raw-text source is mixed in.
+
+**Did not reproduce (verified, not just re-asserted):**
+- **BUG-002 (checkpoint resume crashes on RNG state restore).** The
+  premise doesn't hold for this codebase: `CheckpointManager.save/load`
+  passes `client_state` (which includes the RNG state) to
+  `model_engine.save_checkpoint()`/`load_checkpoint()`, which under
+  DeepSpeed's default `TorchCheckpointEngine` uses `torch.save`/
+  `torch.load` — pickle, not JSON — so the numpy ndarray inside the RNG
+  state tuple is never flattened to a list in the first place. Confirmed
+  by reading `DeepSpeedEngine._save_checkpoint`'s source directly and by
+  round-tripping `np.random.get_state()` through actual JSON on the
+  installed numpy (2.4.4), which restored correctly even through the
+  list-shaped inner array. `_restore_rng_state`'s defensive
+  `isinstance(x, list)` handling is still made fully correct below (and a
+  second, deeper nested-list issue in Python's own `random.setstate` that
+  the report didn't mention was found and fixed too), since it's cheap and
+  harmless — but there was no resume-crash bug to fix here.
+- **BUG-005 (MoE fallback has a mangled `self.expertsexpert_id` line).**
+  The actual source at the cited location reads
+  `expert_output = self.experts[expert_id](expert_input)` — correct.
+  Confirmed by reading the source directly and by running the fallback
+  path end-to-end with `deepspeed`'s import blocked (simulating the
+  no-DeepSpeed environment the report's failure scenario describes); it
+  worked without error.
+
+**One more bug found, unrelated to the audit entirely:** `TrainingMetrics`
+is a frozen dataclass, but `Trainer.train_step` (and
+`DiffusionTrainer.train_step`) did `metrics.tokens_this_step =
+actual_tokens` directly on an already-constructed instance — frozen
+dataclasses reject any attribute assignment, so this raised
+`FrozenInstanceError` on every successful optimizer step, for every
+training run, regardless of MTP. This is more fundamental than BUG-001 and
+was hiding a few lines behind it in the same method: **`Trainer.train_step`
+could not actually complete a single step and return before this fix**,
+independent of anything the audit or this fix batch was originally looking
+for — it only surfaced because fixing BUG-001 required an actual real
+`Trainer.train_step` call to verify against (existing tests never
+constructed a real `Trainer` at all). Fixed by declaring
+`tokens_this_step` as a real field on `TrainingMetrics` and using
+`dataclasses.replace` to produce a new instance instead of mutating.
+
 ## Known gaps (honest, as of this revision)
 
 - Mamba layers do not support KV-cache-based incremental decoding (training

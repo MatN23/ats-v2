@@ -6,6 +6,7 @@ scheduler/checkpoint/monitor/adaptive-controller infrastructure."""
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from collections.abc import Iterable
 from typing import Any
@@ -319,13 +320,17 @@ class Trainer:
         )
         total_loss = ce_loss + output.aux_loss
 
-        # Integrate MTP loss when multi-token prediction head is active
-        if hasattr(output, "mtp_logits") and output.mtp_logits is not None:
-            mtp_weight = getattr(self.config.model, "mtp_loss_weight", 1.0)
-            mtp_loss = torch.nn.functional.cross_entropy(
-                output.mtp_logits.reshape(-1, output.mtp_logits.size(-1)),
-                shift_labels.reshape(-1),
-                ignore_index=-100,
+        # Integrate MTP loss when multi-token prediction head is active.
+        # output.mtp_logits is a list[torch.Tensor] (one per predicted
+        # offset), NOT a single tensor -- and each offset k needs labels
+        # shifted by k, not the single 1-shift used for the main next-token
+        # CE loss above. See ats.model.mtp.compute_mtp_loss_from_logits.
+        if output.mtp_logits is not None:
+            from ats.model.mtp import compute_mtp_loss_from_logits
+
+            mtp_weight = self.config.model.mtp_loss_weight
+            mtp_loss = compute_mtp_loss_from_logits(
+                output.mtp_logits, batch["labels"], self.config.model.vocab_size
             )
             total_loss = total_loss + mtp_weight * mtp_loss
 
@@ -404,8 +409,14 @@ class Trainer:
         action = self.adaptive_controller.step(metrics)
         self._apply_adaptive_action(action)
 
-        # Attach actual token count to metrics for accurate throughput logging
-        metrics.tokens_this_step = actual_tokens  # type: ignore[attr-defined]
+        # Attach actual token count to metrics for accurate throughput
+        # logging. metrics is a frozen dataclass (see TrainingMetrics --
+        # immutable by design), so this must produce a NEW instance via
+        # dataclasses.replace rather than assigning to metrics directly
+        # (direct assignment raises FrozenInstanceError -- see
+        # TrainingMetrics.tokens_this_step's docstring for how this was
+        # found).
+        metrics = dataclasses.replace(metrics, tokens_this_step=actual_tokens)
         return metrics
 
     def train(self, max_steps: int | None = None) -> None:
@@ -420,7 +431,16 @@ class Trainer:
             except StopIteration:
                 self.epoch += 1
                 train_iter = iter(self.train_dataloader)
-                batch = next(train_iter)
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    raise RuntimeError(
+                        "train_dataloader is empty: iterating it produced no batches "
+                        "at all, even immediately after being freshly re-created. Fix: "
+                        "check that data.sources point at real, non-empty data, and "
+                        "that batch_size/seq_length aren't larger than the available "
+                        "data."
+                    ) from None
 
             try:
                 metrics = self.train_step(batch)
@@ -707,7 +727,14 @@ class DiffusionTrainer:
             grad_norm=grad_norm,
             learning_rate=self.model_engine.optimizer.param_groups[0]["lr"],
         )
-        metrics.tokens_this_step = actual_tokens  # type: ignore[attr-defined]
+        # Attach actual token count to metrics for accurate throughput
+        # logging. metrics is a frozen dataclass (see TrainingMetrics --
+        # immutable by design), so this must produce a NEW instance via
+        # dataclasses.replace rather than assigning to metrics directly
+        # (direct assignment raises FrozenInstanceError on every step --
+        # see TrainingMetrics.tokens_this_step's docstring for how this
+        # was found).
+        metrics = dataclasses.replace(metrics, tokens_this_step=actual_tokens)
 
         action = self.adaptive_controller.step(metrics)
         self._apply_adaptive_action(action)
@@ -725,7 +752,16 @@ class DiffusionTrainer:
             except StopIteration:
                 self.epoch += 1
                 train_iter = iter(self.train_dataloader)
-                batch = next(train_iter)
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    raise RuntimeError(
+                        "train_dataloader is empty: iterating it produced no batches "
+                        "at all, even immediately after being freshly re-created. Fix: "
+                        "check that data.sources point at real, non-empty data, and "
+                        "that batch_size/seq_length aren't larger than the available "
+                        "data."
+                    ) from None
 
             try:
                 metrics = self.train_step(batch)

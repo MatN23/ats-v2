@@ -36,7 +36,9 @@ def compute_perplexity(
     dataloader produces zero valid tokens.
     """
     resolved_micro_batch_size = (
-        micro_batch_size if micro_batch_size is not None else config.training.micro_batch_size
+        micro_batch_size
+        if micro_batch_size is not None
+        else config.training.micro_batch_size
     )
 
     model = ATSTransformer(

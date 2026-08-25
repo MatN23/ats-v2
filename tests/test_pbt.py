@@ -232,7 +232,9 @@ def test_initialize_population_with_perturb_specs_produces_diversity(tmp_path):
 
 def _members_with_fitness(fitnesses: list[float]) -> list[PopulationMember]:
     return [
-        PopulationMember(member_id=i, config=None, checkpoint_dir=f"/tmp/m{i}", fitness=f)
+        PopulationMember(
+            member_id=i, config=None, checkpoint_dir=f"/tmp/m{i}", fitness=f
+        )
         for i, f in enumerate(fitnesses)
     ]
 
@@ -267,7 +269,7 @@ def test_select_cull_never_culls_everyone():
 
 def test_select_cull_never_culls_nobody_even_at_tiny_fraction():
     ranked = _members_with_fitness([0.0, 1.0, 2.0, 3.0, 4.0])
-    survivors, culled = select_cull(ranked, cull_fraction=0.01)
+    _survivors, culled = select_cull(ranked, cull_fraction=0.01)
     assert len(culled) >= 1
 
 

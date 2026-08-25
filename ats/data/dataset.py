@@ -86,7 +86,9 @@ def _iter_preprocessed_examples(
     block starting at shard_id" is both correct and cheap.
     """
     if not (0 <= shard_id < num_shards):
-        raise ValueError(f"shard_id ({shard_id}) must be in [0, num_shards={num_shards})")
+        raise ValueError(
+            f"shard_id ({shard_id}) must be in [0, num_shards={num_shards})"
+        )
 
     meta = _load_preprocessed_meta(bin_path)
     if meta["seq_length"] != expected_seq_length:

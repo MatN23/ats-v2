@@ -69,7 +69,7 @@ class PerturbSpec(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _check_ranges(self) -> "PerturbSpec":
+    def _check_ranges(self) -> PerturbSpec:
         if self.factor_low > self.factor_high:
             raise ConfigError(
                 f"PerturbSpec({self.name!r}).factor_low ({self.factor_low}) must "
@@ -137,7 +137,7 @@ class PBTConfig(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _check_cull_leaves_survivors(self) -> "PBTConfig":
+    def _check_cull_leaves_survivors(self) -> PBTConfig:
         n_cull = round(self.population_size * self.cull_fraction)
         n_cull = max(1, min(self.population_size - 1, n_cull))
         if n_cull >= self.population_size:

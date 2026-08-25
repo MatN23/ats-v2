@@ -23,7 +23,6 @@ import torch.nn.functional as F
 from ats.config.schema import (
     ATSConfig,
     CheckpointConfig,
-    ConfigError,
     DataConfig,
     DataSource,
     ModelConfig,
@@ -33,10 +32,44 @@ from ats.model.attention import GroupedQueryAttention
 from ats.model.mla import MLAAttention
 from ats.model.transformer import ATSTransformer
 from ats.training.adaptive_controller import AdaptiveController
-from ats.training.checkpoint import CheckpointManager, _capture_rng_state, _restore_rng_state
+from ats.training.checkpoint import (
+    CheckpointManager,
+    _capture_rng_state,
+    _restore_rng_state,
+)
 from ats.training.scheduler import WarmupCosineScheduler
 from ats.training.trainer import Trainer
-from tests.test_training import _TinyModelEngine
+
+
+class _TinyModelEngine:
+    """Minimal stand-in for a DeepSpeed model engine's checkpoint interface,
+    used to test CheckpointManager's client_state / RNG-state / hash logic
+    without requiring deepspeed to be installed. Duplicated from
+    tests/test_training.py rather than imported from it: `tests/` has no
+    __init__.py, so `from tests.test_training import ...` is not a reliable
+    cross-environment import (it depends on how pytest happens to insert
+    rootdir onto sys.path, which varies -- this is what actually broke CI;
+    see CHANGES.md)."""
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        self.module = model
+
+    def save_checkpoint(self, save_dir, tag, client_state, save_latest=True):
+        import os
+
+        ckpt_dir = os.path.join(save_dir, tag)
+        os.makedirs(ckpt_dir, exist_ok=True)
+        torch.save(self.module.state_dict(), os.path.join(ckpt_dir, "model.pt"))
+        with open(os.path.join(ckpt_dir, "client_state.json"), "w") as f:
+            json.dump(
+                {
+                    "global_step": client_state["global_step"],
+                    "epoch": client_state["epoch"],
+                    "config_hash": client_state["config_hash"],
+                },
+                f,
+            )
+        torch.save(client_state["rng_state"], os.path.join(ckpt_dir, "rng_state.pt"))
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +130,9 @@ class _FakeEngineWrapper:
     mocked), while step()/get_global_grad_norm()/optimizer are lightweight
     stand-ins for bookkeeping DeepSpeed would otherwise own."""
 
-    def __init__(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer) -> None:
+    def __init__(
+        self, model: torch.nn.Module, optimizer: torch.optim.Optimizer
+    ) -> None:
         self.module = model
         self.optimizer = optimizer
         self.local_rank = torch.device("cpu")
@@ -383,8 +418,13 @@ def test_checkpoint_save_only_rank_zero_writes_files(tmp_path, monkeypatch):
     monkeypatch.setenv("RANK", "1")
     config = ATSConfig(
         model=ModelConfig(
-            hidden_size=8, num_layers=1, num_heads=2, num_kv_heads=1,
-            intermediate_size=16, vocab_size=20, use_flash_attention=False,
+            hidden_size=8,
+            num_layers=1,
+            num_heads=2,
+            num_kv_heads=1,
+            intermediate_size=16,
+            vocab_size=20,
+            use_flash_attention=False,
         ),
         training=TrainingConfig(max_steps=10, learning_rate=1e-3, warmup_steps=1),
         data=DataConfig(sources=[DataSource(path="x.jsonl")], seq_length=8),
@@ -420,8 +460,13 @@ def test_checkpoint_save_only_rank_zero_writes_files(tmp_path, monkeypatch):
 def test_checkpoint_save_rank_zero_still_writes_safetensors(tmp_path):
     config = ATSConfig(
         model=ModelConfig(
-            hidden_size=8, num_layers=1, num_heads=2, num_kv_heads=1,
-            intermediate_size=16, vocab_size=20, use_flash_attention=False,
+            hidden_size=8,
+            num_layers=1,
+            num_heads=2,
+            num_kv_heads=1,
+            intermediate_size=16,
+            vocab_size=20,
+            use_flash_attention=False,
         ),
         training=TrainingConfig(max_steps=10, learning_rate=1e-3, warmup_steps=1),
         data=DataConfig(sources=[DataSource(path="x.jsonl")], seq_length=8),
@@ -492,8 +537,13 @@ def test_moe_pytorch_fallback_runs_without_deepspeed():
 
 def test_forward_validates_input_ids_on_cpu_by_default():
     config = ModelConfig(
-        hidden_size=8, num_layers=1, num_heads=2, num_kv_heads=1,
-        intermediate_size=16, vocab_size=20, use_flash_attention=False,
+        hidden_size=8,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=1,
+        intermediate_size=16,
+        vocab_size=20,
+        use_flash_attention=False,
     )
     model = ATSTransformer(config)
     bad_input_ids = torch.tensor([[0, 1, 20]])  # 20 is out of range for vocab_size=20
@@ -503,8 +553,13 @@ def test_forward_validates_input_ids_on_cpu_by_default():
 
 def test_forward_validate_input_ids_flag_can_be_forced_off():
     config = ModelConfig(
-        hidden_size=8, num_layers=1, num_heads=2, num_kv_heads=1,
-        intermediate_size=16, vocab_size=20, use_flash_attention=False,
+        hidden_size=8,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=1,
+        intermediate_size=16,
+        vocab_size=20,
+        use_flash_attention=False,
     )
     model = ATSTransformer(config)
     bad_input_ids = torch.tensor([[0, 1, 20]])
@@ -520,8 +575,13 @@ def test_forward_validate_input_ids_flag_can_be_forced_off():
 
 def test_forward_validate_input_ids_false_does_not_affect_valid_input():
     config = ModelConfig(
-        hidden_size=8, num_layers=1, num_heads=2, num_kv_heads=1,
-        intermediate_size=16, vocab_size=20, use_flash_attention=False,
+        hidden_size=8,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=1,
+        intermediate_size=16,
+        vocab_size=20,
+        use_flash_attention=False,
     )
     model = ATSTransformer(config)
     model.eval()
@@ -571,7 +631,10 @@ def test_trainer_handles_empty_dataloader_without_crashing(tmp_path):
 def test_gqa_incremental_decoding_with_attention_mask():
     torch.manual_seed(0)
     attn = GroupedQueryAttention(
-        hidden_size=32, num_heads=4, num_kv_heads=2, max_seq_len=32,
+        hidden_size=32,
+        num_heads=4,
+        num_kv_heads=2,
+        max_seq_len=32,
         use_flash_attention=False,
     )
     x_prompt = torch.randn(2, 4, 32)
@@ -579,7 +642,9 @@ def test_gqa_incremental_decoding_with_attention_mask():
 
     x_new = torch.randn(2, 3, 32)  # multi-token continuation, seq_len > 1
     attention_mask = torch.ones(2, 3, dtype=torch.long)
-    out, _ = attn(x_new, attention_mask=attention_mask, past_key_value=past, use_cache=True)
+    out, _ = attn(
+        x_new, attention_mask=attention_mask, past_key_value=past, use_cache=True
+    )
     assert out.shape == (2, 3, 32)
     assert torch.isfinite(out).all()
 
@@ -590,7 +655,10 @@ def test_gqa_incremental_mask_is_actually_causal_among_new_tokens():
     of BUG-008), it would."""
     torch.manual_seed(0)
     attn = GroupedQueryAttention(
-        hidden_size=16, num_heads=2, num_kv_heads=2, max_seq_len=32,
+        hidden_size=16,
+        num_heads=2,
+        num_kv_heads=2,
+        max_seq_len=32,
         use_flash_attention=False,
     )
     attn.eval()
@@ -627,7 +695,9 @@ def test_mla_incremental_decoding_with_attention_mask():
 
     x_new = torch.randn(2, 3, 32)
     attention_mask = torch.ones(2, 3, dtype=torch.long)
-    out, _ = mla(x_new, attention_mask=attention_mask, past_key_value=past, use_cache=True)
+    out, _ = mla(
+        x_new, attention_mask=attention_mask, past_key_value=past, use_cache=True
+    )
     assert out.shape == (2, 3, 32)
     assert torch.isfinite(out).all()
 

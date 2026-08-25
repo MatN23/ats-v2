@@ -102,7 +102,7 @@ def perturb_config(
         if spec.max_value is not None:
             new_value = min(spec.max_value, new_value)
         if isinstance(current, int):
-            new_value = int(round(new_value))
+            new_value = round(new_value)
 
         config = _set_nested(config, spec.name, new_value)
     return config

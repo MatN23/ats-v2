@@ -257,10 +257,13 @@ class GroupedQueryAttention(nn.Module):
                 # tokens' own padding status is folded in.
                 new_token_mask = attention_mask.to(device=x.device, dtype=torch.bool)
                 past_ok = torch.ones(batch, past_len, dtype=torch.bool, device=x.device)
-                full_key_mask = torch.cat([past_ok, new_token_mask], dim=1)  # [batch, total_len]
-                attn_mask_arg = incremental_mask.unsqueeze(0).unsqueeze(0) & full_key_mask[
-                    :, None, None, :
-                ]  # [batch, 1, seq_len, total_len]
+                full_key_mask = torch.cat(
+                    [past_ok, new_token_mask], dim=1
+                )  # [batch, total_len]
+                attn_mask_arg = (
+                    incremental_mask.unsqueeze(0).unsqueeze(0)
+                    & full_key_mask[:, None, None, :]
+                )  # [batch, 1, seq_len, total_len]
             else:
                 attn_mask_arg = incremental_mask  # [seq_len, total_len]; broadcasts fine without a batch dim
             attn_out = F.scaled_dot_product_attention(

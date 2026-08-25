@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import pytest
 
-from ats.cli.breed import _resolve_perturb_specs, build_arg_parser as build_breed_parser
-from ats.cli.train import build_arg_parser as build_train_parser, main as train_main
+from ats.cli.breed import _resolve_perturb_specs
+from ats.cli.breed import build_arg_parser as build_breed_parser
+from ats.cli.train import build_arg_parser as build_train_parser
+from ats.cli.train import main as train_main
 
 
 def test_train_parser_accepts_init_weights_flag():
@@ -127,9 +129,7 @@ def test_resolve_perturb_specs_no_perturb_disables_everything():
 
 def test_resolve_perturb_specs_can_disable_individual_fields():
     parser = build_breed_parser()
-    args = parser.parse_args(
-        ["--config", "configs/debug.yaml", "--no-perturb-dropout"]
-    )
+    args = parser.parse_args(["--config", "configs/debug.yaml", "--no-perturb-dropout"])
     specs = _resolve_perturb_specs(args)
     names = {s.name for s in specs}
     assert names == {"training.learning_rate", "training.weight_decay"}

@@ -220,9 +220,10 @@ class MLAAttention(nn.Module):
                 new_token_mask = attention_mask.to(device=x.device, dtype=torch.bool)
                 past_ok = torch.ones(batch, past_len, dtype=torch.bool, device=x.device)
                 full_key_mask = torch.cat([past_ok, new_token_mask], dim=1)
-                attn_mask = incremental_mask.unsqueeze(0).unsqueeze(0) & full_key_mask[
-                    :, None, None, :
-                ]
+                attn_mask = (
+                    incremental_mask.unsqueeze(0).unsqueeze(0)
+                    & full_key_mask[:, None, None, :]
+                )
             else:
                 attn_mask = incremental_mask
             is_causal = False

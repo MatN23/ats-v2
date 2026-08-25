@@ -89,35 +89,35 @@ def _base_dims(mode: str) -> dict:
     the per-layer parameter footprint enough that one fixed hidden_size
     can't hit ~1M for every mode at once)."""
     if mode == "moe":
-        return dict(
-            hidden_size=120,
-            num_layers=4,
-            num_heads=6,
-            num_kv_heads=2,
-            intermediate_size=240,
-            vocab_size=384,
-            max_seq_len=64,
-        )
+        return {
+            "hidden_size": 120,
+            "num_layers": 4,
+            "num_heads": 6,
+            "num_kv_heads": 2,
+            "intermediate_size": 240,
+            "vocab_size": 384,
+            "max_seq_len": 64,
+        }
     if mode == "all":
-        return dict(
-            hidden_size=136,
-            num_layers=4,
-            num_heads=4,
-            num_kv_heads=2,
-            intermediate_size=272,
-            vocab_size=384,
-            max_seq_len=64,
-        )
+        return {
+            "hidden_size": 136,
+            "num_layers": 4,
+            "num_heads": 4,
+            "num_kv_heads": 2,
+            "intermediate_size": 272,
+            "vocab_size": 384,
+            "max_seq_len": 64,
+        }
     # dense, swa, mla, mamba, mod, mtp
-    return dict(
-        hidden_size=144,
-        num_layers=5,
-        num_heads=6,
-        num_kv_heads=3,
-        intermediate_size=300,
-        vocab_size=512,
-        max_seq_len=64,
-    )
+    return {
+        "hidden_size": 144,
+        "num_layers": 5,
+        "num_heads": 6,
+        "num_kv_heads": 3,
+        "intermediate_size": 300,
+        "vocab_size": 512,
+        "max_seq_len": 64,
+    }
 
 
 def build_model_config(mode: str) -> ModelConfig:
@@ -131,14 +131,14 @@ def build_model_config(mode: str) -> ModelConfig:
         raise ValueError(f"Unknown mode {mode!r}; expected one of {MODES}")
 
     dims = _base_dims(mode)
-    flags: dict = dict(
-        use_swa=False,
-        use_mla=False,
-        use_mamba=False,
-        use_moe=False,
-        use_mod=False,
-        use_mtp=False,
-    )
+    flags: dict = {
+        "use_swa": False,
+        "use_mla": False,
+        "use_mamba": False,
+        "use_moe": False,
+        "use_mod": False,
+        "use_mtp": False,
+    }
 
     def enable(*names: str) -> None:
         for name in names:
@@ -181,34 +181,54 @@ def _unwrap_mod(layer: torch.nn.Module) -> torch.nn.Module:
     return layer.block if isinstance(layer, MixtureOfDepths) else layer
 
 
-def assert_feature_active(mode: str, model: ATSTransformer, config: ModelConfig) -> None:
+def assert_feature_active(
+    mode: str, model: ATSTransformer, config: ModelConfig
+) -> None:
     """Fails loudly if the feature `mode` claims to test isn't actually
     present in the constructed module graph -- catches a config flag that
     silently didn't reach the model, which a passing config-validation test
     elsewhere would never notice."""
     transformer_blocks = [
-        _unwrap_mod(layer) for layer in model.layers if isinstance(_unwrap_mod(layer), TransformerBlock)
+        _unwrap_mod(layer)
+        for layer in model.layers
+        if isinstance(_unwrap_mod(layer), TransformerBlock)
     ]
 
     if mode in ("mamba", "all"):
-        mamba_layers = [layer for layer in model.layers if isinstance(_unwrap_mod(layer), MambaLayer)]
+        mamba_layers = [
+            layer
+            for layer in model.layers
+            if isinstance(_unwrap_mod(layer), MambaLayer)
+        ]
         if not mamba_layers:
-            raise AssertionError("expected at least one MambaLayer in model.layers, found none")
+            raise AssertionError(
+                "expected at least one MambaLayer in model.layers, found none"
+            )
 
     if mode in ("mla", "all"):
-        mla_blocks = [b for b in transformer_blocks if isinstance(b.attention, MLAAttention)]
+        mla_blocks = [
+            b for b in transformer_blocks if isinstance(b.attention, MLAAttention)
+        ]
         if not mla_blocks:
-            raise AssertionError("expected at least one TransformerBlock using MLAAttention, found none")
+            raise AssertionError(
+                "expected at least one TransformerBlock using MLAAttention, found none"
+            )
 
     if mode in ("moe", "all"):
         moe_blocks = [b for b in transformer_blocks if b.ffn_is_moe]
         if not moe_blocks:
-            raise AssertionError("expected at least one TransformerBlock with an MoE FFN, found none")
+            raise AssertionError(
+                "expected at least one TransformerBlock with an MoE FFN, found none"
+            )
 
     if mode in ("mod", "all"):
-        mod_layers = [layer for layer in model.layers if isinstance(layer, MixtureOfDepths)]
+        mod_layers = [
+            layer for layer in model.layers if isinstance(layer, MixtureOfDepths)
+        ]
         if not mod_layers:
-            raise AssertionError("expected at least one MixtureOfDepths-wrapped layer, found none")
+            raise AssertionError(
+                "expected at least one MixtureOfDepths-wrapped layer, found none"
+            )
 
     if mode in ("swa", "all"):
         if not config.use_swa:
@@ -223,12 +243,13 @@ def assert_feature_active(mode: str, model: ATSTransformer, config: ModelConfig)
                 "would have no effect (check swa_full_attention_interval)"
             )
 
-    if mode in ("mtp", "all"):
-        if not (model.uses_mtp and hasattr(model, "mtp_head")):
-            raise AssertionError("expected model.uses_mtp=True and model.mtp_head to exist")
+    if mode in ("mtp", "all") and not (model.uses_mtp and hasattr(model, "mtp_head")):
+        raise AssertionError("expected model.uses_mtp=True and model.mtp_head to exist")
 
 
-def _mtp_loss(logits_per_offset: list[torch.Tensor], labels: torch.Tensor, vocab_size: int) -> torch.Tensor:
+def _mtp_loss(
+    logits_per_offset: list[torch.Tensor], labels: torch.Tensor, vocab_size: int
+) -> torch.Tensor:
     """Same per-offset shift-and-cross-entropy math as
     ats.model.mtp.MultiTokenPredictionHead.compute_loss, operating on the
     already-computed logits list from TransformerOutput.mtp_logits (a plain
@@ -245,7 +266,9 @@ def _mtp_loss(logits_per_offset: list[torch.Tensor], labels: torch.Tensor, vocab
         target = labels[:, k:].contiguous()
         losses.append(
             F.cross_entropy(
-                pred.reshape(-1, vocab_size), target.reshape(-1), ignore_index=IGNORE_INDEX
+                pred.reshape(-1, vocab_size),
+                target.reshape(-1),
+                ignore_index=IGNORE_INDEX,
             )
         )
     if not losses:
@@ -269,7 +292,13 @@ def run_mode(
     try:
         config = build_model_config(mode)
     except (ConfigError, ValueError) as exc:
-        return ModeResult(mode=mode, passed=False, steps_completed=0, total_steps=steps, error=f"config build failed: {exc}")
+        return ModeResult(
+            mode=mode,
+            passed=False,
+            steps_completed=0,
+            total_steps=steps,
+            error=f"config build failed: {exc}",
+        )
 
     try:
         with warnings.catch_warnings():
@@ -280,7 +309,13 @@ def run_mode(
             warnings.filterwarnings("ignore", message=".*flash_attn.*")
             model = ATSTransformer(config)
     except Exception as exc:  # noqa: BLE001 - report any construction failure as a FAIL, not a crash
-        return ModeResult(mode=mode, passed=False, steps_completed=0, total_steps=steps, error=f"model construction failed: {type(exc).__name__}: {exc}")
+        return ModeResult(
+            mode=mode,
+            passed=False,
+            steps_completed=0,
+            total_steps=steps,
+            error=f"model construction failed: {type(exc).__name__}: {exc}",
+        )
 
     param_count = sum(p.numel() for p in model.parameters())
 
@@ -288,8 +323,12 @@ def run_mode(
         assert_feature_active(mode, model, config)
     except AssertionError as exc:
         return ModeResult(
-            mode=mode, passed=False, steps_completed=0, total_steps=steps,
-            param_count=param_count, error=f"feature-active check failed: {exc}",
+            mode=mode,
+            passed=False,
+            steps_completed=0,
+            total_steps=steps,
+            param_count=param_count,
+            error=f"feature-active check failed: {exc}",
         )
 
     model.to(device)
@@ -300,7 +339,9 @@ def run_mode(
     last_loss: float | None = None
     for step in range(1, steps + 1):
         try:
-            input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len), device=device)
+            input_ids = torch.randint(
+                0, config.vocab_size, (batch_size, seq_len), device=device
+            )
             labels = input_ids.clone()
             # Match what the real dataloader always sends (_collate in
             # ats/data/dataloader.py always produces an all-ones
@@ -313,7 +354,9 @@ def run_mode(
             # moment attention_mask was supplied -- see CHANGES.md and
             # tests/test_bug_audit_fixes.py). Passing it here now closes
             # that blind spot for future architecture changes.
-            attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long, device=device)
+            attention_mask = torch.ones(
+                batch_size, seq_len, dtype=torch.long, device=device
+            )
 
             output = model(input_ids, attention_mask=attention_mask)
 
@@ -332,8 +375,12 @@ def run_mode(
 
             if not torch.isfinite(total_loss):
                 return ModeResult(
-                    mode=mode, passed=False, steps_completed=step - 1, total_steps=steps,
-                    param_count=param_count, last_loss=float(total_loss.item()),
+                    mode=mode,
+                    passed=False,
+                    steps_completed=step - 1,
+                    total_steps=steps,
+                    param_count=param_count,
+                    last_loss=float(total_loss.item()),
                     error=f"non-finite loss at step {step}: {total_loss.item()}",
                 )
 
@@ -343,8 +390,12 @@ def run_mode(
             for name, p in model.named_parameters():
                 if p.grad is not None and not torch.isfinite(p.grad).all():
                     return ModeResult(
-                        mode=mode, passed=False, steps_completed=step - 1, total_steps=steps,
-                        param_count=param_count, last_loss=float(total_loss.item()),
+                        mode=mode,
+                        passed=False,
+                        steps_completed=step - 1,
+                        total_steps=steps,
+                        param_count=param_count,
+                        last_loss=float(total_loss.item()),
                         error=f"non-finite gradient in {name!r} at step {step}",
                     )
 
@@ -353,8 +404,12 @@ def run_mode(
 
         except Exception as exc:  # noqa: BLE001 - any exception mid-training is a FAIL, not a crash
             return ModeResult(
-                mode=mode, passed=False, steps_completed=step - 1, total_steps=steps,
-                param_count=param_count, last_loss=last_loss,
+                mode=mode,
+                passed=False,
+                steps_completed=step - 1,
+                total_steps=steps,
+                param_count=param_count,
+                last_loss=last_loss,
                 error=f"{type(exc).__name__}: {exc}",
             )
 
@@ -365,8 +420,12 @@ def run_mode(
     changed_fraction = num_changed / max(1, len(initial_params))
     if changed_fraction < MIN_CHANGED_FRACTION:
         return ModeResult(
-            mode=mode, passed=False, steps_completed=steps, total_steps=steps,
-            param_count=param_count, last_loss=last_loss,
+            mode=mode,
+            passed=False,
+            steps_completed=steps,
+            total_steps=steps,
+            param_count=param_count,
+            last_loss=last_loss,
             error=(
                 f"only {num_changed}/{len(initial_params)} parameter tensors changed "
                 f"after {steps} steps ({changed_fraction:.0%} < {MIN_CHANGED_FRACTION:.0%} "
@@ -374,7 +433,14 @@ def run_mode(
             ),
         )
 
-    return ModeResult(mode=mode, passed=True, steps_completed=steps, total_steps=steps, param_count=param_count, last_loss=last_loss)
+    return ModeResult(
+        mode=mode,
+        passed=True,
+        steps_completed=steps,
+        total_steps=steps,
+        param_count=param_count,
+        last_loss=last_loss,
+    )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -390,9 +456,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Run only this one mode instead of all 8 (default: run all 8).",
     )
     parser.add_argument(
-        "--steps", type=int, default=DEFAULT_STEPS, help=f"Optimizer steps per mode (default: {DEFAULT_STEPS})."
+        "--steps",
+        type=int,
+        default=DEFAULT_STEPS,
+        help=f"Optimizer steps per mode (default: {DEFAULT_STEPS}).",
     )
-    parser.add_argument("--seed", type=int, default=0, help="Torch RNG seed (default: 0).")
+    parser.add_argument(
+        "--seed", type=int, default=0, help="Torch RNG seed (default: 0)."
+    )
     return parser
 
 
@@ -412,11 +483,15 @@ def main(argv: list[str] | None = None) -> int:
         results.append(result)
 
         if result.passed:
-            print(f"[PASS] {mode:<6} {result.steps_completed}/{result.total_steps}  ({elapsed:.1f}s)")
+            print(
+                f"[PASS] {mode:<6} {result.steps_completed}/{result.total_steps}  ({elapsed:.1f}s)"
+            )
         else:
             print(f"[FAIL] {mode}")
             print(f"  step: {result.steps_completed}/{result.total_steps}")
-            print(f"  loss: {result.last_loss if result.last_loss is not None else 'n/a'}")
+            print(
+                f"  loss: {result.last_loss if result.last_loss is not None else 'n/a'}"
+            )
             print(f"  error: {result.error}")
 
     num_passed = sum(1 for r in results if r.passed)

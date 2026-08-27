@@ -115,6 +115,7 @@ class MLAAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_value: MLAPastState | None = None,
         use_cache: bool = False,
+        causal: bool = True,
     ) -> tuple[torch.Tensor, MLAPastState | None]:
         if x.dim() != 3:
             raise ValueError(
@@ -229,18 +230,35 @@ class MLAAttention(nn.Module):
             is_causal = False
         elif attention_mask is not None:
             attn_mask = build_padding_causal_mask(
-                attention_mask, seq_len, is_causal=seq_len > 1, device=x.device
+                attention_mask,
+                seq_len,
+                is_causal=causal and seq_len > 1,
+                device=x.device,
             )
             is_causal = False
         else:
             attn_mask = None
-            is_causal = seq_len > 1
+            # causal=False disables causal masking entirely (used only by
+            # the diffusion-LM backbone -- see
+            # ats.model.attention.GroupedQueryAttention.forward's matching
+            # comment for the full rationale on why this parameter exists
+            # and why it defaults to True everywhere else).
+            is_causal = causal and seq_len > 1
 
         # Bug 2 fix: apply the hybrid SWA window to MLA the same way
         # GroupedQueryAttention does, so "full attention every N layers"
         # (force_full_attention) is actually respected instead of every MLA
         # layer silently running full attention regardless of the pattern.
-        if self.use_swa and not self.force_full_attention and past_key_value is None:
+        # `and causal`: SWA's mask (ats.model.swa.generate_swa_mask) is
+        # inherently a causal band, with no bidirectional-windowed variant
+        # implemented -- ModelConfig itself already rejects use_swa=True
+        # combined with model_type="diffusion", so this is defense in depth.
+        if (
+            self.use_swa
+            and not self.force_full_attention
+            and past_key_value is None
+            and causal
+        ):
             swa_mask = generate_swa_mask(seq_len, self.swa_window_size, x.device)
             attn_mask = swa_mask if attn_mask is None else (attn_mask & swa_mask)
             is_causal = False

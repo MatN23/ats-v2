@@ -275,6 +275,43 @@ class ModelConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _check_diffusion_bidirectional_compat(self) -> ModelConfig:
+        # BUG FIX: found alongside (not originally part of) the external
+        # bug-audit report -- see CHANGES.md. A diffusion denoising step
+        # needs every position to see every other position (past AND
+        # future); ATSTransformer.forward_hidden now correctly requests
+        # this (causal=False -- see GroupedQueryAttention.forward's
+        # matching comment), but SWA's mask
+        # (ats.model.swa.generate_swa_mask) is inherently a causal band with
+        # no bidirectional-windowed variant implemented, and MambaBlock's
+        # selective scan is causal by construction with no bidirectional
+        # formulation implemented either. Both would silently keep the
+        # backbone partially or fully backward-looking-only even with the
+        # causal=False plumbing in place, so both are rejected explicitly
+        # here rather than silently producing a degraded model.
+        if self.model_type != "diffusion":
+            return self
+        if self.use_swa:
+            raise ConfigError(
+                "model.use_swa=True is incompatible with model.model_type='diffusion': "
+                "SWA's window mask is inherently causal (each position only attends "
+                "backward), with no bidirectional-windowed variant implemented, but "
+                "diffusion denoising requires every position to see every other "
+                "position. Fix: disable use_swa, or set model_type back to "
+                "'autoregressive'."
+            )
+        if self.use_mamba:
+            raise ConfigError(
+                "model.use_mamba=True is incompatible with model.model_type='diffusion': "
+                "MambaBlock's selective scan is causal by construction (state at "
+                "position t depends only on positions <= t), with no bidirectional "
+                "formulation implemented, but diffusion denoising requires every "
+                "position to see every other position. Fix: disable use_mamba, or set "
+                "model_type back to 'autoregressive'."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _check_heads(self) -> ModelConfig:
         if (
             self.num_heads is not None

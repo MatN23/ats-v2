@@ -64,12 +64,30 @@ class MambaLayer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_value: PastKeyValue | None = None,
         use_cache: bool = False,
+        causal: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, PastKeyValue | None]:
         if past_key_value is not None:
             raise ValueError(
                 "MambaLayer does not support KV-cache-based incremental decoding in "
                 "this implementation. Fix: run full-sequence forward passes, or disable "
                 "use_cache for Mamba layers."
+            )
+        # MambaBlock's selective scan is inherently causal (state at position
+        # t is computed only from positions <= t; there is no bidirectional
+        # variant implemented here). causal=False (the diffusion-LM backbone
+        # path -- see ats.model.attention.GroupedQueryAttention.forward's
+        # matching comment) cannot be honored by a Mamba layer, so this
+        # raises rather than silently producing a causally-limited backbone
+        # for a model class that needs bidirectional context. ModelConfig
+        # itself already rejects use_mamba=True combined with
+        # model_type="diffusion" for the same reason, so reaching this in
+        # practice would mean that guard was bypassed some other way.
+        if not causal:
+            raise ValueError(
+                "MambaLayer cannot run in non-causal (causal=False) mode: its "
+                "selective scan has no bidirectional formulation in this "
+                "implementation. Fix: don't combine use_mamba=True with "
+                "model_type='diffusion'."
             )
         h = self.input_norm(x)
         mamba_out = self.mamba(h)
@@ -188,6 +206,7 @@ class TransformerBlock(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_value: PastKeyValue | None = None,
         use_cache: bool = False,
+        causal: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, PastKeyValue | None]:
         residual = x
         h = self.input_norm(x)
@@ -197,6 +216,7 @@ class TransformerBlock(nn.Module):
                 attention_mask=attention_mask,
                 past_key_value=past_key_value,
                 use_cache=use_cache,
+                causal=causal,
             )
         else:
             attn_out, new_past_key_value = self.attention(
@@ -205,6 +225,7 @@ class TransformerBlock(nn.Module):
                 past_key_value=past_key_value,
                 use_cache=use_cache,
                 force_full_attention=self.force_full_attention,
+                causal=causal,
             )
         x = residual + attn_out
 
@@ -277,6 +298,7 @@ class ATSTransformer(nn.Module):
         attention_mask: torch.Tensor | None,
         past_key_values: list[PastKeyValue | None] | None,
         use_cache: bool,
+        causal: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, list[PastKeyValue | None]]:
         total_aux_loss = torch.zeros((), device=x.device, dtype=torch.float32)
         new_past_key_values: list[PastKeyValue | None] = []
@@ -303,12 +325,22 @@ class ATSTransformer(nn.Module):
             # a positive int) so mypy can narrow n from `int | None` to
             # `int` for the `layer_idx % n` below.
             if use_checkpointing and n is not None and layer_idx % n == 0:
+                # BUG FIX (found alongside the diffusion causal-masking bug
+                # -- see GroupedQueryAttention.forward and CHANGES.md):
+                # `causal` must be passed here too, or gradient checkpointing
+                # would silently fall back to every layer's own default
+                # (causal=True) regardless of what the caller asked for --
+                # forward_hidden's causal=False would get silently
+                # overridden back to causal=True on every checkpointed
+                # layer specifically (i.e. exactly the layers a real
+                # (non-debug-size) diffusion training run actually uses).
                 x, aux_loss, new_kv = torch.utils.checkpoint.checkpoint(
                     layer,
                     x,
                     attention_mask,
                     past_kv,
                     use_cache,
+                    causal,
                     use_reentrant=False,
                 )
             else:
@@ -317,6 +349,7 @@ class ATSTransformer(nn.Module):
                     attention_mask=attention_mask,
                     past_key_value=past_kv,
                     use_cache=use_cache,
+                    causal=causal,
                 )
             total_aux_loss = total_aux_loss + aux_loss
             new_past_key_values.append(new_kv)
@@ -333,7 +366,17 @@ class ATSTransformer(nn.Module):
         embedding lookup and the LM head, and returns final normed hidden
         states rather than logits. No aux-loss/MoE/MoD routing state is
         threaded through here since diffusion training does not use KV
-        caching or autoregressive generation."""
+        caching or autoregressive generation.
+
+        causal=False is passed to _run_layers unconditionally here: a
+        diffusion denoising step needs every position to see every other
+        position (past AND future), not just prior ones, unlike
+        autoregressive next-token prediction. See
+        GroupedQueryAttention.forward's comment on the causal parameter for
+        the full rationale, and CHANGES.md for how this was found (the
+        backbone was previously always causal here, regardless of caller,
+        silently limiting the diffusion model to backward-looking-only
+        context)."""
         if (
             inputs_embeds.dim() != 3
             or inputs_embeds.shape[-1] != self.config.hidden_size
@@ -347,6 +390,7 @@ class ATSTransformer(nn.Module):
             attention_mask,
             past_key_values=None,
             use_cache=False,
+            causal=False,
         )
         return self.final_norm(x)
 

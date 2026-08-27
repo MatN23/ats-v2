@@ -343,6 +343,84 @@ constructed a real `Trainer` at all). Fixed by declaring
 `tokens_this_step` as a real field on `TrainingMetrics` and using
 `dataclasses.replace` to produce a new instance instead of mutating.
 
+## (o) Diffusion backbone was always causally masked (found on re-audit)
+
+`ats/model/diffusion.py::DiffusionLM` wraps an `ATSTransformer` purely as an
+embedding-space noise predictor (`ATSTransformer.forward_hidden`). A
+diffusion denoising step fundamentally needs every position to see every
+other position — past AND future — to reconstruct the clean signal; that's
+the entire premise of diffusion vs. autoregressive modeling, not an
+optional refinement. `GroupedQueryAttention`/`MLAAttention` had no way to
+request bidirectional attention at all: `is_causal` was computed
+unconditionally whenever `seq_len > 1` and no KV cache was active, with no
+parameter to turn it off. **This silently trained a causally-masked
+(backward-looking-only) backbone for a model class that cannot function
+correctly without bidirectional context** — every diffusion training run
+in prior revisions was training a degenerate model, with no error, warning,
+or test catching it (`ats/cli/test_modes.py`'s 8 architecture modes don't
+include diffusion — the user's own spec for that script, unmodified — and
+neither the pytest suite nor the earlier bug-audit fix batch happened to
+exercise the diffusion path with a check that would have caught this).
+
+Confirmed empirically before writing the fix: perturbing the LAST token in
+a short sequence and checking whether EARLIER positions' predicted noise
+changes. The naive version of this check is a false positive trap — the
+diffusion process injects `torch.randn_like` noise internally, so two
+forward calls with different inputs consume the global RNG differently and
+produce different injected noise regardless of attention behavior. Holding
+the RNG state fixed identically before each call (so the only difference
+between the two calls is the model's own computation, not the injected
+noise) isolates the real signal: before the fix, earlier positions' output
+was byte-identical regardless of what the last token was (proving strict
+causality); after the fix, perturbing the last token changes every earlier
+position's output (proving genuine bidirectional information flow).
+
+Fixed with a `causal: bool = True` parameter threaded through
+`GroupedQueryAttention.forward`, `MLAAttention.forward`,
+`TransformerBlock.forward`, `MixtureOfDepths.forward`, and
+`ATSTransformer._run_layers`. Two places this had to be threaded carefully,
+each a real would-be-reintroduced instance of the same bug if missed:
+
+- **`MixtureOfDepths.forward`** builds a `block_kwargs` dict to call its
+  wrapped block; `causal` wasn't in it. Without adding it explicitly, any
+  MoD-wrapped layer would silently fall back to the wrapped block's own
+  `causal=True` default, reintroducing causal masking for exactly the
+  layers `use_mod=True` wraps — regardless of what the caller (correctly)
+  requested.
+- **`ATSTransformer._run_layers`'s gradient-checkpointing call site** calls
+  each layer via `torch.utils.checkpoint.checkpoint(layer, x,
+  attention_mask, past_kv, use_cache, ...)` — positionally, by convention
+  (see the existing "Bug 1 fix" comment in `ats/model/mod.py` about why
+  `MixtureOfDepths.forward` accepts these as named positional args rather
+  than `**kwargs` in the first place). `causal` had to be added as an
+  explicit 5th positional argument to this exact call, or checkpointed
+  layers specifically — i.e. exactly the layers a real, non-toy-sized
+  diffusion training run actually uses — would silently keep training with
+  `causal=True` even after every other part of the fix was in place.
+
+`ATSTransformer.forward_hidden` (the diffusion-only entry point) now passes
+`causal=False`; `ATSTransformer.forward` (the autoregressive entry point)
+is unchanged and still defaults to `causal=True` — confirmed with a
+regression test in the other direction too (perturbing the last token of
+an ordinary autoregressive forward pass must change nothing about earlier
+positions' logits, and still doesn't).
+
+**Not fully fixable within this scope, made explicit instead of silently
+wrong:** `MambaBlock`'s selective scan is causal by construction (state at
+position `t` depends only on positions `<= t`; a genuine bidirectional SSM
+formulation is a different, larger piece of work), and SWA's mask
+(`ats.model.swa.generate_swa_mask`) is inherently a causal band with no
+bidirectional-windowed variant implemented. Both would silently remain
+partially or fully backward-looking-only even with the rest of this fix in
+place. Rather than leave that as a second, quieter version of the same
+bug, `ModelConfig` now rejects `use_swa=True` or `use_mamba=True` combined
+with `model_type="diffusion"` outright — the same pattern already used for
+the pre-existing `use_mtp` + diffusion incompatibility check.
+`MambaLayer.forward` itself also refuses `causal=False` directly (not just
+the config-level guard), so anything that bypassed `ModelConfig`'s
+validator would still fail loudly instead of silently producing a
+causally-limited layer.
+
 ## Known gaps (honest, as of this revision)
 
 - Mamba layers do not support KV-cache-based incremental decoding (training

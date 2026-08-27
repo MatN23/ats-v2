@@ -742,3 +742,225 @@ def test_config_rejects_seq_length_one():
 def test_config_accepts_seq_length_two():
     config = DataConfig(sources=[DataSource(path="x.jsonl")], seq_length=2)
     assert config.seq_length == 2
+
+
+# ---------------------------------------------------------------------------
+# EXTRA BUG (found while re-auditing the codebase after the previous fix
+# batch, entirely unrelated to any of BUG-001 through BUG-009): the
+# diffusion-LM backbone was always causally masked.
+#
+# ats.model.diffusion.DiffusionLM wraps an ATSTransformer purely as a noise
+# predictor over embeddings (ATSTransformer.forward_hidden). A diffusion
+# denoising step fundamentally needs every position to see every other
+# position -- past AND future -- to reconstruct the clean signal; that's
+# the entire premise of diffusion vs. autoregressive modeling, unlike
+# next-token prediction where causal masking is correct and required.
+# GroupedQueryAttention/MLAAttention had no way to request bidirectional
+# attention at all: is_causal was computed unconditionally whenever
+# seq_len > 1 and no cache was active, with no parameter to turn it off.
+# This silently trained a causally-masked (backward-looking-only) backbone
+# for a model class that cannot function correctly without bidirectional
+# context -- confirmed empirically below by perturbing a later token (with
+# the diffusion process's injected random noise held fixed via a
+# controlled RNG seed, since otherwise the injected noise -- not the
+# backbone -- would differ between the two forward passes and produce a
+# false positive) and checking whether earlier positions' output changes.
+#
+# Fixed with a `causal: bool = True` parameter threaded through
+# GroupedQueryAttention.forward, MLAAttention.forward, TransformerBlock.forward,
+# MixtureOfDepths.forward (which was silently dropping it from block_kwargs
+# and would otherwise reintroduce causal=True for any MoD-wrapped layer),
+# and ATSTransformer._run_layers (including its gradient-checkpointing call
+# site, which calls layers by position and would otherwise silently fall
+# back to every layer's own causal=True default under checkpointing
+# specifically). ATSTransformer.forward_hidden (the diffusion-only entry
+# point) now passes causal=False; ATSTransformer.forward (the autoregressive
+# entry point) is unchanged and still defaults to causal=True.
+#
+# MambaBlock's selective scan and SWA's window mask are both causal by
+# construction, with no bidirectional variant implemented -- rather than
+# silently leaving those specific layers backward-looking-only even after
+# this fix, ModelConfig now rejects use_swa=True or use_mamba=True combined
+# with model_type="diffusion" outright, the same pattern already used for
+# the existing use_mtp + diffusion incompatibility check.
+# ---------------------------------------------------------------------------
+
+
+def test_diffusion_backbone_is_bidirectional_not_causal():
+    from ats.model.diffusion import DiffusionLM
+
+    torch.manual_seed(0)
+    config = ModelConfig(
+        hidden_size=32,
+        num_layers=2,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=64,
+        vocab_size=50,
+        use_flash_attention=False,
+        max_seq_len=32,
+    )
+    backbone = ATSTransformer(config)
+    diffusion = DiffusionLM(backbone=backbone, hidden_size=32, num_timesteps=100)
+    diffusion.eval()
+
+    input_ids = torch.randint(0, 50, (1, 6))
+    timesteps = torch.tensor([50])
+
+    # The diffusion process injects random noise via torch.randn_like inside
+    # add_noise(); without resetting the seed identically before each call,
+    # the two forward passes below would see DIFFERENT injected noise (since
+    # the global RNG advances during the first call), which would make
+    # earlier positions' output differ regardless of whether attention is
+    # causal or bidirectional -- a false positive for this test. Resetting
+    # the seed identically isolates the one thing actually being tested:
+    # whether the backbone's own computation, not the injected noise,
+    # changes when a LATER position's input changes.
+    torch.manual_seed(123)
+    out_a = diffusion(input_ids, backbone.embed_tokens, timesteps=timesteps)
+
+    perturbed_input_ids = input_ids.clone()
+    perturbed_input_ids[0, -1] = (perturbed_input_ids[0, -1] + 1) % 50
+
+    torch.manual_seed(123)
+    out_b = diffusion(perturbed_input_ids, backbone.embed_tokens, timesteps=timesteps)
+
+    earlier_positions_diff = (
+        (out_a.predicted_noise[0, :-1] - out_b.predicted_noise[0, :-1]).abs().max()
+    )
+    assert earlier_positions_diff > 1e-6, (
+        "earlier positions' predicted noise did not change when the LAST "
+        "token changed -- the backbone appears to be causally masked, which "
+        "breaks diffusion denoising (every position must see every other "
+        "position, not just prior ones)."
+    )
+
+
+def test_diffusion_backbone_bidirectional_through_mod_wrapping():
+    """The same test as above, but with use_mod=True: MixtureOfDepths.forward
+    used to silently drop causal from block_kwargs, so a MoD-wrapped layer
+    would reintroduce causal=True even if the outer plumbing correctly
+    requested causal=False."""
+    from ats.model.diffusion import DiffusionLM
+
+    torch.manual_seed(0)
+    config = ModelConfig(
+        hidden_size=32,
+        num_layers=2,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=64,
+        vocab_size=50,
+        use_flash_attention=False,
+        max_seq_len=32,
+        use_mod=True,
+        mod_capacity_factor=0.75,
+    )
+    backbone = ATSTransformer(config)
+    diffusion = DiffusionLM(backbone=backbone, hidden_size=32, num_timesteps=100)
+    diffusion.eval()
+
+    input_ids = torch.randint(0, 50, (1, 6))
+    timesteps = torch.tensor([50])
+
+    torch.manual_seed(123)
+    out_a = diffusion(input_ids, backbone.embed_tokens, timesteps=timesteps)
+
+    perturbed_input_ids = input_ids.clone()
+    perturbed_input_ids[0, -1] = (perturbed_input_ids[0, -1] + 1) % 50
+
+    torch.manual_seed(123)
+    out_b = diffusion(perturbed_input_ids, backbone.embed_tokens, timesteps=timesteps)
+
+    earlier_positions_diff = (
+        (out_a.predicted_noise[0, :-1] - out_b.predicted_noise[0, :-1]).abs().max()
+    )
+    assert earlier_positions_diff > 1e-6
+
+
+def test_autoregressive_forward_is_still_causal_after_the_diffusion_fix():
+    """Regression guard in the other direction: the causal=False plumbing
+    added for diffusion must not leak into the ordinary autoregressive
+    forward() path, which must remain strictly causal."""
+    torch.manual_seed(0)
+    config = ModelConfig(
+        hidden_size=32,
+        num_layers=2,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=64,
+        vocab_size=50,
+        use_flash_attention=False,
+        max_seq_len=32,
+    )
+    model = ATSTransformer(config)
+    model.eval()
+
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    out_a = model(input_ids)
+
+    perturbed_input_ids = input_ids.clone()
+    perturbed_input_ids[0, -1] = 7
+
+    out_b = model(perturbed_input_ids)
+
+    earlier_positions_diff = (out_a.logits[0, :-1] - out_b.logits[0, :-1]).abs().max()
+    assert earlier_positions_diff == 0.0, (
+        "autoregressive forward() must be strictly causal: perturbing the "
+        "last token must not change any earlier position's logits."
+    )
+
+
+def test_diffusion_model_type_rejects_swa():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="use_swa"):
+        ModelConfig(
+            hidden_size=32,
+            num_layers=2,
+            num_heads=4,
+            num_kv_heads=2,
+            intermediate_size=64,
+            vocab_size=50,
+            model_type="diffusion",
+            use_swa=True,
+            swa_window_size=8,
+        )
+
+
+def test_diffusion_model_type_rejects_mamba():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="use_mamba"):
+        ModelConfig(
+            hidden_size=32,
+            num_layers=2,
+            num_heads=4,
+            num_kv_heads=2,
+            intermediate_size=64,
+            vocab_size=50,
+            model_type="diffusion",
+            use_mamba=True,
+        )
+
+
+def test_mamba_layer_rejects_non_causal_directly():
+    """MambaLayer.forward itself refuses causal=False (not just the config
+    layer), so anything that bypasses ModelConfig's validator still fails
+    loudly instead of silently producing a causally-limited layer."""
+    from ats.model.transformer import MambaLayer
+
+    config = ModelConfig(
+        hidden_size=16,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=2,
+        intermediate_size=32,
+        vocab_size=20,
+        use_mamba=True,
+        mamba_every_n_layers=1,
+    )
+    mamba_layer = MambaLayer(config)
+    x = torch.randn(1, 4, 16)
+    with pytest.raises(ValueError, match="non-causal"):
+        mamba_layer(x, causal=False)

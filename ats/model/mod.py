@@ -50,6 +50,7 @@ class MixtureOfDepths(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_value: object | None = None,
         use_cache: bool = False,
+        causal: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, object | None]:
         # Bug 1 fix: torch.utils.checkpoint.checkpoint in transformer.py calls
         # layer(x, attention_mask, past_kv, use_cache) positionally, so this
@@ -59,6 +60,14 @@ class MixtureOfDepths(nn.Module):
             "attention_mask": attention_mask,
             "past_key_value": past_key_value,
             "use_cache": use_cache,
+            # BUG FIX (found alongside the diffusion causal-masking bug --
+            # see ats.model.attention.GroupedQueryAttention.forward and
+            # CHANGES.md): without this, a MoD-wrapped layer silently never
+            # received causal=False at all, since it wasn't in block_kwargs
+            # -- the wrapped block would fall back to its own default
+            # (causal=True), quietly reintroducing causal masking for any
+            # MoD-wrapped layer even after the rest of the diffusion fix.
+            "causal": causal,
         }
         _batch, seq_len, hidden_size = x.shape
         if hidden_size != self.hidden_size:

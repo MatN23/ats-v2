@@ -163,6 +163,7 @@ class GroupedQueryAttention(nn.Module):
         past_key_value: PastKeyValue | None = None,
         use_cache: bool = False,
         force_full_attention: bool = False,
+        causal: bool = True,
     ) -> tuple[torch.Tensor, PastKeyValue | None]:
         if x.dim() != 3:
             raise ValueError(
@@ -206,8 +207,32 @@ class GroupedQueryAttention(nn.Module):
         k = self._repeat_kv(k, self.num_kv_groups)
         v = self._repeat_kv(v, self.num_kv_groups)
 
-        is_causal = past_key_value is None and attention_mask is None and seq_len > 1
-        apply_swa = self.use_swa and not force_full_attention
+        # causal=False (used only by the diffusion-LM backbone path, via
+        # ATSTransformer.forward_hidden -- see ats.model.diffusion.DiffusionLM)
+        # disables causal masking entirely: diffusion denoises the whole
+        # sequence at once and needs every position to see every other
+        # position, not just prior ones, unlike autoregressive next-token
+        # prediction. Previously there was no way to request this at all --
+        # every attention path here was unconditionally causal, silently
+        # training a causally-masked (backward-looking-only) backbone for a
+        # model class that fundamentally requires bidirectional attention to
+        # denoise correctly. See CHANGES.md and
+        # tests/test_bug_audit_fixes.py for how this was found (perturbing a
+        # later token and confirming, with the injected diffusion noise
+        # controlled for, that it changed earlier positions' output only
+        # after this fix).
+        is_causal = (
+            causal and past_key_value is None and attention_mask is None and seq_len > 1
+        )
+        # SWA's mask (ats.model.swa.generate_swa_mask) is inherently a
+        # causal band (j <= i AND i - j < window_size); there is no
+        # bidirectional-windowed variant implemented, so it's simply
+        # unavailable rather than silently applied in a way that would
+        # still block backward-to-forward information flow. ModelConfig
+        # itself rejects use_swa=True combined with model_type="diffusion"
+        # for the same reason (see ModelConfig._check_diffusion_bidirectional_compat),
+        # so this `and causal` is defense in depth, not the only guard.
+        apply_swa = self.use_swa and not force_full_attention and causal
 
         # Multi-token continuation against an existing KV cache (seq_len>1
         # with past_key_value set) needs an explicit mask: new tokens must
@@ -334,7 +359,7 @@ class GroupedQueryAttention(nn.Module):
                 attn_mask = build_padding_causal_mask(
                     attention_mask,
                     seq_len,
-                    is_causal=(past_key_value is None and seq_len > 1),
+                    is_causal=(causal and past_key_value is None and seq_len > 1),
                     device=x.device,
                 )
                 use_is_causal = False

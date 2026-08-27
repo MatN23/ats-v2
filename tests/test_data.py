@@ -9,7 +9,6 @@ import types
 from pathlib import Path
 
 import pytest
-import torch
 
 from ats.config.schema import ConfigError, DataSource
 from ats.data.dataloader import _collate

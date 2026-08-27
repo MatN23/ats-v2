@@ -57,11 +57,17 @@ class Monitor:
 
         full_metrics = dict(metrics)
         full_metrics["tokens_per_sec"] = tokens_per_sec
-        mem = get_gpu_memory_info()
-        full_metrics["gpu_mem_allocated_gib"] = mem["allocated_gib"]
-        full_metrics["gpu_mem_reserved_gib"] = mem["reserved_gib"]
 
         if step % self.config.log_every == 0:
+            # get_gpu_memory_info() queries torch.cuda directly and is only
+            # meaningful when we're actually about to report metrics; it was
+            # previously called unconditionally on every step even though
+            # log_every gates the print/TB/wandb output to every 50th step,
+            # so 49 out of every 50 calls were pure waste.
+            mem = get_gpu_memory_info()
+            full_metrics["gpu_mem_allocated_gib"] = mem["allocated_gib"]
+            full_metrics["gpu_mem_reserved_gib"] = mem["reserved_gib"]
+
             # "lr" is forced to scientific notation always: %.4g only
             # switches to scientific when the exponent is below -4, so a
             # value like the common 3e-4 target LR (exponent exactly -4)
@@ -76,11 +82,18 @@ class Monitor:
             formatted = " | ".join(parts)
             logger.info("step=%d | %s", step, formatted)
 
-        if self._tb_writer is not None:
-            for key, value in full_metrics.items():
-                self._tb_writer.add_scalar(key, value, global_step=step)
-        if self._wandb is not None:
-            self._wandb.log(full_metrics, step=step)
+            # TensorBoard/W&B logging used to run unconditionally on every
+            # step (outside this log_every gate) even though log_every=50
+            # clearly signals "report roughly every 50 steps". Each
+            # add_scalar()/wandb.log() call does a Python-side dict-to-proto
+            # (or HTTP, for wandb) write, so this was doing 50x the intended
+            # number of writes -- see Section 2 write-up for the additional
+            # bug this fixes.
+            if self._tb_writer is not None:
+                for key, value in full_metrics.items():
+                    self._tb_writer.add_scalar(key, value, global_step=step)
+            if self._wandb is not None:
+                self._wandb.log(full_metrics, step=step)
 
     def close(self) -> None:
         if self._tb_writer is not None:

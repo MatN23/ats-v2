@@ -27,7 +27,7 @@ training:
   min_lr_ratio: 0.1
   grad_clip_norm: 1.0
   grad_accum_steps: 8
-  micro_batch_size: 1
+  micro_batch_size: 8
   eval_every: 1000
   save_every: 1000
   keep_last_n_checkpoints: 3

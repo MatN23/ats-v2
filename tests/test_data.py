@@ -171,8 +171,14 @@ def test_collate_produces_correct_shapes():
     collated = _collate(batch)
     assert collated["input_ids"].shape == (2, 4)
     assert collated["labels"].shape == (2, 4)
-    assert collated["attention_mask"].shape == (2, 4)
-    assert torch.equal(collated["attention_mask"], torch.ones(2, 4, dtype=torch.long))
+    # No attention_mask key: every example here is already a fixed-length
+    # seq_length block, so there's never anything to mask. Padding (the
+    # final partial chunk of a stream) is encoded via `labels` IGNORE_INDEX
+    # upstream in MixedDataset, not via a mask. Omitting the key (rather
+    # than always sending an all-ones tensor) lets the attention layers'
+    # is_causal fast path engage on every forward pass -- see PERF fix in
+    # ats/data/dataloader.py::_collate.
+    assert "attention_mask" not in collated
 
 
 def test_collate_rejects_inconsistent_lengths():

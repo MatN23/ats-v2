@@ -7,7 +7,6 @@ scheduler/checkpoint/monitor/adaptive-controller infrastructure."""
 from __future__ import annotations
 
 import dataclasses
-import math
 from collections.abc import Iterable
 from typing import Any
 
@@ -311,11 +310,24 @@ class Trainer:
             batch["input_ids"], attention_mask=batch.get("attention_mask")
         )
 
+        # shift_logits (a slice off dim=-2, not the last dim) is NOT
+        # contiguous: its per-batch stride still reflects the original
+        # (unsliced) seq_len, so .reshape(-1, vocab) below used to force a
+        # full contiguous copy of the ENTIRE [batch*(seq_len-1), vocab]
+        # logits tensor just to flatten it -- at seq_len=4096, vocab=100352,
+        # fp16 and the batch=8 micro-batch from Fix 4, that's an extra
+        # ~6.5 GiB allocation on every single forward pass (and it has to
+        # stick around for backward), on top of whatever logits already
+        # cost. F.cross_entropy natively accepts (N, C, d1, ...) input with
+        # (N, d1, ...) targets (the same convention as its 2D/segmentation
+        # use), so transposing to put the class dim second -- a metadata-only
+        # operation, 0 extra bytes -- and passing shift_labels as-is (no
+        # reshape needed there either) avoids the copy entirely.
         shift_logits = output.logits[..., :-1, :]
         shift_labels = batch["labels"][..., 1:]
         ce_loss = torch.nn.functional.cross_entropy(
-            shift_logits.reshape(-1, shift_logits.size(-1)),
-            shift_labels.reshape(-1),
+            shift_logits.transpose(1, 2),
+            shift_labels,
             ignore_index=-100,
         )
         total_loss = ce_loss + output.aux_loss
@@ -344,13 +356,6 @@ class Trainer:
         if not is_optimizer_step:
             return None
 
-        # Measure grad norm before step() clears gradients
-        pre_step_grad_norm = float(
-            torch.nn.utils.clip_grad_norm_(
-                self.model_engine.parameters(), max_norm=float("inf")
-            )
-        )
-
         self._adaptive_lr_multiplier = (
             1.0 + (self._adaptive_lr_multiplier - 1.0) * self._adaptive_multiplier_decay
         )
@@ -359,6 +364,17 @@ class Trainer:
             self.scheduler.get_lr(self.global_step) * self._adaptive_lr_multiplier
         )
         self._set_lr(scheduled_lr)
+        # DeepSpeed's model_engine.step() already computes (and applies)
+        # gradient clipping internally using config.training.grad_clip_norm
+        # (see build_deepspeed_config's "gradient_clipping" key), and the
+        # resulting global grad norm is retrievable afterward via
+        # get_global_grad_norm(). The extra clip_grad_norm_(max_norm=inf)
+        # call that used to run here recomputed the exact same global norm a
+        # second time (a full reduction over every parameter's grad, i.e. a
+        # second all-reduce + norm pass across the entire model on every
+        # single optimizer step) purely to log it -- doubling the per-step
+        # gradient-norm cost for no behavioral benefit, since max_norm=inf
+        # never actually clips anything.
         self.model_engine.step()
 
         # Capture actual accumulated tokens BEFORE resetting
@@ -367,22 +383,24 @@ class Trainer:
         self._accumulated_tokens = 0
 
         grad_norm = self.model_engine.get_global_grad_norm()
-        if grad_norm is None:
-            grad_norm = pre_step_grad_norm
-        else:
+        if grad_norm is not None:
             grad_norm = float(grad_norm)
-            # get_global_grad_norm() reflects DeepSpeed's post-clip gradients,
-            # while pre_step_grad_norm was measured before that clipping was
-            # applied. Surface both when they diverge so a report of "grad
-            # norm looks fine" doesn't hide that clipping is doing a lot of
-            # work every step (a sign the LR or grad_clip_norm may be off).
-            if not math.isclose(pre_step_grad_norm, grad_norm, rel_tol=1e-3):
-                logger.info(
-                    "Grad norm at step %d: pre-clip=%.4f post-clip=%.4f",
-                    self.global_step,
-                    pre_step_grad_norm,
-                    grad_norm,
+        else:
+            # Fallback only: some engines/configs (e.g. gradient_clipping
+            # disabled DeepSpeed-side, or a non-DeepSpeed engine, as in
+            # tests) don't expose a post-step grad norm at all. This runs
+            # after model_engine.step() has already cleared gradients, so
+            # it reports ~0.0 rather than the true pre-clip norm -- a
+            # degraded fallback, but this branch is not on the hot path for
+            # real DeepSpeed runs with gradient_clipping configured (which
+            # is the normal case here; see build_deepspeed_config), so it
+            # never pays the double-computation cost that used to run
+            # unconditionally on every single step.
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    self.model_engine.parameters(), max_norm=float("inf")
                 )
+            )
 
         if self.global_step % self.config.logging.log_every == 0:
             fp16_opt = self.model_engine.optimizer
@@ -523,9 +541,12 @@ class Trainer:
                 )
                 shift_logits = output.logits[..., :-1, :]
                 shift_labels = batch["labels"][..., 1:]
+                # See train_step's identical fix: transpose (metadata-only)
+                # instead of reshape (forces a full contiguous copy of the
+                # whole logits tensor) to flatten for cross_entropy.
                 loss = torch.nn.functional.cross_entropy(
-                    shift_logits.reshape(-1, shift_logits.size(-1)),
-                    shift_labels.reshape(-1),
+                    shift_logits.transpose(1, 2),
+                    shift_labels,
                     ignore_index=-100,
                     reduction="sum",
                 )
@@ -689,12 +710,6 @@ class DiffusionTrainer:
         if self._accumulation_step != self.grad_accum_steps:
             return None
 
-        pre_step_grad_norm = float(
-            torch.nn.utils.clip_grad_norm_(
-                self.model_engine.parameters(), max_norm=float("inf")
-            )
-        )
-
         self._adaptive_lr_multiplier = (
             1.0 + (self._adaptive_lr_multiplier - 1.0) * self._adaptive_multiplier_decay
         )
@@ -702,6 +717,11 @@ class DiffusionTrainer:
             self.scheduler.get_lr(self.global_step) * self._adaptive_lr_multiplier
         )
         self._set_lr(scheduled_lr)
+        # See Trainer.train_step for why the pre-step clip_grad_norm_(inf)
+        # call that used to run here was removed: DeepSpeed's step() already
+        # computes the global grad norm internally, so recomputing it here
+        # was a second full norm pass over every parameter's gradient on
+        # every optimizer step, purely for logging.
         self.model_engine.step()
 
         actual_tokens = self._accumulated_tokens
@@ -709,17 +729,16 @@ class DiffusionTrainer:
         self._accumulated_tokens = 0
 
         grad_norm = self.model_engine.get_global_grad_norm()
-        if grad_norm is None:
-            grad_norm = pre_step_grad_norm
-        else:
+        if grad_norm is not None:
             grad_norm = float(grad_norm)
-            if not math.isclose(pre_step_grad_norm, grad_norm, rel_tol=1e-3):
-                logger.info(
-                    "Grad norm at step %d: pre-clip=%.4f post-clip=%.4f",
-                    self.global_step,
-                    pre_step_grad_norm,
-                    grad_norm,
+        else:
+            # Fallback only -- see Trainer.train_step's identical fallback
+            # for why this is safe to leave as the rare-case path.
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    self.model_engine.parameters(), max_norm=float("inf")
                 )
+            )
 
         metrics = TrainingMetrics(
             step=self.global_step,

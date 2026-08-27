@@ -157,9 +157,13 @@ class _PyTorchMoEFallback(nn.Module):
         normalized_utilization = dispatch_fraction / dispatch_fraction.sum().clamp(
             min=1e-8
         )
-        self.last_expert_utilization = {
-            i: float(normalized_utilization[i].item()) for i in range(self.num_experts)
-        }
+        # normalized_utilization.tolist() does ONE GPU->CPU sync for the
+        # whole vector; the previous per-expert `.item()` inside this dict
+        # comprehension did num_experts separate syncs every forward pass on
+        # every MoE layer (only when use_moe=True, but real for MoE runs).
+        self.last_expert_utilization = dict(
+            enumerate(normalized_utilization.tolist())
+        )
 
         return output.reshape(batch, seq_len, hidden_size), aux_loss
 
@@ -254,10 +258,12 @@ class MoELayer(nn.Module):
                 counts = exp_counts.detach().float()
                 total = counts.sum()
                 if total > 0:
-                    self.last_expert_utilization = {
-                        i: float((counts[i] / total).item())
-                        for i in range(counts.shape[0])
-                    }
+                    # Single .tolist() sync instead of one .item() per
+                    # expert -- see the matching fix in the pure-PyTorch
+                    # MoE fallback above for why this matters.
+                    self.last_expert_utilization = dict(
+                        enumerate((counts / total).tolist())
+                    )
             except (AttributeError, TypeError, IndexError) as exc:
                 logger.warning(
                     "Could not derive expert_utilization from DeepSpeed's exp_counts "

@@ -104,8 +104,21 @@ def _collate(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
             )
     input_ids = torch.tensor([ex["input_ids"] for ex in batch], dtype=torch.long)
     labels = torch.tensor([ex["labels"] for ex in batch], dtype=torch.long)
-    attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-    return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
+    # No attention_mask here: every example in this pipeline is already a
+    # fixed-length seq_length block (asserted above), and the only padding
+    # that ever occurs (the final partial chunk of a stream, or a
+    # preprocessed block's tail -- see MixedDataset._make_example /
+    # _iter_preprocessed_shard) is already encoded entirely in `labels` via
+    # IGNORE_INDEX, not via input_ids or a mask. The all-ones mask this used
+    # to build was therefore never masking anything (it was always literally
+    # all ones): it cost one extra full-size tensor allocation per batch,
+    # and -- worse -- forced GroupedQueryAttention.forward's is_causal
+    # fast-path off on every layer of every step, since that path requires
+    # attention_mask is None to dispatch flash_attn/SDPA's optimized causal
+    # kernels (see ats/model/attention.py). Passing no attention_mask at all
+    # (batch.get("attention_mask") returns None downstream) restores that
+    # fast path with no change in behavior.
+    return {"input_ids": input_ids, "labels": labels}
 
 
 def build_dataloader(

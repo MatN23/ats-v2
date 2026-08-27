@@ -71,11 +71,14 @@ def compute_perplexity(
             output = model_engine(
                 batch["input_ids"], attention_mask=batch.get("attention_mask")
             )
-            shift_logits = output.logits[..., :-1, :].contiguous()
-            shift_labels = batch["labels"][..., 1:].contiguous()
+            # Transpose (metadata-only) instead of an explicit .contiguous()
+            # + .view() flatten, which forces a full copy of the whole
+            # logits tensor -- see the matching fix in trainer.py.
+            shift_logits = output.logits[..., :-1, :]
+            shift_labels = batch["labels"][..., 1:]
             loss = torch.nn.functional.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
+                shift_logits.transpose(1, 2),
+                shift_labels,
                 ignore_index=-100,
                 reduction="sum",
             )

@@ -161,9 +161,7 @@ class _PyTorchMoEFallback(nn.Module):
         # whole vector; the previous per-expert `.item()` inside this dict
         # comprehension did num_experts separate syncs every forward pass on
         # every MoE layer (only when use_moe=True, but real for MoE runs).
-        self.last_expert_utilization = dict(
-            enumerate(normalized_utilization.tolist())
-        )
+        self.last_expert_utilization = dict(enumerate(normalized_utilization.tolist()))
 
         return output.reshape(batch, seq_len, hidden_size), aux_loss
 

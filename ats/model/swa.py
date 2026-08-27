@@ -4,9 +4,12 @@ banded lower-triangular mask, not full causal. No custom CUDA kernels."""
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
 
+@functools.lru_cache(maxsize=8)
 def generate_swa_mask(
     seq_len: int, window_size: int, device: torch.device
 ) -> torch.Tensor:
@@ -16,6 +19,17 @@ def generate_swa_mask(
 
     True == "attend", following torch.nn.functional.scaled_dot_product_attention's
     boolean-mask convention (True = keep, False = mask out).
+
+    PERF: memoized on (seq_len, window_size, device) via lru_cache. Every
+    SWA-enabled layer previously rebuilt this full [seq_len, seq_len]
+    boolean tensor (16 MiB at seq_len=4096) from scratch on every forward
+    pass, even though training uses a fixed seq_len/window_size for the
+    entire run -- num_layers redundant O(seq_len^2) rebuilds per step for
+    no reason. maxsize=8 caps memory if seq_len legitimately varies (e.g.
+    padded final batches, or eval at a different length) rather than
+    growing unbounded. NOTE: callers must not mutate the returned tensor
+    in place (none currently do -- it's only read as an attn_mask/combined
+    via `&`, which allocates a new tensor).
     """
     if seq_len <= 0:
         raise ValueError(f"generate_swa_mask requires seq_len > 0, got {seq_len}.")

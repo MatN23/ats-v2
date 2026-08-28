@@ -68,6 +68,30 @@ python -m ats.cli.train --config configs/debug.yaml
 This runs 100 steps of a ~14M parameter model on CPU (ZeRO-0, single
 process) and writes checkpoints to `./checkpoints/debug`.
 
+## Downloading training data
+
+`scripts/download_data.sh` downloads exactly the amount of data a config
+actually needs — no more, no less. It reads a config's `training.max_steps`,
+`grad_accum_steps`, `micro_batch_size`, `data.seq_length`, and
+`parallelism.gpus`/`nodes`, computes the exact token count that run will
+consume, then streams from a HuggingFace dataset (default: `fineweb-edu`),
+tokenizing with the config's own `tiktoken` encoding, and stops the instant
+that budget is hit:
+
+```bash
+./scripts/download_data.sh --all --dry-run       # print the token budget for every config, download nothing
+./scripts/download_data.sh --config configs/125m.yaml
+./scripts/download_data.sh --all --install-deps  # every configs/*.yaml, auto-installing pyyaml/tiktoken/datasets if missing
+```
+
+It writes straight to each config's `data.sources[0].path` in the
+`{"text": ...}` jsonl format `ats/data/dataset.py` expects, skips
+re-downloading if the destination already has enough tokens (checked with
+the same tokenizer — pass `--force` to override), and warns if the source
+dataset runs out before the budget is reached. Run
+`./scripts/download_data.sh --help` for the full flag list (`--dataset`,
+`--dataset-config`, `--split`, `--text-field`, `--margin`, `--out`).
+
 ## Train a real-sized model
 
 ```bash

@@ -41,6 +41,11 @@
 #   --text-field NAME     Field in the HF dataset containing raw text. Default: text
 #   --margin FLOAT      Multiplier applied to the computed token budget. Default: 1.05
 #   --out PATH             Override the output .jsonl path (only valid with a single --config).
+#   --batch-size N          Docs tokenized per tiktoken encode_batch() call. Default: 512.
+#                           Higher = fewer, bigger batches (faster, more RAM); this is the
+#                           main speed knob -- tokenizing one doc at a time is dramatically
+#                           slower than batching, since tiktoken's batch API releases the
+#                           GIL and parallelizes across threads.
 #   --force               Re-download even if the destination already has enough tokens.
 #   --dry-run              Print the computed budget table and exit; no download.
 #   --install-deps         pip install the (few) missing Python deps and continue.
@@ -58,12 +63,16 @@ SPLIT="train"
 TEXT_FIELD="text"
 MARGIN="1.05"
 OUT_OVERRIDE=""
+BATCH_SIZE=512
 FORCE=0
 DRY_RUN=0
 INSTALL_DEPS=0
 
 usage() {
-    sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    # Print the leading '#'-comment block (lines 2 through the first
+    # non-comment line), dynamically -- avoids a hardcoded line range going
+    # stale every time this header comment is edited.
+    awk 'NR==1{next} /^#/{sub(/^# ?/, ""); print; next} {exit}' "${BASH_SOURCE[0]}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -76,6 +85,7 @@ while [[ $# -gt 0 ]]; do
         --text-field)          TEXT_FIELD="$2"; shift 2 ;;
         --margin)               MARGIN="$2"; shift 2 ;;
         --out)                   OUT_OVERRIDE="$2"; shift 2 ;;
+        --batch-size)             BATCH_SIZE="$2"; shift 2 ;;
         --force)                  FORCE=1; shift ;;
         --dry-run)                  DRY_RUN=1; shift ;;
         --install-deps)              INSTALL_DEPS=1; shift ;;
@@ -149,8 +159,9 @@ done
 # tokenization-aware stopping, resume/skip logic — happens in one Python
 # process per config so the token count used to decide "enough" is
 # computed with the exact same tokenizer the trainer will use.
-python3 - "${REPO_ROOT}" "${DRY_RUN}" "${FORCE}" "${MARGIN}" "${DATASET}" "${DATASET_CONFIG}" "${SPLIT}" "${TEXT_FIELD}" "${OUT_OVERRIDE}" "${CONFIGS[@]}" <<'PYEOF'
+python3 - "${REPO_ROOT}" "${DRY_RUN}" "${FORCE}" "${MARGIN}" "${DATASET}" "${DATASET_CONFIG}" "${SPLIT}" "${TEXT_FIELD}" "${OUT_OVERRIDE}" "${BATCH_SIZE}" "${CONFIGS[@]}" <<'PYEOF'
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -165,7 +176,8 @@ dataset_config = sys.argv[6]
 split = sys.argv[7]
 text_field = sys.argv[8]
 out_override = sys.argv[9] or None
-config_paths = sys.argv[10:]
+batch_size = int(sys.argv[10])
+config_paths = sys.argv[11:]
 
 
 def load_budget(cfg_path: str):
@@ -270,20 +282,52 @@ def get_encoding(tokenizer_name: str):
         ) from exc
 
 
-def existing_token_count(path: Path, enc) -> int:
+def existing_token_count(path: Path, enc, batch_size: int) -> int:
     if not path.exists():
         return 0
     total = 0
+    texts = []
+
+    def flush():
+        nonlocal total
+        if not texts:
+            return
+        for ids in enc.encode_batch(texts, num_threads=os.cpu_count() or 4):
+            total += len(ids) + 1
+        texts.clear()
+
     with open(path) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
-                total += len(enc.encode(json.loads(line)["text"])) + 1
+                texts.append(json.loads(line)["text"])
             except (json.JSONDecodeError, KeyError):
                 continue
+            if len(texts) >= batch_size:
+                flush()
+    flush()
     return total
+
+
+def flush_batch(texts, out_f, enc, budget: int, tokens_so_far: int):
+    """Batch-tokenize `texts` in one tiktoken call (releases the GIL and uses
+    multiple threads internally -- an order of magnitude faster than calling
+    enc.encode() once per document in a Python loop), then write+count them
+    one at a time so we can still stop at the EXACT token budget rather than
+    overshooting by a whole batch."""
+    if not texts:
+        return tokens_so_far, 0, False
+    encoded = enc.encode_batch(texts, num_threads=os.cpu_count() or 4)
+    written = 0
+    for text, ids in zip(texts, encoded):
+        out_f.write(json.dumps({"text": text}) + "\n")
+        tokens_so_far += len(ids) + 1  # +1 for the EOS the trainer appends
+        written += 1
+        if tokens_so_far >= budget:
+            return tokens_so_far, written, True
+    return tokens_so_far, written, False
 
 
 for p in plans:
@@ -293,7 +337,7 @@ for p in plans:
     enc = get_encoding(p["tokenizer_name"])
 
     if not force:
-        have = existing_token_count(out_path, enc)
+        have = existing_token_count(out_path, enc, batch_size)
         if have >= p["budget"]:
             print(
                 f"[{Path(p['cfg_path']).name}] {out_path} already has "
@@ -319,23 +363,33 @@ for p in plans:
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
     tokens_written = 0
     docs_written = 0
+    hit_budget = False
+    buf = []
     with open(tmp_path, "w") as out_f:
         for example in ds:
             text = example.get(text_field)
             if not text:
                 continue
-            n_tokens = len(enc.encode(text)) + 1  # +1 for the EOS the trainer appends
-            out_f.write(json.dumps({"text": text}) + "\n")
-            tokens_written += n_tokens
-            docs_written += 1
-            if docs_written % 2000 == 0:
-                print(
-                    f"  ... {human(tokens_written)}/{human(p['budget'])} tokens "
-                    f"({docs_written} docs)",
-                    end="\r",
-                )
-            if tokens_written >= p["budget"]:
+            buf.append(text)
+            if len(buf) < batch_size:
+                continue
+            tokens_written, n, hit_budget = flush_batch(
+                buf, out_f, enc, p["budget"], tokens_written
+            )
+            docs_written += n
+            buf = []
+            print(
+                f"  ... {human(tokens_written)}/{human(p['budget'])} tokens "
+                f"({docs_written} docs)",
+                end="\r",
+            )
+            if hit_budget:
                 break
+        if not hit_budget and buf:
+            tokens_written, n, _ = flush_batch(
+                buf, out_f, enc, p["budget"], tokens_written
+            )
+            docs_written += n
 
     tmp_path.replace(out_path)
     print()

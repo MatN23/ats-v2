@@ -39,6 +39,20 @@
 #   --dataset-config C  HF dataset config/subset name. Default: sample-10BT
 #   --split NAME         HF dataset split. Default: train
 #   --text-field NAME     Field in the HF dataset containing raw text. Default: text
+#   --transfer MODE        auto (default) | shards | stream. 'shards' downloads whole
+#                           parquet files via huggingface_hub.hf_hub_download (uses HF's
+#                           accelerated Xet/hf_transfer transfer path, and lets a second
+#                           run skip shards it already has cached locally) and only reads
+#                           as many shards as needed to hit the budget. 'stream' is the
+#                           old row-by-row datasets streaming path -- much slower for
+#                           Xet-backed repos (small ranged HTTP reads instead of bulk
+#                           transfer), but works for datasets 'shards' can't resolve a
+#                           file list for. 'auto' tries shards, falls back to stream.
+#   --file-glob PATTERN     Override the glob used to find this dataset's parquet shards
+#                           in 'shards'/'auto' mode. Default guess: dataset-config values
+#                           of the form 'sample-10BT' -> 'sample/10BT/*.parquet' (fineweb's
+#                           convention); anything else falls back to 'stream' unless you
+#                           pass this explicitly.
 #   --margin FLOAT      Multiplier applied to the computed token budget. Default: 1.05
 #   --out PATH             Override the output .jsonl path (only valid with a single --config).
 #   --batch-size N          Docs tokenized per tiktoken encode_batch() call. Default: 512.
@@ -61,6 +75,8 @@ DATASET="HuggingFaceFW/fineweb-edu"
 DATASET_CONFIG="sample-10BT"
 SPLIT="train"
 TEXT_FIELD="text"
+TRANSFER="auto"
+FILE_GLOB=""
 MARGIN="1.05"
 OUT_OVERRIDE=""
 BATCH_SIZE=512
@@ -83,6 +99,8 @@ while [[ $# -gt 0 ]]; do
         --dataset-config)    DATASET_CONFIG="$2"; shift 2 ;;
         --split)              SPLIT="$2"; shift 2 ;;
         --text-field)          TEXT_FIELD="$2"; shift 2 ;;
+        --transfer)             TRANSFER="$2"; shift 2 ;;
+        --file-glob)             FILE_GLOB="$2"; shift 2 ;;
         --margin)               MARGIN="$2"; shift 2 ;;
         --out)                   OUT_OVERRIDE="$2"; shift 2 ;;
         --batch-size)             BATCH_SIZE="$2"; shift 2 ;;
@@ -107,6 +125,10 @@ if [[ -n "${OUT_OVERRIDE}" && ${#CONFIGS[@]} -ne 1 ]]; then
     echo "error: --out only makes sense with exactly one --config" >&2
     exit 1
 fi
+case "${TRANSFER}" in
+    auto|shards|stream) ;;
+    *) echo "error: --transfer must be one of: auto, shards, stream (got '${TRANSFER}')" >&2; exit 1 ;;
+esac
 
 if [[ "${ALL}" -eq 1 ]]; then
     while IFS= read -r -d '' f; do
@@ -117,13 +139,18 @@ fi
 command -v python3 >/dev/null 2>&1 || { echo "error: python3 is required" >&2; exit 1; }
 
 missing_deps() {
-    python3 - "${DRY_RUN}" <<'PYEOF'
+    python3 - "${DRY_RUN}" "${TRANSFER}" <<'PYEOF'
 import importlib
 import sys
 dry_run = sys.argv[1] == "1"
+transfer = sys.argv[2]
 needed = [("yaml", "pyyaml")]
 if not dry_run:
-    needed += [("tiktoken", "tiktoken"), ("datasets", "datasets")]
+    needed += [("tiktoken", "tiktoken")]
+    if transfer in ("auto", "shards"):
+        needed += [("huggingface_hub", "huggingface_hub"), ("pyarrow", "pyarrow")]
+    if transfer in ("auto", "stream"):
+        needed += [("datasets", "datasets")]
 missing = []
 for mod, pip_name in needed:
     try:
@@ -159,7 +186,7 @@ done
 # tokenization-aware stopping, resume/skip logic — happens in one Python
 # process per config so the token count used to decide "enough" is
 # computed with the exact same tokenizer the trainer will use.
-python3 - "${REPO_ROOT}" "${DRY_RUN}" "${FORCE}" "${MARGIN}" "${DATASET}" "${DATASET_CONFIG}" "${SPLIT}" "${TEXT_FIELD}" "${OUT_OVERRIDE}" "${BATCH_SIZE}" "${CONFIGS[@]}" <<'PYEOF'
+python3 - "${REPO_ROOT}" "${DRY_RUN}" "${FORCE}" "${MARGIN}" "${DATASET}" "${DATASET_CONFIG}" "${SPLIT}" "${TEXT_FIELD}" "${OUT_OVERRIDE}" "${BATCH_SIZE}" "${TRANSFER}" "${FILE_GLOB}" "${CONFIGS[@]}" <<'PYEOF'
 import json
 import os
 import sys
@@ -177,7 +204,9 @@ split = sys.argv[7]
 text_field = sys.argv[8]
 out_override = sys.argv[9] or None
 batch_size = int(sys.argv[10])
-config_paths = sys.argv[11:]
+transfer_mode = sys.argv[11]
+file_glob_override = sys.argv[12] or None
+config_paths = sys.argv[13:]
 
 
 def load_budget(cfg_path: str):
@@ -255,10 +284,10 @@ if dry_run:
     print("(dry run — nothing downloaded)")
     sys.exit(0)
 
-# Tokenizer + dataset imports are deferred until we know we're actually
-# downloading something, so --dry-run never requires tiktoken/datasets.
+# Tokenizer import is always needed once we're actually downloading;
+# huggingface_hub/pyarrow (shard mode) and datasets (stream mode) are
+# imported lazily below, only for the transfer path actually used.
 import tiktoken
-from datasets import load_dataset
 
 
 def get_encoding(tokenizer_name: str):
@@ -330,26 +359,100 @@ def flush_batch(texts, out_f, enc, budget: int, tokens_so_far: int):
     return tokens_so_far, written, False
 
 
-for p in plans:
-    out_path = Path(out_override) if out_override else repo_root / p["out_path"]
-    out_path = out_path if out_path.is_absolute() else repo_root / out_path
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    enc = get_encoding(p["tokenizer_name"])
+def guess_file_glob(dataset_config: str) -> str | None:
+    # Fineweb-family convention: config "sample-10BT" lives under the repo
+    # path "sample/10BT/*.parquet". Nothing more general is safe to guess.
+    if dataset_config.startswith("sample-"):
+        return f"sample/{dataset_config[len('sample-'):]}/*.parquet"
+    return None
 
-    if not force:
-        have = existing_token_count(out_path, enc, batch_size)
-        if have >= p["budget"]:
-            print(
-                f"[{Path(p['cfg_path']).name}] {out_path} already has "
-                f"{human(have)} tokens (need {human(p['budget'])}) — skipping. "
-                f"Use --force to re-download."
-            )
-            continue
 
-    print(
-        f"[{Path(p['cfg_path']).name}] downloading -> {out_path} "
-        f"(target {human(p['budget'])} tokens from {dataset_name}/{dataset_config})"
-    )
+def resolve_shard_files(dataset_name: str, file_glob: str):
+    """Lists this dataset repo's files (a single, cheap API call -- no data
+    transferred) and returns the ones matching file_glob, in a stable sorted
+    order (matters for resuming: later reruns should look at the same shards
+    first)."""
+    import fnmatch
+
+    from huggingface_hub import HfApi
+
+    all_files = HfApi().list_repo_files(repo_id=dataset_name, repo_type="dataset")
+    matches = sorted(f for f in all_files if fnmatch.fnmatch(f, file_glob))
+    return matches
+
+
+def process_shard_file(local_path, text_field, enc, batch_size, out_f, budget, tokens_so_far):
+    """Reads one already-downloaded parquet shard with column projection (only
+    the text column's pages are materialized, not the other ~8 metadata
+    columns fineweb-family datasets carry), then batch-tokenizes/writes/counts
+    exactly like the streaming path's flush_batch, stopping the instant the
+    budget is hit (possibly partway through this shard)."""
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(local_path, columns=[text_field])
+    texts_all = table.column(text_field).to_pylist()
+    del table
+
+    docs_written = 0
+    hit_budget = False
+    for i in range(0, len(texts_all), batch_size):
+        chunk = [t for t in texts_all[i : i + batch_size] if t]
+        tokens_so_far, n, hit_budget = flush_batch(chunk, out_f, enc, budget, tokens_so_far)
+        docs_written += n
+        if hit_budget:
+            break
+    return tokens_so_far, docs_written, hit_budget
+
+
+def download_via_shards(dataset_name, dataset_config, text_field, file_glob, enc,
+                         batch_size, out_f, budget, tag):
+    """Whole-file downloads via huggingface_hub.hf_hub_download instead of
+    datasets' row-by-row streaming. This matters specifically because
+    Xet/LFS-backed repos (fineweb-edu's parquet shards are Xet-backed) are
+    only served through HF's accelerated chunked/deduplicated transfer path
+    (and respect HF_HUB_ENABLE_HF_TRANSFER) when fetched as whole files --
+    datasets' streaming=True mode reads via small ranged HTTP requests over
+    fsspec instead, which doesn't use that fast path. Bonus: hf_hub_download
+    caches shards locally, so a second run (or a different config that reuses
+    the same dataset) skips the network entirely for shards already on disk.
+    Returns (tokens_written, docs_written, hit_budget) or raises on failure
+    so the caller can fall back to streaming mode.
+    """
+    from huggingface_hub import hf_hub_download
+
+    files = resolve_shard_files(dataset_name, file_glob)
+    if not files:
+        raise RuntimeError(
+            f"no files in {dataset_name} matched glob {file_glob!r} "
+            f"(dataset repo layout may differ from the fineweb convention "
+            f"this guess is based on -- pass --file-glob explicitly)"
+        )
+    print(f"[{tag}] shard mode: {len(files)} candidate shard(s) matching {file_glob!r}")
+
+    tokens_written = 0
+    docs_written = 0
+    for i, filename in enumerate(files):
+        print(f"[{tag}] fetching shard {i + 1}/{len(files)}: {filename}")
+        local_path = hf_hub_download(
+            repo_id=dataset_name, filename=filename, repo_type="dataset"
+        )
+        tokens_written, n, hit_budget = process_shard_file(
+            local_path, text_field, enc, batch_size, out_f, budget, tokens_written
+        )
+        docs_written += n
+        print(
+            f"[{tag}]   ... {human(tokens_written)}/{human(budget)} tokens "
+            f"({docs_written} docs so far)"
+        )
+        if hit_budget:
+            return tokens_written, docs_written, True
+    return tokens_written, docs_written, False
+
+
+def download_via_stream(dataset_name, dataset_config, split, text_field, enc,
+                         batch_size, out_f, budget, tag):
+    from datasets import load_dataset
+
     try:
         ds = load_dataset(dataset_name, dataset_config, split=split, streaming=True)
     except Exception as exc:
@@ -360,42 +463,100 @@ for p in plans:
             f"`huggingface-cli login` has been run."
         ) from exc
 
-    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
     tokens_written = 0
     docs_written = 0
     hit_budget = False
     buf = []
-    with open(tmp_path, "w") as out_f:
-        for example in ds:
-            text = example.get(text_field)
-            if not text:
-                continue
-            buf.append(text)
-            if len(buf) < batch_size:
-                continue
-            tokens_written, n, hit_budget = flush_batch(
-                buf, out_f, enc, p["budget"], tokens_written
-            )
-            docs_written += n
-            buf = []
+    for example in ds:
+        text = example.get(text_field)
+        if not text:
+            continue
+        buf.append(text)
+        if len(buf) < batch_size:
+            continue
+        tokens_written, n, hit_budget = flush_batch(buf, out_f, enc, budget, tokens_written)
+        docs_written += n
+        buf = []
+        print(
+            f"[{tag}]   ... {human(tokens_written)}/{human(budget)} tokens "
+            f"({docs_written} docs)",
+            end="\r",
+        )
+        if hit_budget:
+            break
+    if not hit_budget and buf:
+        tokens_written, n, _ = flush_batch(buf, out_f, enc, budget, tokens_written)
+        docs_written += n
+    print()
+    return tokens_written, docs_written, hit_budget
+
+
+for p in plans:
+    out_path = Path(out_override) if out_override else repo_root / p["out_path"]
+    out_path = out_path if out_path.is_absolute() else repo_root / out_path
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    enc = get_encoding(p["tokenizer_name"])
+    tag = Path(p["cfg_path"]).name
+
+    if not force:
+        have = existing_token_count(out_path, enc, batch_size)
+        if have >= p["budget"]:
             print(
-                f"  ... {human(tokens_written)}/{human(p['budget'])} tokens "
-                f"({docs_written} docs)",
-                end="\r",
+                f"[{tag}] {out_path} already has {human(have)} tokens "
+                f"(need {human(p['budget'])}) — skipping. Use --force to "
+                f"re-download."
             )
-            if hit_budget:
-                break
-        if not hit_budget and buf:
-            tokens_written, n, _ = flush_batch(
-                buf, out_f, enc, p["budget"], tokens_written
+            continue
+
+    print(
+        f"[{tag}] downloading -> {out_path} (target {human(p['budget'])} "
+        f"tokens from {dataset_name}/{dataset_config})"
+    )
+
+    file_glob = file_glob_override or guess_file_glob(dataset_config)
+    use_shards = transfer_mode == "shards" or (transfer_mode == "auto" and file_glob)
+    if transfer_mode == "shards" and not file_glob:
+        raise SystemExit(
+            "--transfer shards requires a resolvable shard glob; pass "
+            "--file-glob explicitly for this dataset/config."
+        )
+
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    with open(tmp_path, "w") as out_f:
+        if use_shards:
+            try:
+                tokens_written, docs_written, hit_budget = download_via_shards(
+                    dataset_name, dataset_config, text_field, file_glob, enc,
+                    batch_size, out_f, p["budget"], tag,
+                )
+            except Exception as exc:
+                if transfer_mode == "shards":
+                    raise SystemExit(
+                        f"[{tag}] shard download failed: {exc}\n"
+                        f"(--transfer shards was explicit, so not falling "
+                        f"back to streaming -- rerun with --transfer auto "
+                        f"to allow that, or fix --file-glob/--dataset-config.)"
+                    ) from exc
+                print(
+                    f"[{tag}] shard mode failed ({exc}); falling back to "
+                    f"row-by-row streaming."
+                )
+                out_f.seek(0)
+                out_f.truncate()
+                tokens_written, docs_written, hit_budget = download_via_stream(
+                    dataset_name, dataset_config, split, text_field, enc,
+                    batch_size, out_f, p["budget"], tag,
+                )
+        else:
+            tokens_written, docs_written, hit_budget = download_via_stream(
+                dataset_name, dataset_config, split, text_field, enc,
+                batch_size, out_f, p["budget"], tag,
             )
-            docs_written += n
 
     tmp_path.replace(out_path)
-    print()
     print(
-        f"[{Path(p['cfg_path']).name}] done: {docs_written} docs, "
-        f"{human(tokens_written)} tokens -> {out_path}"
+        f"[{tag}] done: {docs_written} docs, {human(tokens_written)} tokens "
+        f"-> {out_path}"
     )
     if tokens_written < p["budget"]:
         print(

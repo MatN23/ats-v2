@@ -56,9 +56,11 @@ if grad_norm is not None:
 else:
     # rare fallback only (e.g. gradient_clipping disabled, or a
     # non-DeepSpeed test double) — not on the hot path for real runs
-    grad_norm = float(torch.nn.utils.clip_grad_norm_(
-        self.model_engine.parameters(), max_norm=float("inf")
-    ))
+    grad_norm = float(
++        torch.nn.utils.clip_grad_norm_(
++            self.model_engine.parameters(), max_norm=float("inf")
++        )
++    )
 ```
 
 ### Fix 3 — Memory profiling gated behind `log_every`

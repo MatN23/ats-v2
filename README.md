@@ -7,27 +7,35 @@ for standard runs.
 
 This is a research project for small teams. It is not an alternative to
 LLM Foundry, NeMo, or Megatron-LM, and does not target their scale or
-hardware-fleet regime (see "Scale limitations" below).
+hardware-fleet regime (see [Scale limitations](#scale-limitations-what-this-framework-does-and-doesnt-do-for-memory)).
 
 ## Status
 
-- **CI:** green on `main` — `ruff check`, `ruff format --check`, `mypy`, and
-  `pytest` (Python 3.10–3.12) all pass.
-- **Trained end-to-end on Colab GPU runtimes:** dense, SWA, MLA, MTP, and
-  diffusion (`--model-type diffusion`) have each completed successful
-  training runs.
-- **Not yet trained/verified on any GPU:** MoE, MoD, and Mamba. The code
-  passes review and unit tests, but nobody has run an actual training loop
-  through these architectures yet. Treat them as less trustworthy than the
-  five modes above until someone does.
-- **Triton kernels (`ats/model/*_triton.py`): status unconfirmed.** A Colab
-  run used a GPU with the `[triton]` extra installed, but there's no
-  Triton-specific log (compile/autotune output) confirming the kernels
-  actually executed rather than silently falling back to the tested
-  PyTorch path — which every kernel here does automatically, with no
-  warning, if Triton isn't available or errors. Don't take "trained
-  successfully on a GPU with Triton installed" as proof the Triton code
-  itself ran; see [Known limitations](#known-limitations) for how to check.
+This is the single source of truth for what has and hasn't actually been run.
+Every other mention of a feature's status elsewhere in this file points back
+here rather than repeating it.
+
+**CI:** green on `main` — `ruff check`, `ruff format --check`, `mypy`, and
+`pytest` (Python 3.10–3.12) all pass.
+
+| Feature | Status |
+|---|---|
+| Dense, SWA, MLA, MTP, diffusion (`--model-type diffusion`) | **Trained end-to-end on Colab GPU runtimes** — each has completed a real training run |
+| MoE, MoD, Mamba | Passes code review and unit tests. **Not yet trained/verified on any GPU.** Treat as less trustworthy than the row above until someone runs it |
+| Population Based Training (`ats-breed`) | Covered by 35 passing unit tests (`tests/test_pbt.py`, `tests/test_cli_breeding.py`). No end-to-end GPU run recorded either way |
+| Triton kernels (`ats/model/*_triton.py`) | **Status unconfirmed.** A Colab run used a GPU with the `[triton]` extra installed, but there's no Triton-specific log (compile/autotune output) confirming the kernels actually executed rather than silently falling back to the tested PyTorch path — which every kernel here does automatically, with no warning, if Triton isn't available or errors. Don't take "trained successfully with Triton installed" as proof the Triton code ran; see [Known limitations](#known-limitations) for how to check yourself |
+| 8-bit Adam (`--optimizer-bits 8`) | CLI/config plumbing and the DeepSpeed client-optimizer wiring verified by code review; `bitsandbytes` itself not installed in the environment this was reviewed in, so the actual 8-bit optimizer math hasn't been run |
+| Selective activation checkpointing (`--checkpoint-every-n-layers`) | Verified directly: fires exactly on layers where `layer_idx % n == 0`, and not at all when disabled or during incremental decoding (`use_cache=True`) |
+| Mamba's chunked parallel scan | Verified numerically against a sequential-loop reference (exact match at float64; ~1e-7 relative error in float32 at realistic scale) — a correctness property checkable through arithmetic alone, independent of the "not yet trained" status above |
+| `preprocess.py`'s streaming-to-disk | Verified with a 20,000-document scale test showing flat peak memory regardless of corpus size |
+| `ats/cli/finetune.py` (LoRA) | Run end-to-end against a tiny model with a stubbed DeepSpeed engine: checkpoint load → LoRA injection → training loop → adapter save → merge → HuggingFace export. **Not** run against a real multi-GPU DeepSpeed engine or a non-trivial model size |
+| `ats/cli/align.py` | Placeholder — parses arguments and prints "not implemented"; does not train anything |
+
+The "verified" rows above (8-bit Adam plumbing, selective checkpointing, the
+Mamba scan math, `preprocess.py` streaming) were checked by code review
+and/or standalone logic tests without a GPU, `deepspeed`, or PyPI access —
+narrower than an end-to-end `ats-train` run, which is why each is called out
+individually instead of folded into a blanket "everything works" claim.
 
 ## Installation
 
@@ -37,8 +45,10 @@ pip install -e .
 
 Installs ats-v2 (via `pyproject.toml`) and its dependencies (torch,
 deepspeed, pydantic, tiktoken, transformers, safetensors, etc — see
-`requirements.txt` for exact pins), plus five console scripts:
-`ats-train`, `ats-eval`, `ats-export`, `ats-doctor`, `ats-finetune`, and the
+`requirements.txt` for exact pins), plus seven console scripts:
+`ats-train`, `ats-eval`, `ats-export`, `ats-doctor`, `ats-finetune`,
+`ats-breed` (Population Based Training — see
+[Population Based Training (`ats-breed`)](#population-based-training-ats-breed)), and the
 not-yet-implemented `ats-align` placeholder. Optional extras:
 `pip install -e ".[eval]"` for lm-evaluation-harness,
 `pip install -e ".[triton]"` for the Triton kernels (GPU only),
@@ -51,6 +61,23 @@ Check your environment before training:
 ats-doctor
 ats-doctor --config configs/7b.yaml   # also estimates memory for that config
 ```
+
+## CLI reference
+
+Every file under `ats/cli/`, what it does, and where to read more. Purposes
+below are drawn directly from each file's own module docstring, not
+inferred from its name.
+
+| Module | Console script | Purpose |
+|---|---|---|
+| `ats.cli.train` | `ats-train` | Trains a model from a YAML config; every architecture/hyperparameter flag is described in [Training](#training) |
+| `ats.cli.evaluate` | `ats-eval` | Benchmark tasks via lm-evaluation-harness (`--tasks`), or perplexity on your own data (`--config`) — see [Evaluate](#evaluate) |
+| `ats.cli.export` | `ats-export` | Exports a checkpoint to HuggingFace format — see [Export to HuggingFace](#export-to-huggingface) |
+| `ats.cli.doctor` | `ats-doctor` | Environment diagnostic: Python/PyTorch/CUDA/DeepSpeed/Flash-Attention/Triton versions and GPU count/memory, plus (with `--config`) an estimated memory report for that config. Every line comes from actually importing/inspecting the relevant package or device, not a hardcoded string |
+| `ats.cli.finetune` | `ats-finetune` | LoRA fine-tunes a checkpoint via `peft` — see [LoRA fine-tuning](#lora-fine-tuning) |
+| `ats.cli.breed` | `ats-breed` | Population Based Training — see [Population Based Training (`ats-breed`)](#population-based-training-ats-breed) |
+| `ats.cli.align` | `ats-align` | Placeholder for RLHF/DPO-style alignment. **Not implemented** — running it prints exactly what's missing and exits non-zero, rather than silently no-op'ing |
+| `ats.cli.test_modes` | *(none — run via `python -m ats.cli.test_modes [--steps 50] [--mode moe]`)* | Architecture *training* smoke test, distinct from `pytest tests/` (which unit-tests components like attention variants or MoE routing in isolation). For each of `dense, swa, mla, mamba, moe, mod, mtp, all`, builds a real ~1M-parameter `ATSTransformer` with that mode's flags actually enabled, runs 50 real optimizer steps (real forward/backward/AdamW step, synthetic random token data, no DeepSpeed, no mocks), and checks: finite loss every step, finite gradients every step, parameters actually moved by the end, and that the claimed feature is actually present in the constructed module graph. Answers "can this whole architecture configuration train end-to-end", which nothing else in the repo answers directly |
 
 ## Quickstart: train a tiny debug model in 3 commands
 
@@ -104,7 +131,21 @@ dataset runs out before the budget is reached. Run
 `--dataset-config`, `--split`, `--text-field`, `--transfer`, `--file-glob`,
 `--batch-size`, `--margin`, `--out`).
 
-## Train a real-sized model
+## Scripts reference
+
+Everything under `scripts/`, verified against each file's own header
+comment/docstring:
+
+| Script | Purpose |
+|---|---|
+| `scripts/download_data.sh` | Downloads exactly the token budget a config needs from a HuggingFace dataset — see [Downloading training data](#downloading-training-data) above |
+| `scripts/launch.sh` | Thin wrapper around `torchrun` for single- or multi-node launches of `ats.cli.train`. Reads `NUM_NODES`, `GPUS_PER_NODE`, `MASTER_ADDR`, `MASTER_PORT`, `JOB_ID` env vars (all optional; default to single-node/single-process values) to build the `torchrun` rendezvous flags, then passes every other argument straight through to `ats.cli.train` — see [Multi-GPU with DeepSpeed](#multi-gpu-with-deepspeed) below |
+| `scripts/slurm_submit.sh` | SLURM batch-job template — submit with `sbatch scripts/slurm_submit.sh`. Ships with `#SBATCH` directives for 2 nodes × 8 GPUs × 24h (edit for your job), derives `MASTER_ADDR`/`NUM_NODES`/`JOB_ID` from SLURM's own environment variables, and calls `scripts/launch.sh` via `srun`. The `ats-train` arguments hardcoded at the bottom of the file (`--config configs/7b.yaml --use-moe --use-mla` by default) are meant to be edited per job, not used as-is |
+| `scripts/verify.py` | Run via `python scripts/verify.py`. A three-stage sanity check, in order, stopping at the first failure: (1) imports every module under `ats/`, catching import-time errors, circular imports, or syntax errors that slipped past review; (2) instantiates the major model classes with small dummy inputs and runs a real forward + backward pass, exercising actual model code rather than just checking classes exist; (3) runs `pytest tests/` as a subprocess. Prints `ALL CHECKS PASSED` and exits 0 if everything succeeds, or `FAILURES DETECTED` with the specific failures and exits 1 otherwise — every step's real exception (or pytest's real exit code) determines the result, nothing is swallowed to look green |
+
+## Training
+
+### A real-sized model
 
 ```bash
 python -m ats.cli.train --config configs/1b.yaml
@@ -127,6 +168,9 @@ python -m ats.cli.train --config configs/debug.yaml --use-mamba --mamba-every-n-
 python -m ats.cli.train --config configs/debug.yaml --model-type diffusion
 ```
 
+See [Status](#status) above for which of these have actually completed a
+real training run.
+
 `--architecture {dense,swa,mla,mamba,moe,mod,mtp,all}` is a convenience
 preset that flips several `--use-x` flags at once; any individual
 `--use-x`/`--no-use-x` you also pass on the same command line overrides the
@@ -141,7 +185,7 @@ Numeric architecture fields, model-size fields, training hyperparameters,
 data settings, and parallelism settings are all separately overridable; run
 `python -m ats.cli.train --help` for the full flag list.
 
-## Multi-GPU example with DeepSpeed
+### Multi-GPU with DeepSpeed
 
 ```bash
 deepspeed --num_gpus 8 -m ats.cli.train --config configs/7b.yaml
@@ -161,12 +205,12 @@ NUM_NODES=1 GPUS_PER_NODE=8 scripts/launch.sh --config configs/7b.yaml --use-moe
 sbatch scripts/slurm_submit.sh
 ```
 
-## Memory-saving flags: 8-bit optimizer and selective checkpointing
+### Memory-saving flags: 8-bit optimizer and selective checkpointing
 
 ```bash
 # bitsandbytes 8-bit Adam instead of fp32 AdamW: ~4x less optimizer-state
 # memory, at a small numerical precision cost. Requires `pip install
-# bitsandbytes` (or the `[8bit]` extra).
+# bitsandbytes` (or the `[8bit]` extra). See Status above for verification level.
 python -m ats.cli.train --config configs/7b.yaml --optimizer-bits 8
 
 # Activation checkpointing every Nth layer instead of every layer: trades
@@ -182,8 +226,87 @@ replaces the old boolean `--gradient-checkpointing` flag (still accepted as a
 deprecated alias: `true`/unset maps to `1`/disabled). `ats-doctor --config`'s
 memory estimate reflects both: 8-bit Adam roughly quarters the reported
 optimizer-state memory, and the activation-memory reduction from
-checkpointing scales down from ~3x at `checkpoint_every_n_layers=1` toward 1x
-(no reduction) as `n` grows, since fewer layers get recomputed.
+checkpointing follows the `reduction_factor = 1 + 2 / checkpoint_every_n_layers`
+heuristic in `ats/utils/memory.py` — see
+[Scale limitations](#scale-limitations-what-this-framework-does-and-doesnt-do-for-memory)
+for exactly what that formula does and doesn't guarantee.
+
+### MoE training example
+
+```bash
+python -m ats.cli.train --config configs/7b.yaml --use-moe --moe-num-experts 8 --moe-top-k 2
+```
+
+See [Status](#status) — MoE has not yet been trained end-to-end on real
+hardware; treat a real run through this as the first verification of it.
+
+### Checkpoint resume example
+
+```bash
+python -m ats.cli.train --config configs/1b.yaml --resume checkpoints/1b/step_5000
+```
+
+Resuming verifies the checkpoint's config hash matches the current config and
+restores RNG state, optimizer state, and global step (`ats/training/checkpoint.py`).
+
+### Population Based Training (`ats-breed`)
+
+```bash
+python -m ats.cli.breed --config configs/debug.yaml \
+    --population-size 10 --generations 5 --steps-per-generation 100 \
+    --cull-fraction 0.5 --output-dir ./pbt_runs
+```
+
+Trains `population_size` independent copies of the model side by side.
+After every `steps_per_generation` steps, each member is evaluated on its
+own held-out data (`config.data.sources`), the bottom `cull_fraction` are
+culled, and each culled member's weights + a perturbed copy of a surviving
+winner's hyperparameters take its place. By default this perturbs
+`training.learning_rate`, `training.weight_decay`, and `model.dropout` —
+not architecture fields, since perturbing those would break the
+weights-only transplant between population members (mismatched parameter
+shapes). See `ats/pbt/orchestrator.py`'s module docstring for the full
+mechanics.
+
+**Cost warning:** total compute is roughly `population_size` times a single
+run of the same step count — only point this at small configs
+(`debug.yaml`, `125m.yaml`, `350m.yaml`, ...) unless you deliberately want
+to multiply an already-large job by `population_size`. This CLI does not
+support resuming an interrupted breeding run across process restarts (a
+fresh call always starts a new population at generation 0); each member's
+own per-generation training does still checkpoint normally under
+`--output-dir`. See [Status](#status) for verification level.
+
+### Mamba / MTP / diffusion / quantization
+
+```bash
+# Replace every 4th block with a Mamba selective-SSM block (pure PyTorch, no custom CUDA):
+python -m ats.cli.train --config configs/7b.yaml --use-mamba --mamba-every-n-layers 4
+
+# Predict 3 future tokens in parallel instead of 1:
+python -m ats.cli.train --config configs/7b.yaml --use-mtp --mtp-num-tokens 3
+
+# Train a diffusion LM (cosine noise schedule, MSE noise-prediction objective,
+# DDIM sampling) instead of an autoregressive one:
+python -m ats.cli.train --config configs/debug.yaml --model-type diffusion
+
+# int8 quantization-aware training via torch.ao fake-quantization:
+python -m ats.cli.train --config configs/7b.yaml --quantization int8
+```
+
+See [Status](#status) for which of these have completed a real training run.
+
+`--quantization fp8` requires `torchao` (`pip install torchao`) — it's the
+only backend `ats/model/quantization.py::QuantizedLinear` actually
+integrates with. If `transformer_engine` is installed instead, it raises a
+clear `ImportError` rather than silently training at full precision while
+appearing to use fp8: `transformer_engine`'s `fp8_autocast()` only affects
+`transformer_engine.pytorch`'s own modules, not a plain `nn.Linear`, so
+wrapping this class's forward pass in it would do nothing. `QuantizedLinear`
+is exposed as a standalone building block but is **not** automatically
+substituted for every `nn.Linear` in the backbone (attention, FFN, MoE
+experts) — that wiring is a larger change than this revision includes;
+today it's available for callers to use directly.
 
 ## Offline preprocessing
 
@@ -202,26 +325,6 @@ corpora of short documents. Point `data.sources[*].path` at the resulting
 sources automatically and reads them via `numpy.memmap`, with no
 on-the-fly tokenization.
 
-## MoE training example
-
-```bash
-python -m ats.cli.train --config configs/7b.yaml --use-moe --moe-num-experts 8 --moe-top-k 2
-```
-
-> MoE has not yet been trained end-to-end on real hardware (see
-> [Status](#status)) — the CLI/config path works and is unit-tested, but
-> treat a real run through this as the first verification of it, not a
-> repeat of one that's already happened.
-
-## Checkpoint resume example
-
-```bash
-python -m ats.cli.train --config configs/1b.yaml --resume checkpoints/1b/step_5000
-```
-
-Resuming verifies the checkpoint's config hash matches the current config and
-restores RNG state, optimizer state, and global step.
-
 ## Evaluate
 
 Standard benchmarks (MMLU, HellaSwag, ARC, ...) are delegated to
@@ -237,7 +340,7 @@ python -m ats.cli.evaluate --checkpoint checkpoints/1b/step_5000 --tasks mmlu,he
 
 This mode requires `pip install lm-eval` (or the `[eval]` extra) and only
 works for dense/SWA autoregressive checkpoints, since only those export to
-HuggingFace format at all.
+HuggingFace format at all (see [Export to HuggingFace](#export-to-huggingface)).
 
 For perplexity on your own held-out data (`data.sources` in a config) instead
 of a standard benchmark — including for MoE/MoD/MLA/Mamba/diffusion
@@ -273,6 +376,14 @@ Defaults come from a config's `peft:` block (`enabled`, `lora_r`,
 `lora_alpha`, `lora_dropout`, `target_modules`); the CLI flags above override
 it the same way `ats-train`'s `--use-moe`-style flags override `model:`.
 
+One rough edge, worked around rather than fixed at the root: `peft`'s
+`merge_and_unload()` runs a tied-embeddings check that expects `model.config`
+to be a dict-like HuggingFace `PretrainedConfig` (`model_config.get(...)`),
+which ats-v2's own `ModelConfig` (a Pydantic model, no `.get()`) doesn't
+satisfy. `ats/cli/finetune.py` temporarily swaps in a two-key dict shim
+around that one call and restores the real config immediately after, rather
+than changing `ATSTransformer.config`'s type everywhere else it's used.
+
 ## Export to HuggingFace
 
 ```bash
@@ -291,35 +402,6 @@ HuggingFace `Llama` equivalent.
 pytest tests/
 ```
 
-## Mamba / MTP / diffusion / quantization
-
-```bash
-# Replace every 4th block with a Mamba selective-SSM block (pure PyTorch, no custom CUDA):
-# NOTE: Mamba has not yet completed a real training run (see Status above) —
-# the scan math is verified numerically against a sequential reference, but
-# that's not the same as this path having actually been trained.
-python -m ats.cli.train --config configs/7b.yaml --use-mamba --mamba-every-n-layers 4
-
-# Predict 3 future tokens in parallel instead of 1:
-python -m ats.cli.train --config configs/7b.yaml --use-mtp --mtp-num-tokens 3
-
-# Train a diffusion LM (cosine noise schedule, MSE noise-prediction objective,
-# DDIM sampling) instead of an autoregressive one:
-python -m ats.cli.train --config configs/debug.yaml --model-type diffusion
-
-# int8 quantization-aware training via torch.ao fake-quantization:
-python -m ats.cli.train --config configs/7b.yaml --quantization int8
-```
-
-`--quantization fp8` requires `transformer-engine` or `torchao` to be
-installed; if neither is present it raises `ImportError` immediately rather
-than silently training in bf16, per this project's design principles.
-`ats/model/quantization.py::QuantizedLinear` is exposed as a building block
-but is not yet automatically substituted for every `nn.Linear` in the
-backbone — wiring that through every module (attention, FFN, MoE experts) is
-a larger change than this revision includes; today it's available for
-callers to use directly.
-
 ## Scale limitations: what this framework does and doesn't do for memory
 
 **ats-v2 targets dense/MoE models up to roughly 14B parameters on ZeRO-3
@@ -330,17 +412,17 @@ rather than letting the feature names imply more than they deliver:
 | Technique | In ats-v2? | Training memory impact | Why |
 |---|---|---|---|
 | ZeRO-3 | Yes | High | Shards params + optimizer + gradients across GPUs |
-| Gradient checkpointing | Yes | High (~2-4x) | Real, but see the caveat below |
+| Gradient checkpointing | Yes | High (see formula below) | Real, but see the caveat below |
 | Flash Attention | Yes (falls back to SDPA) | Medium | Saves activation memory vs. standard attention |
 | Sequence packing | Yes | Low-Medium | Only for preprocessed `.bin` data |
+| 8-bit Adam (bitsandbytes) | Yes (`--optimizer-bits 8`) | High (~4x less optimizer-state memory) | See [Status](#status) for verification level |
 | **Mixture-of-Depths (MoD)** | Yes | **None** | The gate is applied *after* the block computes on every token — see below |
 | **Sliding Window Attention (SWA)** | Yes | **None** | Full Q/K/V are still materialized for the whole sequence during training; SWA only shrinks the *inference* KV cache |
 | **Int8 quantization** | Yes | **None** | `torch.ao`'s fake-quantization keeps weights in bf16/fp16 throughout; it simulates QAT numerics, it doesn't reduce memory |
-| **FP8 quantization** | Yes | High, if used | `QuantizedLinear` is wired into attention/FFN/MoE-expert/MLA projections (see `model.quantization` in configs) but requires `transformer-engine` or `torchao` installed |
+| **FP8 quantization** | `QuantizedLinear` exists (torchao backend only) | **None, as shipped** | Not wired into attention/FFN/MoE/MLA by default — see [Quantization](#mamba--mtp--diffusion--quantization) above |
 | Mamba (chunked scan) | Yes | N/A (speed, not memory) | O(seq_len/chunk_size) sequential steps, not O(seq_len) — see below |
 | Tensor Parallelism | **No** | Critical for 70B | Not implemented — see below |
 | Pipeline Parallelism | **No** | Critical for 70B | Not implemented — see below |
-| 8-bit optimizers (bitsandbytes) | **No** | High | Not implemented |
 | ZeRO-Offload (CPU offload) | **No** | High | Not implemented |
 
 **MoD in detail:** `ats/model/mod.py`'s gate decides which tokens' outputs
@@ -355,14 +437,13 @@ non-trivially with gradient checkpointing and DeepSpeed's ZeRO sharding;
 that rewrite isn't attempted here rather than risk an under-tested version
 of it.
 
-**Selective checkpointing formula:** `ats/utils/memory.py`'s pre-flight
-estimator uses a `reduction_factor = 1 + 2 / checkpoint_every_n_layers`
-heuristic for activation memory: `checkpoint_every_n_layers=1` (checkpoint
-every layer) gives the same constant ~3x reduction the old boolean
-`gradient_checkpointing=True` flag used, based on commonly-reported
-practical figures for full (every-layer) checkpointing — not a precise
-theoretical bound. `checkpoint_every_n_layers > 1` (checkpoint every Nth
-layer) scales that reduction down toward 1x (no savings) as `n` grows, since
+**Gradient checkpointing formula:** `ats/utils/memory.py`'s pre-flight
+estimator uses `reduction_factor = 1 + 2 / checkpoint_every_n_layers` for
+activation memory: `checkpoint_every_n_layers=1` (checkpoint every layer)
+gives a 3x reduction, based on commonly-reported practical figures for
+full (every-layer) checkpointing — not a precise theoretical bound.
+`checkpoint_every_n_layers > 1` (checkpoint every Nth layer) scales that
+reduction down toward 1x (no savings) as `n` grows, since
 DeepSpeed/`torch.utils.checkpoint` only trades recompute for memory on the
 layers actually checkpointed. This is still a simple heuristic, not the
 theoretical O(sqrt(num_layers)) bound from Chen et al. 2016 (that bound
@@ -382,59 +463,30 @@ for the sub-~14B regime where ZeRO-3 is sufficient on its own. Models larger
 than that are intended to be handled by a separate wrapper (planned, not
 part of this repository) that would plug into ats-v2's config/checkpoint/
 data interfaces rather than ats-v2 reimplementing Megatron-style 3D
-parallelism itself. Unlike the Mamba scan or the memory-formula fix above —
-both correctness properties that could be verified through careful numerical
-reasoning without a GPU — tensor/pipeline parallelism's correctness
-fundamentally depends on real multi-GPU collective communication (NCCL
-all-reduce/all-gather/scatter across process groups, pipeline bubble
-scheduling). There's no way to establish confidence in that kind of
-implementation through arithmetic verification the way the fixes above were
-checked; attempting it without hardware to actually run it on would trade a
-disclosed gap for undisclosed, hard-to-detect correctness bugs in
-distributed training, which is a worse outcome. Given you've already said
-you're building this as a separate Megatron-based wrapper, that's also the
-right place for it.
-
-**Int8 "quantization-aware training" not saving training memory is by
-design, not an unfinished fix:** `QuantizedLinear`'s int8 path
-(`torch.ao.quantization.FakeQuantize`) exists specifically to simulate int8
-rounding numerics during training via a straight-through estimator, while
-keeping weights in bf16/fp16 so gradients can flow — that's what QAT means.
-Making int8 training actually reduce memory would mean a different
-technique entirely (storing and updating genuinely low-precision weights
-with specialized gradient handling, e.g. what dedicated 8-bit-optimizer
-libraries implement), not a bug fix to the QAT path that's already here. A
-separate, genuinely memory-reducing feature — post-training quantization for
-*inference* (storing real int8 weights in an exported checkpoint, no
-training involved) — is not implemented and would be a reasonable, lower-risk
-addition if useful; it's a different feature from what `model.quantization`
-currently does.
+parallelism itself. Unlike the Mamba scan or the gradient-checkpointing
+formula above — both correctness properties that could be verified through
+careful numerical reasoning without a GPU — tensor/pipeline parallelism's
+correctness fundamentally depends on real multi-GPU collective
+communication (NCCL all-reduce/all-gather/scatter across process groups,
+pipeline bubble scheduling). There's no way to establish confidence in that
+kind of implementation through arithmetic verification the way the fixes
+above were checked; attempting it without hardware to actually run it on
+would trade a disclosed gap for undisclosed, hard-to-detect correctness bugs
+in distributed training, which is a worse outcome.
 
 **Mamba uses a chunked parallel scan, not a Python loop over every
 timestep:** `ats/model/mamba.py`'s selective scan solves the recurrence in
 chunks of `mamba_chunk_size` (default 32) positions via a batched matmul
 against a log-space lower-triangular decay matrix, dropping sequential
 Python-level steps from O(seq_len) to O(seq_len / chunk_size). This is
-mathematically exact (not an approximation) — verified numerically against
-a plain sequential-loop reference at both small scale (exact match to
-float64 precision) and realistic scale (seq_len=4096, extreme decay-rate
-range, ~1e-7 relative error in float32) before being written, and the
-shipped code has its own regression test comparing against a sequential
-reference built from the same intermediate tensors. `chunk_size` trades
-memory for speed: the per-chunk decay tensor is
-`[batch, chunk_size, chunk_size, d_inner, d_state]`, so larger chunks mean
-fewer sequential steps but quadratically more peak memory per chunk —
-reduce `mamba_chunk_size` if you hit OOM specifically on this tensor.
-Mamba layers still don't support KV-cache-based incremental decoding (see
-Known limitations below) — that's a separate, unrelated limitation from the
-scan algorithm.
-
-**`preprocess.py` streams directly to disk** (writes and discards each
-block as it's produced) rather than accumulating the tokenized corpus in
-memory — verified with a 20,000-document scale test showing flat peak
-memory regardless of corpus size. It still tokenizes with a single Python
-process, so very large corpora will be throughput-bound by that, but won't
-run out of RAM.
+mathematically exact (not an approximation) — see [Status](#status) for how
+it was verified. `chunk_size` trades memory for speed: the per-chunk decay
+tensor is `[batch, chunk_size, chunk_size, d_inner, d_state]`, so larger
+chunks mean fewer sequential steps but quadratically more peak memory per
+chunk — reduce `mamba_chunk_size` if you hit OOM specifically on this
+tensor. Mamba layers still don't support KV-cache-based incremental
+decoding (see [Known limitations](#known-limitations)) — that's a separate,
+unrelated limitation from the scan algorithm.
 
 ## Known limitations
 
@@ -445,56 +497,25 @@ run out of RAM.
 - **MoE/MoD/MLA/Mamba/diffusion models cannot be exported to HuggingFace
   format** — `ats/export/huggingface.py` raises a clear `ConfigError` for
   each rather than emitting a checkpoint that would silently load with the
-  wrong architecture. Only dense and SWA models (both Llama/Mistral-family
-  compatible) export today, which also means `ats-eval`'s lm-eval-harness
-  path only works for those architectures; use `--config` (perplexity mode)
-  for the others.
-- **Triton kernels (`ats/model/*_triton.py`) status is unconfirmed, not
-  confirmed-working.** Each one is gated behind `HAS_TRITON` and falls back
-  silently (no warning) to a plain PyTorch implementation that *is* tested —
-  a real safety net, but one that also means a training run completing
-  successfully on a GPU with Triton installed proves nothing about whether
-  the Triton code actually ran. If you want to check on your own GPU:
-  temporarily force the `HAS_TRITON` gate to skip the fallback (so a broken
-  kernel raises instead of silently substituting) and confirm training
-  still runs, or add a print/log inside the Triton branch and check it fires.
-  Two of the four (MoE routing dispatch, MLA KV decompression) are also only
-  *partially* fused, by design — see the docstring in each file for exactly
-  what is and isn't fused, rather than taking "Triton kernel" to mean the
-  whole pipeline is.
-- `ats/cli/align.py` is placeholder structure — it parses arguments and
-  prints a clear "not implemented" message, it does not train anything.
-  `ats/cli/finetune.py` (LoRA fine-tuning via `peft`) is implemented and was
-  run end-to-end in this sandbox against a tiny model with a stubbed-out
-  DeepSpeed engine (real `deepspeed` isn't installable here either): base
-  checkpoint load → LoRA injection → a short training loop → adapter save →
-  merge → HuggingFace export, producing a valid `LlamaForCausalLM.
-  from_pretrained`-loadable checkpoint. It has **not** been run against a
-  real multi-GPU DeepSpeed engine or a non-trivial model size. One rough
-  edge found via that testing and worked around: `peft`'s
-  `merge_and_unload()` runs a tied-embeddings check that expects
-  `model.config` to be a dict-like HuggingFace `PretrainedConfig`
-  (`model_config.get("tie_word_embeddings")`), which `ats-v2`'s own
-  `ModelConfig` (a Pydantic model, no `.get()`) doesn't satisfy;
-  `ats/cli/finetune.py` temporarily swaps in a two-key dict shim around that
-  one call and restores the real config immediately after, rather than
-  changing `ATSTransformer.config`'s type everywhere else it's used.
-- 8-bit Adam (`--optimizer-bits 8`) was verified for CLI/config plumbing and
-  the DeepSpeed client-optimizer wiring (`initialize_engine` passing a
-  constructed `bitsandbytes.optim.Adam8bit` via `deepspeed.initialize
-  (optimizer=...)` instead of the JSON `optimizer` block); the `bitsandbytes`
-  package itself isn't installed in this sandbox, so the actual 8-bit
-  optimizer math has not been run.
-- Selective activation checkpointing (`checkpoint_every_n_layers`) was
-  verified directly: `torch.utils.checkpoint.checkpoint()` fires exactly on
-  layers where `layer_idx % n == 0` during training, and not at all when
-  disabled or when `use_cache=True` (incremental decoding).
-- The bullets above describing specific things as "verified" (8-bit Adam
-  plumbing, selective checkpointing, the Mamba chunked-scan math,
-  `preprocess.py` streaming) were checked by code review and/or standalone
-  logic tests in a sandbox without a GPU, `deepspeed`, or PyPI access — not
-  by running `ats-train` itself. That's a narrower claim than an end-to-end
-  training run and is called out per-bullet above rather than implied by a
-  blanket statement. See [Status](#status) at the top of this file for
-  which architectures have actually completed real training runs, and which
-  (MoE, MoD, Mamba, and the Triton kernels) have not yet.
+  wrong architecture. Only dense and SWA models export today (see
+  [Export to HuggingFace](#export-to-huggingface)).
+- **Triton kernels status is unconfirmed** (see [Status](#status)). Each
+  kernel is gated behind `HAS_TRITON` and falls back silently (no warning)
+  to a plain PyTorch implementation that *is* tested — a real safety net,
+  but one that also means a training run completing successfully on a GPU
+  with Triton installed proves nothing about whether the Triton code
+  actually ran. To check on your own GPU: temporarily force the
+  `HAS_TRITON` gate to skip the fallback (so a broken kernel raises instead
+  of silently substituting) and confirm training still runs, or add a
+  print/log inside the Triton branch and check it fires. Two of the four
+  (MoE routing dispatch, MLA KV decompression) are also only *partially*
+  fused, by design — see the docstring in each file for exactly what is
+  and isn't fused, rather than taking "Triton kernel" to mean the whole
+  pipeline is.
+- A separate, genuinely memory-reducing feature — post-training
+  quantization for *inference* (storing real int8 weights in an exported
+  checkpoint, no training involved) — is not implemented. This would be a
+  different feature from what `model.quantization`'s int8 QAT path
+  currently does (see [Quantization](#mamba--mtp--diffusion--quantization)
+  above); it's a reasonable, lower-risk addition if useful, not an
+  unfinished version of the existing path.

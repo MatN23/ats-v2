@@ -113,10 +113,23 @@ class MambaBlock(nn.Module):
         A: torch.Tensor,
         B: torch.Tensor,
         x_conv: torch.Tensor,
+        initial_carry: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Computes state_t at every position via a chunked parallel scan.
         dt, x_conv: [batch, seq_len, d_inner]. A: [d_inner, d_state].
         B: [batch, seq_len, d_state]. Returns states: [batch, seq_len, d_inner, d_state].
+
+        `initial_carry` (state at the position immediately before this
+        call's first position, shape [batch, d_inner, d_state]) defaults to
+        zeros -- the correct starting state for a fresh sequence. Passing a
+        real prior state here (from a previous call's final state) is what
+        makes incremental decoding mathematically exact rather than an
+        approximation: continuing the scan from the exact carry a full-
+        sequence call would have produced at that position is exactly what
+        the linear recurrence's associativity guarantees is equivalent to
+        having run the full sequence in one call -- see
+        test_mamba_incremental_decoding_matches_full_sequence in
+        tests/test_model.py for the direct numerical check of that claim.
         """
         batch, seq_len, d_inner = dt.shape
         d_state = A.shape[-1]
@@ -125,7 +138,11 @@ class MambaBlock(nn.Module):
         all_states = torch.empty(
             batch, seq_len, d_inner, d_state, device=device, dtype=dtype
         )
-        carry = torch.zeros(batch, d_inner, d_state, device=device, dtype=dtype)
+        carry = (
+            torch.zeros(batch, d_inner, d_state, device=device, dtype=dtype)
+            if initial_carry is None
+            else initial_carry
+        )
 
         for start in range(0, seq_len, self.chunk_size):
             end = min(start + self.chunk_size, seq_len)
@@ -177,29 +194,83 @@ class MambaBlock(nn.Module):
 
         return all_states
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        state: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """state, if given, is (conv_state, ssm_state) from a previous call:
+        conv_state is the last (d_conv - 1) raw (pre-conv) x_main columns
+        seen so far, shape [batch, d_inner, d_conv - 1] (empty in the last
+        dim if d_conv == 1, since a kernel-size-1 conv has no history to
+        carry); ssm_state is the selective-scan carry, shape
+        [batch, d_inner, d_state]. state=None (the default) means "start of
+        a fresh sequence" -- mathematically identical to conv_state being
+        all zeros and ssm_state being all zeros, which is exactly what a
+        fresh sequence's true initial state is, so this is not a special
+        case requiring separate math, just a convenient default that avoids
+        callers allocating zero tensors themselves.
+
+        Returns just the output tensor (exactly the pre-existing behavior,
+        unchanged) when use_cache=False. Returns (output, new_state) when
+        use_cache=True, where new_state is a (conv_state, ssm_state) pair
+        in the same shapes described above, ready to pass as `state` on the
+        next call to continue the sequence.
+        """
         if x.dim() != 3:
             raise ValueError(
                 f"MambaBlock expected input of shape [batch, seq_len, hidden_size], "
                 f"got shape {tuple(x.shape)}."
             )
-        _batch, _seq_len, hidden_size = x.shape
+        batch, _seq_len, hidden_size = x.shape
         if hidden_size != self.hidden_size:
             raise ValueError(
                 f"MambaBlock expected hidden_size={self.hidden_size}, got {hidden_size}."
             )
+        conv_state, ssm_state = (None, None) if state is None else state
+        if conv_state is not None:
+            expected_conv_shape = (batch, self.d_inner, self.d_conv - 1)
+            if tuple(conv_state.shape) != expected_conv_shape:
+                raise ValueError(
+                    f"MambaBlock got a conv_state of shape {tuple(conv_state.shape)}, "
+                    f"expected {expected_conv_shape}."
+                )
+        if ssm_state is not None:
+            expected_ssm_shape = (batch, self.d_inner, self.d_state)
+            if tuple(ssm_state.shape) != expected_ssm_shape:
+                raise ValueError(
+                    f"MambaBlock got an ssm_state of shape {tuple(ssm_state.shape)}, "
+                    f"expected {expected_ssm_shape}."
+                )
 
         x_and_gate = self.in_proj(x)  # [batch, seq_len, 2*d_inner]
         x_main, gate = x_and_gate.chunk(2, dim=-1)
 
         # Causal depthwise conv: transpose to [batch, d_inner, seq_len], then
-        # pad on the left only (kernel_size - 1 positions) so every output
-        # position only ever sees itself and earlier positions -- strictly
-        # causal without computing (and discarding) right-side padding.
-        x_main_t = x_main.transpose(1, 2)
-        x_main_t = F.pad(x_main_t, (self.d_conv - 1, 0))
-        x_conv = self.conv1d(x_main_t)
+        # either zero-pad on the left (fresh sequence -- the true history
+        # before position 0 is nothing, which zero-padding correctly
+        # represents) or prepend the real conv_state carried over from a
+        # previous call (continuing a sequence -- using the actual prior
+        # values here, not zeros, is what makes this exact rather than an
+        # approximation that forgets the last (d_conv - 1) tokens' influence
+        # on the conv every time a new incremental call starts).
+        x_main_t = x_main.transpose(1, 2)  # [batch, d_inner, seq_len]
+        if conv_state is None:
+            x_main_t_history = F.pad(x_main_t, (self.d_conv - 1, 0))
+        else:
+            x_main_t_history = torch.cat([conv_state, x_main_t], dim=-1)
+        x_conv = self.conv1d(x_main_t_history)
         x_conv = F.silu(x_conv.transpose(1, 2))  # [batch, seq_len, d_inner]
+
+        # The new conv_state to return is simply the last (d_conv - 1)
+        # RAW (pre-conv) columns of the same history buffer just used --
+        # exactly what the next call needs to prepend to continue seamlessly.
+        new_conv_state = (
+            x_main_t_history[..., -(self.d_conv - 1) :]
+            if self.d_conv > 1
+            else torch.empty(batch, self.d_inner, 0, device=x.device, dtype=x.dtype)
+        )
 
         # Selective parameters, input-dependent per position.
         proj = self.x_proj(x_conv)  # [batch, seq_len, 2*d_state + 1]
@@ -211,11 +282,14 @@ class MambaBlock(nn.Module):
         A = -torch.exp(self.A_log)  # [d_inner, d_state], negative for stability
 
         states = self._chunked_scan(
-            dt, A, B, x_conv
+            dt, A, B, x_conv, initial_carry=ssm_state
         )  # [batch, seq_len, d_inner, d_state]
+        new_ssm_state = states[:, -1, :, :]
         y = torch.einsum("btdn,btn->btd", states, C)  # [batch, seq_len, d_inner]
         y = y + x_conv * self.D  # skip connection (D is a per-channel scalar)
 
         y = y * F.silu(gate)  # gating
         out = self.out_proj(y)
+        if use_cache:
+            return out, (new_conv_state, new_ssm_state)
         return out

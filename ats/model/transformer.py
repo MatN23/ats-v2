@@ -36,11 +36,21 @@ class TransformerOutput:
 class MambaLayer(nn.Module):
     """Adapts MambaBlock to the same (x, attention_mask, past_key_value,
     use_cache) -> (x, aux_loss, new_past_key_value) call signature used by
-    TransformerBlock, so ATSTransformer can mix the two freely. This
-    reference implementation does not support KV-cache-based incremental
-    decoding (the chunked scan is recomputed over the full sequence each
-    call); attention_mask/past_key_value/use_cache are accepted for
-    interface compatibility but past_key_value must be None."""
+    TransformerBlock, so ATSTransformer can mix the two freely.
+
+    Supports KV-cache-style incremental decoding: when use_cache=True, the
+    (conv_state, ssm_state) pair MambaBlock returns is passed through as
+    this layer's past_key_value, exactly like GroupedQueryAttention's
+    (key, value) cache -- ATSTransformer's generic per-layer cache list
+    (list[PastKeyValue | None] in _run_layers) has no idea (and doesn't
+    need to know) that a Mamba layer's "past_key_value" tuple holds a
+    selective-scan carry and a causal-conv history buffer rather than
+    attention keys/values; it's opaque state round-tripped through the
+    same interface either way. See MambaBlock.forward's docstring for what
+    each half of that tuple actually contains, and
+    test_mamba_incremental_decoding_matches_full_sequence in
+    tests/test_model.py for the numerical proof this is exact, not an
+    approximation."""
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
@@ -66,12 +76,6 @@ class MambaLayer(nn.Module):
         use_cache: bool = False,
         causal: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, PastKeyValue | None]:
-        if past_key_value is not None:
-            raise ValueError(
-                "MambaLayer does not support KV-cache-based incremental decoding in "
-                "this implementation. Fix: run full-sequence forward passes, or disable "
-                "use_cache for Mamba layers."
-            )
         # MambaBlock's selective scan is inherently causal (state at position
         # t is computed only from positions <= t; there is no bidirectional
         # variant implemented here). causal=False (the diffusion-LM backbone
@@ -90,10 +94,25 @@ class MambaLayer(nn.Module):
                 "model_type='diffusion'."
             )
         h = self.input_norm(x)
-        mamba_out = self.mamba(h)
+        if use_cache:
+            # past_key_value is None on the first (prefill) call of a
+            # generation -- MambaBlock.forward treats state=None as "start
+            # of a fresh sequence" (equivalent to all-zero state, which is
+            # exactly correct for a fresh sequence, not a placeholder).
+            mamba_out, new_state = self.mamba(h, state=past_key_value, use_cache=True)
+            new_past_key_value: PastKeyValue | None = new_state
+        else:
+            if past_key_value is not None:
+                raise ValueError(
+                    "MambaLayer received a past_key_value without use_cache=True. "
+                    "Fix: pass use_cache=True when continuing generation from a "
+                    "previously-returned Mamba cache state."
+                )
+            mamba_out = self.mamba(h)
+            new_past_key_value = None
         out = x + mamba_out
         aux_loss = torch.zeros((), device=x.device, dtype=torch.float32)
-        return out, aux_loss, None
+        return out, aux_loss, new_past_key_value
 
 
 class TransformerBlock(nn.Module):

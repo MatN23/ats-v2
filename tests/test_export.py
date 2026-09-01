@@ -63,7 +63,38 @@ def test_swa_export_includes_sliding_window(tmp_path):
     assert hf_config["sliding_window"] == 128
 
 
-def test_moe_export_raises(tmp_path):
+@pytest.mark.skipif(
+    not _SAFETENSORS_AVAILABLE, reason="safetensors not installed in this environment"
+)
+def test_int8_export_produces_quantized_tensors_and_metadata(tmp_path):
+    config = _dense_config()
+    model = ATSTransformer(config)
+    out_dir = export_to_huggingface(
+        model, config, str(tmp_path / "exported_int8"), quantize="int8"
+    )
+
+    with open(out_dir / "config.json") as f:
+        hf_config = json.load(f)
+    assert hf_config["ats_quantization"]["mode"] == "int8"
+    quantized_keys = hf_config["ats_quantization"]["quantized_keys"]
+    assert len(quantized_keys) > 0
+
+    from safetensors import safe_open
+
+    with safe_open(str(out_dir / "model.safetensors"), framework="pt") as f:
+        saved_keys = set(f.keys())
+        for key in quantized_keys:
+            assert f.get_slice(key).get_dtype() == "I8"
+            assert f"{key}.quant_scale" in saved_keys
+        # Embeddings must never be quantized by this scheme (see
+        # ats.export.quantize's module docstring).
+        embed_keys = [
+            k for k in saved_keys if "embed" in k.lower() and "quant_scale" not in k
+        ]
+        assert embed_keys, "expected at least one embedding-like key in a dense export"
+        for key in embed_keys:
+            assert key not in quantized_keys
+
     config = _dense_config(use_moe=True, num_experts=4, moe_top_k=2)
     model = ATSTransformer(config)
     with pytest.raises(ConfigError):

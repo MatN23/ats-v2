@@ -79,6 +79,36 @@ def build_deepspeed_config(config: ATSConfig, micro_batch_size: int) -> dict[str
 
     zero_stage = _ZERO_STAGE_BY_STRATEGY[strategy]
 
+    if config.parallelism.offload_param and zero_stage != 3:
+        raise ConfigError(
+            f"parallelism.offload_param=True requires ZeRO stage 3 (got resolved "
+            f"stage {zero_stage} from strategy '{strategy}'). DeepSpeed only "
+            f"supports offloading parameters under ZeRO-3, since stages 0-2 don't "
+            f"partition parameters across ranks the way stage 3 does. "
+            f"Fix: set parallelism.strategy: deepspeed_zero3, or disable offload_param."
+        )
+    if config.parallelism.offload_optimizer and zero_stage == 0:
+        raise ConfigError(
+            f"parallelism.offload_optimizer=True requires ZeRO stage >= 1 (got "
+            f"resolved stage 0 from strategy '{strategy}'). Stage 0 has no "
+            f"optimizer-state sharding for DeepSpeed to offload. "
+            f"Fix: set parallelism.strategy to a ZeRO 1/2/3 strategy (or 'auto' with "
+            f"more than 1 GPU, since auto only resolves to zero0 for single-GPU "
+            f"jobs), or disable offload_optimizer."
+        )
+
+    zero_optimization: dict[str, Any] = {"stage": zero_stage}
+    if config.parallelism.offload_optimizer:
+        zero_optimization["offload_optimizer"] = {
+            "device": "cpu",
+            "pin_memory": True,
+        }
+    if config.parallelism.offload_param:
+        zero_optimization["offload_param"] = {
+            "device": "cpu",
+            "pin_memory": True,
+        }
+
     ds_config: dict[str, Any] = {
         "train_micro_batch_size_per_gpu": micro_batch_size,
         # Deliberately 1, NOT config.training.grad_accum_steps: trainer.py's
@@ -93,9 +123,7 @@ def build_deepspeed_config(config: ATSConfig, micro_batch_size: int) -> dict[str
         "gradient_accumulation_steps": 1,
         "gradient_clipping": config.training.grad_clip_norm,
         "steps_per_print": config.logging.log_every,
-        "zero_optimization": {
-            "stage": zero_stage,
-        },
+        "zero_optimization": zero_optimization,
         "zero_allow_untested_optimizer": True,
     }
 

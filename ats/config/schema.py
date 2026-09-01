@@ -578,6 +578,20 @@ class ParallelismConfig(BaseModel):
     ] = "auto"
     gpus: int = 1
     nodes: int = 1
+    # ZeRO-Offload: moves optimizer state (offload_optimizer) and/or
+    # parameters (offload_param) to CPU RAM (or NVMe, not exposed here) so
+    # GPU memory can hold a larger model than would otherwise fit, at the
+    # cost of PCIe transfer time every step. DeepSpeed itself does the
+    # actual offloading; these two fields just decide whether
+    # build_deepspeed_config's zero_optimization block asks for it.
+    # Compatibility (validated in build_deepspeed_config, once the
+    # "auto" strategy has actually been resolved to a concrete ZeRO
+    # stage): offload_optimizer requires ZeRO stage >= 1; offload_param
+    # requires ZeRO stage == 3 specifically (DeepSpeed does not support
+    # offloading parameters under stage 1/2, since those stages don't
+    # partition parameters across ranks the way stage 3 does).
+    offload_optimizer: bool = False
+    offload_param: bool = False
 
     @field_validator("gpus", "nodes")
     @classmethod

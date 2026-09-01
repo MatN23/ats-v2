@@ -898,6 +898,183 @@ def test_mamba_block_rejects_non_positive_chunk_size():
         MambaBlock(hidden_size=16, chunk_size=0)
 
 
+def test_mamba_block_incremental_matches_full_sequence():
+    """The core correctness claim for Mamba's KV-cache support: processing a
+    sequence in one full-sequence call must produce EXACTLY the same output
+    as processing it in two pieces with the second piece continuing from
+    the first piece's returned (conv_state, ssm_state). This is what makes
+    incremental decoding mathematically exact rather than an approximation
+    -- the chunked scan's associativity guarantees a carried-over state is
+    equivalent to having run everything in one call (see MambaBlock.
+    _chunked_scan's initial_carry docstring)."""
+    torch.manual_seed(0)
+    hidden_size, d_state, d_conv, expand = 16, 8, 4, 2
+    block = MambaBlock(
+        hidden_size=hidden_size,
+        d_state=d_state,
+        d_conv=d_conv,
+        expand=expand,
+        chunk_size=5,
+    )
+    block.eval()
+
+    batch, seq_len = 2, 23
+    x = torch.randn(batch, seq_len, hidden_size)
+
+    with torch.no_grad():
+        full_output = block(x)
+
+        # Split at a point that isn't a multiple of chunk_size or d_conv, on
+        # purpose, so this doesn't accidentally only work at "nice" boundaries.
+        split = 9
+        x_first, x_second = x[:, :split, :], x[:, split:, :]
+
+        out_first, state_after_first = block(x_first, use_cache=True)
+        out_second, _state_after_second = block(
+            x_second, state=state_after_first, use_cache=True
+        )
+        incremental_output = torch.cat([out_first, out_second], dim=1)
+
+    assert torch.allclose(full_output, incremental_output, atol=1e-5), (
+        f"Incremental (split) output diverges from full-sequence output: "
+        f"max abs diff = {(full_output - incremental_output).abs().max().item()}"
+    )
+
+
+def test_mamba_block_incremental_token_by_token_matches_full_sequence():
+    """Same claim as above, but decoding strictly one token at a time (the
+    actual autoregressive-generation access pattern), to make sure the
+    conv_state/ssm_state carry chain stays exact across many small steps,
+    not just a single two-piece split."""
+    torch.manual_seed(1)
+    hidden_size, d_state, d_conv, expand = 8, 4, 3, 2
+    block = MambaBlock(
+        hidden_size=hidden_size, d_state=d_state, d_conv=d_conv, expand=expand
+    )
+    block.eval()
+
+    batch, seq_len = 1, 11
+    x = torch.randn(batch, seq_len, hidden_size)
+
+    with torch.no_grad():
+        full_output = block(x)
+
+        state = None
+        outputs = []
+        for t in range(seq_len):
+            out_t, state = block(x[:, t : t + 1, :], state=state, use_cache=True)
+            outputs.append(out_t)
+        incremental_output = torch.cat(outputs, dim=1)
+
+    assert torch.allclose(full_output, incremental_output, atol=1e-5), (
+        f"Token-by-token output diverges from full-sequence output: "
+        f"max abs diff = {(full_output - incremental_output).abs().max().item()}"
+    )
+
+
+def test_mamba_block_use_cache_false_return_type_unchanged():
+    """Backward-compatibility check: use_cache=False (the default, and every
+    pre-existing call site's behavior) must still return a single tensor,
+    not a tuple -- every test above this one in the file calls block(x) and
+    asserts on .shape directly, so a regression here would break all of
+    them, not just this test."""
+    block = MambaBlock(hidden_size=8, d_state=4, d_conv=2, expand=2)
+    x = torch.randn(1, 5, 8)
+    out = block(x)
+    assert isinstance(out, torch.Tensor)
+    out_explicit = block(x, use_cache=False)
+    assert isinstance(out_explicit, torch.Tensor)
+
+
+def test_mamba_block_state_shape_validation():
+    import pytest
+
+    block = MambaBlock(hidden_size=8, d_state=4, d_conv=3, expand=2)
+    x = torch.randn(1, 5, 8)
+    bad_conv_state = torch.zeros(1, block.d_inner, 999)  # wrong last dim
+    bad_ssm_state = torch.zeros(1, block.d_inner, 4)
+    with pytest.raises(ValueError, match="conv_state"):
+        block(x, state=(bad_conv_state, bad_ssm_state), use_cache=True)
+
+    good_conv_state = torch.zeros(1, block.d_inner, block.d_conv - 1)
+    bad_ssm_state_2 = torch.zeros(1, block.d_inner, 999)
+    with pytest.raises(ValueError, match="ssm_state"):
+        block(x, state=(good_conv_state, bad_ssm_state_2), use_cache=True)
+
+
+def test_mamba_layer_incremental_decoding_via_use_cache():
+    """Same equivalence claim as test_mamba_block_incremental_matches_full_sequence,
+    but through MambaLayer's (x, attention_mask, past_key_value, use_cache)
+    interface -- the one ATSTransformer._run_layers actually calls -- to
+    verify the plumbing between MambaBlock's state tuple and the generic
+    per-layer PastKeyValue cache slot is correct end to end."""
+    from ats.model.transformer import MambaLayer
+
+    config = ModelConfig(
+        hidden_size=16,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=2,
+        intermediate_size=32,
+        vocab_size=30,
+        max_seq_len=32,
+        use_mamba=True,
+        mamba_every_n_layers=1,
+        mamba_d_state=4,
+        mamba_d_conv=3,
+        mamba_chunk_size=4,
+        use_flash_attention=False,
+    )
+    layer = MambaLayer(config)
+    layer.eval()
+
+    torch.manual_seed(2)
+    batch, seq_len = 1, 13
+    x = torch.randn(batch, seq_len, 16)
+
+    with torch.no_grad():
+        full_out, _full_aux, _full_kv = layer(x, use_cache=False)
+
+        split = 6
+        out_a, _aux_a, kv_a = layer(x[:, :split, :], use_cache=True)
+        out_b, _aux_b, _kv_b = layer(
+            x[:, split:, :], past_key_value=kv_a, use_cache=True
+        )
+        incremental_out = torch.cat([out_a, out_b], dim=1)
+
+    assert torch.allclose(full_out, incremental_out, atol=1e-5)
+
+
+def test_mamba_layer_rejects_past_key_value_without_use_cache():
+    """A past_key_value passed without use_cache=True is almost certainly a
+    caller bug (the cache would be silently ignored otherwise) -- this must
+    raise, not silently discard the cache and recompute from scratch."""
+    import pytest
+
+    from ats.model.transformer import MambaLayer
+
+    config = ModelConfig(
+        hidden_size=8,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=2,
+        intermediate_size=16,
+        vocab_size=20,
+        max_seq_len=16,
+        use_mamba=True,
+        mamba_every_n_layers=1,
+        use_flash_attention=False,
+    )
+    layer = MambaLayer(config)
+    x = torch.randn(1, 4, 8)
+    fake_past_kv = (
+        torch.zeros(1, layer.mamba.d_inner, 3),
+        torch.zeros(1, layer.mamba.d_inner, 16),
+    )
+    with pytest.raises(ValueError, match="use_cache"):
+        layer(x, past_key_value=fake_past_kv, use_cache=False)
+
+
 def test_mamba_config_chunk_size_field_wired_through():
     config = ModelConfig(
         hidden_size=16,

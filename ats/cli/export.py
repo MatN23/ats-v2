@@ -48,6 +48,17 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Directory of tokenizer files to copy alongside the export.",
     )
     parser.add_argument(
+        "--quantize",
+        choices=["none", "int8"],
+        default="none",
+        help="Post-training weight quantization applied to the exported checkpoint. "
+        "'int8': symmetric per-output-channel quantization of Linear-style weight "
+        "matrices (real memory/disk savings; NOT loadable by a stock "
+        "transformers.LlamaForCausalLM.from_pretrained() -- see "
+        "ats.export.quantize for the dequantization function a custom loader needs). "
+        "'none' (default): export at the checkpoint's native dtype, unchanged.",
+    )
+    parser.add_argument(
         "--micro-batch-size",
         type=int,
         default=None,
@@ -128,6 +139,7 @@ def main(argv=None) -> int:
             model_config=config.model,
             output_dir=args.output_dir,
             tokenizer_dir=args.tokenizer_dir,
+            quantize=args.quantize,
         )
     except ConfigError as exc:
         logger.error("Export failed: %s", exc)

@@ -189,6 +189,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--gpus", type=int, default=None)
     parser.add_argument("--nodes", type=int, default=None)
+    _bool_flag(
+        parser,
+        "offload-optimizer",
+        "ZeRO-Offload optimizer state to CPU RAM (requires ZeRO stage >= 1). "
+        "Trades PCIe transfer time each step for GPU memory headroom.",
+    )
+    _bool_flag(
+        parser,
+        "offload-param",
+        "ZeRO-Offload parameters to CPU RAM (requires ZeRO stage 3 specifically). "
+        "Trades PCIe transfer time each step for GPU memory headroom.",
+    )
 
     # --- Other ---
     parser.add_argument("--output-dir", type=str, default=None)
@@ -335,6 +347,8 @@ def apply_cli_overrides(config: ATSConfig, args: argparse.Namespace) -> ATSConfi
         "strategy": args.parallelism_strategy,
         "gpus": args.gpus,
         "nodes": args.nodes,
+        "offload_optimizer": args.offload_optimizer,
+        "offload_param": args.offload_param,
     }
     parallelism_updates = {k: v for k, v in parallelism_fields.items() if v is not None}
     if parallelism_updates:

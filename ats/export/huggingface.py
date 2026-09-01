@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 
 from ats.config.schema import ConfigError, ModelConfig
+from ats.export.quantize import quantize_state_dict_int8
 from ats.model.transformer import ATSTransformer
 from ats.utils.logging_utils import get_logger
 
@@ -109,7 +110,7 @@ def _remap_state_dict(
     return hf_state_dict
 
 
-def _build_model_card(model_config: ModelConfig) -> str:
+def _build_model_card(model_config: ModelConfig, quantize: str = "none") -> str:
     attention_kind = (
         "MLA" if model_config.use_mla else ("SWA" if model_config.use_swa else "GQA")
     )
@@ -119,6 +120,8 @@ def _build_model_card(model_config: ModelConfig) -> str:
         tags.append("sliding-window-attention")
     if model_config.use_mod:
         tags.append("mixture-of-depths")
+    if quantize == "int8":
+        tags.append("int8")
 
     tag_lines = "\n".join(f"  - {tag}" for tag in tags)
     lines = [
@@ -151,6 +154,15 @@ def _build_model_card(model_config: ModelConfig) -> str:
         lines.append(
             f"- Experts: {model_config.num_experts}, top-{model_config.moe_top_k} routing"
         )
+    if quantize == "int8":
+        lines.append(
+            "- Weights: int8, symmetric per-output-channel post-training "
+            "quantization (see config.json's `ats_quantization` field). "
+            "**Not** loadable with a stock `LlamaForCausalLM.from_pretrained()` "
+            "-- use `ats.export.quantize.dequantize_tensor_int8` to reconstruct "
+            "float weights, or write a custom loader that dequantizes the "
+            "`*.quant_scale`-suffixed tensors before use."
+        )
     lines.append("")
     lines.append(
         "This checkpoint was exported automatically by `ats.export.huggingface."
@@ -165,7 +177,10 @@ def export_to_huggingface(
     model_config: ModelConfig,
     output_dir: str,
     tokenizer_dir: str | None = None,
+    quantize: str = "none",
 ) -> Path:
+    if quantize not in ("none", "int8"):
+        raise ConfigError(f"quantize must be 'none' or 'int8', got {quantize!r}.")
     if model_config.use_mla:
         raise ConfigError(
             "MLA models cannot be exported to LlamaForCausalLM format because MLA uses "
@@ -214,9 +229,34 @@ def export_to_huggingface(
         ats_state_dict, model_config.num_layers, model_config.tie_word_embeddings
     )
 
+    quantized_keys: list[str] = []
+    if quantize == "int8":
+        hf_state_dict, quantized_keys = quantize_state_dict_int8(hf_state_dict)
+        logger.info(
+            "int8-quantized %d of %d state_dict tensors (see config.json's "
+            "'ats_quantization' field for the exact key list)",
+            len(quantized_keys),
+            len(hf_state_dict) - len(quantized_keys),
+        )
+
     save_file(hf_state_dict, str(out_path / "model.safetensors"))
 
     hf_config = _build_hf_config(model_config)
+    if quantize == "int8":
+        # Not a standard HuggingFace config field -- there is no standard
+        # field for "these specific keys are int8 with a companion
+        # '<key>.quant_scale' tensor" in this scheme. A stock
+        # transformers.LlamaForCausalLM.from_pretrained() will NOT
+        # understand this and will fail to load an int8-exported checkpoint;
+        # this field exists so a custom loader (see
+        # ats.export.quantize.dequantize_tensor_int8) has everything it
+        # needs, and so it's visible in config.json rather than silently
+        # implied by tensor dtypes alone.
+        hf_config["ats_quantization"] = {
+            "mode": "int8",
+            "scheme": "symmetric_per_output_channel",
+            "quantized_keys": quantized_keys,
+        }
     with open(out_path / "config.json", "w", encoding="utf-8") as f:
         json.dump(hf_config, f, indent=2)
 
@@ -228,7 +268,7 @@ def export_to_huggingface(
             if item.is_file():
                 shutil.copy2(item, out_path / item.name)
 
-    model_card = _build_model_card(model_config)
+    model_card = _build_model_card(model_config, quantize=quantize)
     with open(out_path / "README.md", "w", encoding="utf-8") as f:
         f.write(model_card)
 

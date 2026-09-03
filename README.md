@@ -7,7 +7,18 @@ for standard runs.
 
 This is a research project for small teams. It is not an alternative to
 LLM Foundry, NeMo, or Megatron-LM, and does not target their scale or
-hardware-fleet regime (see [Scale limitations](#scale-limitations-what-this-framework-does-and-doesnt-do-for-memory)).
+hardware-fleet regime (see [Scale limitations]
+
+(#scale-limitations-what-this-framework-does-and-doesnt-do-for-memory)).
+
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-green.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1QMWzvlHo5AtnLUbhAmE3WjiXXHN1RHeL?authuser=2)
+
+</div>
+
+> **The Pitch:** Prototype hybrid Transformer/Mamba architectures, MoE, and advanced parallelism via a single YAML file. No Python edits required. Developed and stress-tested to run on a single 16GB Google Colab T4.
+
 
 ## Status
 

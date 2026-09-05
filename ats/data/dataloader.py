@@ -166,4 +166,6 @@ def build_dataloader(
         batch_size=batch_size,
         collate_fn=_collate,
         num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
     )

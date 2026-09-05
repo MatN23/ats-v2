@@ -225,6 +225,7 @@ def main(argv: list[str] | None = None) -> int:
             rank=rank,
             world_size=world_size,
             seed=config.training.seed,
+            num_workers=config.data.num_workers,
         )
     except ConfigError as exc:
         logger.error("Preference data error: %s", exc)

@@ -535,6 +535,14 @@ class DataConfig(BaseModel):
     seq_length: int
     tokenizer_name: str = "tiktoken:cl100k_base"
     streaming: bool = True
+    # Background DataLoader worker processes. Left at PyTorch's implicit
+    # default of 0 (synchronous, main-process loading) before this field
+    # existed, which meant every real training run silently loaded data
+    # on the main process between steps -- the GPU sits idle during every
+    # load+preprocess with num_workers=0. 4 is a reasonable default for most
+    # setups; override per-job if the dataset is unusually cheap/expensive
+    # to read or the host has few CPU cores available per GPU.
+    num_workers: int = 4
 
     @field_validator("sources")
     @classmethod

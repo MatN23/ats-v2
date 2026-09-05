@@ -374,14 +374,17 @@ def run_mode(
                 total_loss = total_loss + config.mtp_loss_weight * mtp_loss
 
             if not torch.isfinite(total_loss):
+                # Single .item() call reused for both fields below (this branch
+                # previously called .item() twice for the same tensor value).
+                loss_value = float(total_loss.item())
                 return ModeResult(
                     mode=mode,
                     passed=False,
                     steps_completed=step - 1,
                     total_steps=steps,
                     param_count=param_count,
-                    last_loss=float(total_loss.item()),
-                    error=f"non-finite loss at step {step}: {total_loss.item()}",
+                    last_loss=loss_value,
+                    error=f"non-finite loss at step {step}: {loss_value}",
                 )
 
             optimizer.zero_grad(set_to_none=True)

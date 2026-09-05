@@ -63,9 +63,20 @@ def compute_perplexity(
         rank=0,
         world_size=1,
         seed=config.training.seed,
+        num_workers=config.data.num_workers,
     )
-    total_loss = 0.0
-    total_tokens = 0
+    device = (
+        model_engine.local_rank
+        if isinstance(model_engine.local_rank, torch.device)
+        else torch.device(f"cuda:{model_engine.local_rank}")
+    )
+    # Accumulate on-device across the whole eval set and only call .item()
+    # once, after the loop -- calling .item() per batch (as this used to)
+    # forces a host-device sync every iteration, serializing what should be
+    # an async eval pass. Perplexity eval commonly runs over a large held-out
+    # set, so this isn't a one-off cost.
+    total_loss_t = torch.zeros((), dtype=torch.float64, device=device)
+    total_tokens_t = torch.zeros((), dtype=torch.long, device=device)
     with torch.no_grad():
         for batch in eval_dataloader:
             output = model_engine(
@@ -82,9 +93,12 @@ def compute_perplexity(
                 ignore_index=-100,
                 reduction="sum",
             )
-            num_valid = (shift_labels != -100).sum().item()
-            total_loss += float(loss.item())
-            total_tokens += int(num_valid)
+            num_valid = (shift_labels != -100).sum()
+            total_loss_t += loss.detach().double()
+            total_tokens_t += num_valid
+
+    total_loss = float(total_loss_t.item())
+    total_tokens = int(total_tokens_t.item())
 
     from ats.config.schema import ConfigError
 

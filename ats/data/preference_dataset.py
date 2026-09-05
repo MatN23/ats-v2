@@ -142,6 +142,7 @@ def build_preference_dataloader(
     rank: int = 0,
     world_size: int = 1,
     seed: int = 0,
+    num_workers: int = 4,
 ) -> DataLoader:
     """rank/world_size shard the dataset by simple index slicing
     (dataset[rank::world_size]) -- adequate for preference-pair datasets'
@@ -171,4 +172,7 @@ def build_preference_dataloader(
         collate_fn=_collate,
         generator=generator,
         drop_last=True,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
     )

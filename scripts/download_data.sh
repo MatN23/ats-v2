@@ -60,6 +60,13 @@
 #                           main speed knob -- tokenizing one doc at a time is dramatically
 #                           slower than batching, since tiktoken's batch API releases the
 #                           GIL and parallelizes across threads.
+#   --parallel-downloads N  Shard files fetched concurrently in 'shards'/'auto' mode.
+#                           Default: 4. Downloads still get consumed/tokenized in original
+#                           shard order (so the token-budget stopping point stays
+#                           deterministic run to run) -- this only overlaps the network
+#                           transfer of upcoming shards with processing of the current one.
+#                           Raise this on a fast/high-latency link, lower it if you're
+#                           hitting per-IP rate limits.
 #   --force               Re-download even if the destination already has enough tokens.
 #   --dry-run              Print the computed budget table and exit; no download.
 #   --install-deps         pip install the (few) missing Python deps and continue.
@@ -80,6 +87,7 @@ FILE_GLOB=""
 MARGIN="1.05"
 OUT_OVERRIDE=""
 BATCH_SIZE=512
+PARALLEL_DOWNLOADS=4
 FORCE=0
 DRY_RUN=0
 INSTALL_DEPS=0
@@ -104,6 +112,7 @@ while [[ $# -gt 0 ]]; do
         --margin)               MARGIN="$2"; shift 2 ;;
         --out)                   OUT_OVERRIDE="$2"; shift 2 ;;
         --batch-size)             BATCH_SIZE="$2"; shift 2 ;;
+        --parallel-downloads)      PARALLEL_DOWNLOADS="$2"; shift 2 ;;
         --force)                  FORCE=1; shift ;;
         --dry-run)                  DRY_RUN=1; shift ;;
         --install-deps)              INSTALL_DEPS=1; shift ;;
@@ -186,7 +195,7 @@ done
 # tokenization-aware stopping, resume/skip logic — happens in one Python
 # process per config so the token count used to decide "enough" is
 # computed with the exact same tokenizer the trainer will use.
-python3 - "${REPO_ROOT}" "${DRY_RUN}" "${FORCE}" "${MARGIN}" "${DATASET}" "${DATASET_CONFIG}" "${SPLIT}" "${TEXT_FIELD}" "${OUT_OVERRIDE}" "${BATCH_SIZE}" "${TRANSFER}" "${FILE_GLOB}" "${CONFIGS[@]}" <<'PYEOF'
+python3 - "${REPO_ROOT}" "${DRY_RUN}" "${FORCE}" "${MARGIN}" "${DATASET}" "${DATASET_CONFIG}" "${SPLIT}" "${TEXT_FIELD}" "${OUT_OVERRIDE}" "${BATCH_SIZE}" "${TRANSFER}" "${FILE_GLOB}" "${PARALLEL_DOWNLOADS}" "${CONFIGS[@]}" <<'PYEOF'
 import json
 import os
 import sys
@@ -206,7 +215,8 @@ out_override = sys.argv[9] or None
 batch_size = int(sys.argv[10])
 transfer_mode = sys.argv[11]
 file_glob_override = sys.argv[12] or None
-config_paths = sys.argv[13:]
+parallel_downloads = int(sys.argv[13])
+config_paths = sys.argv[14:]
 
 
 def load_budget(cfg_path: str):
@@ -280,6 +290,90 @@ for p in plans:
     )
 print()
 
+# --- Deduplicate by resolved output path ---
+#
+# Multiple configs commonly point at the SAME data.sources[0].path (e.g. every
+# non-debug model-size config in this repo shares ./data/train.jsonl, since
+# they're meant to train on the same corpus at different model scales). Before
+# this fix, --all processed each config as an independent job: config #2 would
+# see config #1's output file already exists, re-tokenize the WHOLE thing just
+# to check its size, find it short of #2's (larger) budget, and then discard
+# it and re-download from scratch. With N configs sharing one path, this
+# downloads and re-tokenizes the same underlying dataset up to N times, each
+# run's work thrown away by the next -- this is almost certainly why this was
+# taking "literal days": not a slow download, a REDUNDANT one, repeated.
+#
+# Fix: group configs by resolved absolute output path, do the download ONCE
+# per unique path, sized to the LARGEST budget among the configs sharing it
+# (a file with enough tokens for the biggest config's needs also satisfies
+# every smaller config pointed at the same path).
+groups: dict[Path, list] = {}
+for p in plans:
+    out_path = Path(out_override) if out_override else repo_root / p["out_path"]
+    out_path = out_path if out_path.is_absolute() else repo_root / out_path
+    groups.setdefault(out_path, []).append(p)
+
+jobs = []
+for out_path, group in groups.items():
+    tokenizers = {g["tokenizer_name"] for g in group}
+    if len(tokenizers) > 1:
+        names = ", ".join(f"{Path(g['cfg_path']).name}={g['tokenizer_name']}" for g in group)
+        raise SystemExit(
+            f"error: configs sharing output path {out_path} disagree on "
+            f"tokenizer_name ({names}) -- they can't share one output file "
+            f"with different tokenizers. Fix: use --out to give one of them "
+            f"a separate path, or align their tokenizer_name."
+        )
+    winner = max(group, key=lambda g: g["budget"])
+    if len(group) > 1:
+        others = ", ".join(Path(g["cfg_path"]).name for g in group if g is not winner)
+        print(
+            f"dedup  {len(group)} configs share {out_path} "
+            f"({', '.join(Path(g['cfg_path']).name for g in group)}) -- "
+            f"downloading once, sized for the largest need "
+            f"({Path(winner['cfg_path']).name}: {human(winner['budget'])} tokens). "
+            f"{others} will reuse this same file."
+        )
+    jobs.append(winner)
+
+if len(groups) < len(plans):
+    print(
+        f"\n{len(plans)} config(s) -> {len(jobs)} actual download job(s) after "
+        f"deduplication by output path.\n"
+    )
+
+# --- Sanity-check budget against the dataset sample actually available ---
+#
+# fineweb-edu-style HF dataset configs are named "sample-<N>BT" / "sample-<N>GB"
+# etc. by their approximate total size. If a job's budget exceeds what the
+# selected sample actually contains, every run will exhaust the sample and
+# stop short -- worth knowing BEFORE spending hours downloading it, not just
+# after, from the "WARNING: exhausted" message that used to be the only signal.
+def approx_sample_tokens(dataset_config: str) -> int | None:
+    import re
+
+    m = re.match(r"sample-(\d+(?:\.\d+)?)BT$", dataset_config)
+    if m:
+        return int(float(m.group(1)) * 1_000_000_000)
+    return None
+
+
+sample_tokens = approx_sample_tokens(dataset_config)
+if sample_tokens is not None:
+    for j in jobs:
+        if j["budget"] > sample_tokens:
+            print(
+                f"WARNING: {Path(j['cfg_path']).name} needs {human(j['budget'])} tokens "
+                f"but {dataset_name}/{dataset_config} only has an estimated "
+                f"~{human(sample_tokens)} tokens total -- this run WILL exhaust the "
+                f"sample and stop short, no matter how long it downloads for. "
+                f"Fix: pass --dataset-config with a larger sample (e.g. "
+                f"sample-100BT or sample-350BT if using fineweb-edu), or accept "
+                f"training on fewer tokens than the config targets (extra epochs "
+                f"over the same data)."
+            )
+    print()
+
 if dry_run:
     print("(dry run — nothing downloaded)")
     sys.exit(0)
@@ -288,6 +382,37 @@ if dry_run:
 # huggingface_hub/pyarrow (shard mode) and datasets (stream mode) are
 # imported lazily below, only for the transfer path actually used.
 import tiktoken
+
+# Opt into HF's accelerated transfer backend if available. Without this,
+# hf_hub_download uses plain single-connection HTTP regardless of whether the
+# repo is Xet-backed -- the "accelerated Xet/hf_transfer transfer path"
+# described in this script's own header comment does NOT happen automatically
+# just by calling hf_hub_download; it requires one of these to actually be
+# installed. hf_xet (newer, used automatically once importable, no env var)
+# is tried first; hf_transfer (older, needs the env var below) as a fallback.
+# Neither is a hard requirement -- downloads still work without them, just
+# slower -- so this only warns, it doesn't fail.
+def _try_enable_fast_transfer(tag: str = "transfer") -> None:
+    try:
+        import hf_xet  # noqa: F401
+        return  # hf_xet auto-activates for Xet-backed repos once importable
+    except ImportError:
+        pass
+    try:
+        import hf_transfer  # noqa: F401
+        os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+        return
+    except ImportError:
+        pass
+    print(
+        f"[{tag}] neither hf_xet nor hf_transfer is installed -- downloads will "
+        f"use plain single-connection HTTP, which is much slower for "
+        f"Xet/LFS-backed dataset repos. Fix: pip install hf_xet (or re-run "
+        f"with --install-deps)."
+    )
+
+
+_try_enable_fast_transfer()
 
 
 def get_encoding(tokenizer_name: str):
@@ -311,9 +436,43 @@ def get_encoding(tokenizer_name: str):
         ) from exc
 
 
+def _sidecar_path(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".tokencount.json")
+
+
+def _read_cached_token_count(path: Path) -> int | None:
+    """Returns the cached count if it's still valid for the CURRENT file
+    (matched by size + mtime), else None. Avoids re-tokenizing a
+    potentially many-GB file on every single invocation just to answer
+    "do we already have enough" -- with multiple configs/re-runs sharing
+    one output path, that re-tokenization pass was happening repeatedly on
+    a file that hadn't changed since the last time it was measured."""
+    sidecar = _sidecar_path(path)
+    if not sidecar.exists():
+        return None
+    try:
+        cached = json.loads(sidecar.read_text())
+        st = path.stat()
+        if cached.get("size_bytes") == st.st_size and cached.get("mtime") == st.st_mtime:
+            return cached["tokens"]
+    except (json.JSONDecodeError, KeyError, OSError):
+        pass
+    return None
+
+
+def _write_cached_token_count(path: Path, tokens: int) -> None:
+    st = path.stat()
+    _sidecar_path(path).write_text(
+        json.dumps({"tokens": tokens, "size_bytes": st.st_size, "mtime": st.st_mtime})
+    )
+
+
 def existing_token_count(path: Path, enc, batch_size: int) -> int:
     if not path.exists():
         return 0
+    cached = _read_cached_token_count(path)
+    if cached is not None:
+        return cached
     total = 0
     texts = []
 
@@ -337,6 +496,7 @@ def existing_token_count(path: Path, enc, batch_size: int) -> int:
             if len(texts) >= batch_size:
                 flush()
     flush()
+    _write_cached_token_count(path, total)
     return total
 
 
@@ -405,7 +565,7 @@ def process_shard_file(local_path, text_field, enc, batch_size, out_f, budget, t
 
 
 def download_via_shards(dataset_name, dataset_config, text_field, file_glob, enc,
-                         batch_size, out_f, budget, tag):
+                         batch_size, out_f, budget, tag, parallel_downloads=4):
     """Whole-file downloads via huggingface_hub.hf_hub_download instead of
     datasets' row-by-row streaming. This matters specifically because
     Xet/LFS-backed repos (fineweb-edu's parquet shards are Xet-backed) are
@@ -417,7 +577,21 @@ def download_via_shards(dataset_name, dataset_config, text_field, file_glob, enc
     the same dataset) skips the network entirely for shards already on disk.
     Returns (tokens_written, docs_written, hit_budget) or raises on failure
     so the caller can fall back to streaming mode.
+
+    Downloads up to `parallel_downloads` shards concurrently (network I/O is
+    the bottleneck here, not CPU, so threads -- not processes -- are the
+    right tool; they release the GIL during the actual transfer). Shards are
+    still CONSUMED in original order via executor.map, which blocks on
+    shard i's future before yielding it even if shard i+1 already finished --
+    this keeps the token budget's stopping point deterministic (the same
+    prefix of shards, in the same order, every run) while still letting
+    several downloads happen in the background at once. Purely sequential
+    downloading was the other half of why this used to take so long: with
+    dozens of shards, waiting for each one to fully complete before starting
+    the next serializes what should be independent network transfers.
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     from huggingface_hub import hf_hub_download
 
     files = resolve_shard_files(dataset_name, file_glob)
@@ -427,25 +601,31 @@ def download_via_shards(dataset_name, dataset_config, text_field, file_glob, enc
             f"(dataset repo layout may differ from the fineweb convention "
             f"this guess is based on -- pass --file-glob explicitly)"
         )
-    print(f"[{tag}] shard mode: {len(files)} candidate shard(s) matching {file_glob!r}")
+    print(
+        f"[{tag}] shard mode: {len(files)} candidate shard(s) matching "
+        f"{file_glob!r}, downloading up to {parallel_downloads} concurrently"
+    )
+
+    def _fetch(filename):
+        return filename, hf_hub_download(
+            repo_id=dataset_name, filename=filename, repo_type="dataset"
+        )
 
     tokens_written = 0
     docs_written = 0
-    for i, filename in enumerate(files):
-        print(f"[{tag}] fetching shard {i + 1}/{len(files)}: {filename}")
-        local_path = hf_hub_download(
-            repo_id=dataset_name, filename=filename, repo_type="dataset"
-        )
-        tokens_written, n, hit_budget = process_shard_file(
-            local_path, text_field, enc, batch_size, out_f, budget, tokens_written
-        )
-        docs_written += n
-        print(
-            f"[{tag}]   ... {human(tokens_written)}/{human(budget)} tokens "
-            f"({docs_written} docs so far)"
-        )
-        if hit_budget:
-            return tokens_written, docs_written, True
+    with ThreadPoolExecutor(max_workers=max(1, parallel_downloads)) as pool:
+        for i, (filename, local_path) in enumerate(pool.map(_fetch, files)):
+            print(f"[{tag}] processing shard {i + 1}/{len(files)}: {filename}")
+            tokens_written, n, hit_budget = process_shard_file(
+                local_path, text_field, enc, batch_size, out_f, budget, tokens_written
+            )
+            docs_written += n
+            print(
+                f"[{tag}]   ... {human(tokens_written)}/{human(budget)} tokens "
+                f"({docs_written} docs so far)"
+            )
+            if hit_budget:
+                return tokens_written, docs_written, True
     return tokens_written, docs_written, False
 
 
@@ -491,7 +671,7 @@ def download_via_stream(dataset_name, dataset_config, split, text_field, enc,
     return tokens_written, docs_written, hit_budget
 
 
-for p in plans:
+for p in jobs:
     out_path = Path(out_override) if out_override else repo_root / p["out_path"]
     out_path = out_path if out_path.is_absolute() else repo_root / out_path
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -527,7 +707,7 @@ for p in plans:
             try:
                 tokens_written, docs_written, hit_budget = download_via_shards(
                     dataset_name, dataset_config, text_field, file_glob, enc,
-                    batch_size, out_f, p["budget"], tag,
+                    batch_size, out_f, p["budget"], tag, parallel_downloads,
                 )
             except Exception as exc:
                 if transfer_mode == "shards":
@@ -554,6 +734,7 @@ for p in plans:
             )
 
     tmp_path.replace(out_path)
+    _write_cached_token_count(out_path, tokens_written)
     print(
         f"[{tag}] done: {docs_written} docs, {human(tokens_written)} tokens "
         f"-> {out_path}"

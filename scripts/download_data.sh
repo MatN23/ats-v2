@@ -542,21 +542,29 @@ def resolve_shard_files(dataset_name: str, file_glob: str):
 
 
 def process_shard_file(local_path, text_field, enc, batch_size, out_f, budget, tokens_so_far):
-    """Reads one already-downloaded parquet shard with column projection (only
-    the text column's pages are materialized, not the other ~8 metadata
-    columns fineweb-family datasets carry), then batch-tokenizes/writes/counts
-    exactly like the streaming path's flush_batch, stopping the instant the
-    budget is hit (possibly partway through this shard)."""
-    import pyarrow.parquet as pq
+    """Reads one already-downloaded parquet shard in bounded-size batches
+    (via ParquetFile.iter_batches) with column projection, instead of
+    loading the whole shard's text column into one Python list up front.
 
-    table = pq.read_table(local_path, columns=[text_field])
-    texts_all = table.column(text_field).to_pylist()
-    del table
+    The original approach here was `pq.read_table(...).to_pylist()` on the
+    full shard -- for a real fineweb-edu shard (~2.15GB compressed on disk),
+    decompressing the whole text column and materializing it as individual
+    Python str objects can easily balloon to several times that in RAM (text
+    decompression expansion + per-object Python string overhead across
+    potentially millions of documents). On a resource-constrained
+    environment (Colab's free tier gives ~12-13GB total), that's enough to
+    OOM-kill the whole runtime -- which is exactly what was reported. Batched
+    streaming bounds peak memory to roughly one batch_size worth of documents
+    at a time, regardless of total shard size, and behaves identically
+    otherwise (same token counts, same early-exit-on-budget point)."""
+    import pyarrow.parquet as pq
 
     docs_written = 0
     hit_budget = False
-    for i in range(0, len(texts_all), batch_size):
-        chunk = [t for t in texts_all[i : i + batch_size] if t]
+    parquet_file = pq.ParquetFile(local_path)
+    for record_batch in parquet_file.iter_batches(batch_size=batch_size, columns=[text_field]):
+        texts = record_batch.column(text_field).to_pylist()
+        chunk = [t for t in texts if t]
         tokens_so_far, n, hit_budget = flush_batch(chunk, out_f, enc, budget, tokens_so_far)
         docs_written += n
         if hit_budget:

@@ -26,8 +26,8 @@ training:
   warmup_steps: 500
   min_lr_ratio: 0.1
   grad_clip_norm: 1.0
-  grad_accum_steps: 2
-  micro_batch_size: 4
+  grad_accum_steps: 1
+  micro_batch_size: 8
   eval_every: 1000
   save_every: 1000
   keep_last_n_checkpoints: 3
@@ -41,6 +41,7 @@ data:
   seq_length: 4096
   tokenizer_name: "tiktoken:cl100k_base"
   streaming: true
+  num_workers: 1
 
 parallelism:
   strategy: auto

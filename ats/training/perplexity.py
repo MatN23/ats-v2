@@ -84,11 +84,15 @@ def compute_perplexity(
             )
             # Transpose (metadata-only) instead of an explicit .contiguous()
             # + .view() flatten, which forces a full copy of the whole
-            # logits tensor -- see the matching fix in trainer.py.
+            # logits tensor -- see the matching fix in trainer.py. .float():
+            # see trainer.py's identical fix -- the per-token logsumexp
+            # reduction over vocab_size classes overflows fp16 (sums to
+            # >65504 just from vocab_size alone, independent of prediction
+            # quality) unless logits are upcast first.
             shift_logits = output.logits[..., :-1, :]
             shift_labels = batch["labels"][..., 1:]
             loss = torch.nn.functional.cross_entropy(
-                shift_logits.transpose(1, 2),
+                shift_logits.float().transpose(1, 2),
                 shift_labels,
                 ignore_index=-100,
                 reduction="sum",

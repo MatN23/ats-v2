@@ -4,8 +4,7 @@ its FFN through MoE and/or wraps blocks with Mixture-of-Depths."""
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import cast
+from typing import NamedTuple, cast
 
 import torch
 import torch.utils.checkpoint
@@ -24,8 +23,21 @@ from ats.model.norm import RMSNorm
 from ats.model.swa import is_full_attention_layer
 
 
-@dataclass
-class TransformerOutput:
+class TransformerOutput(NamedTuple):
+    # A NamedTuple, not a @dataclass: DeepSpeed ZeRO-3's
+    # apply_to_tensors_only (deepspeed/runtime/zero/utils.py) walks a
+    # module's forward return value to attach the backward hooks it uses
+    # to know when that module's backward pass has finished, so it can
+    # finalize its parameter-tracking state and prefetch trace for the
+    # next iteration. It only recurses into tuple/list/dict/namedtuple --
+    # a plain dataclass is an unrecognized leaf type, so the hook silently
+    # never attaches to ATSTransformer.forward's output (the ZeRO-3
+    # top-level module boundary), which leaves the param coordinator
+    # without a signal that the iteration's backward completed and hangs
+    # the following iteration. A NamedTuple IS a tuple
+    # (isinstance(x, tuple) is True) with the same import.logits /
+    # .aux_loss attribute access dataclasses gave every call site, so this
+    # fixes the hang with no other code changes.
     logits: torch.Tensor
     aux_loss: torch.Tensor
     past_key_values: list[PastKeyValue | None] | None = None

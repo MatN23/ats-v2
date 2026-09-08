@@ -325,8 +325,22 @@ class Trainer:
         # reshape needed there either) avoids the copy entirely.
         shift_logits = output.logits[..., :-1, :]
         shift_labels = batch["labels"][..., 1:]
+        # .float(): cross_entropy's softmax reduction sums vocab_size
+        # (100352 here) exp() terms. Each term is ~exp(0)==1 near a
+        # well-behaved max-subtracted logit, so the running sum lands
+        # around 100k+ regardless of how good or bad the model's
+        # predictions are -- and that alone exceeds fp16's ~65504 max
+        # representable value, overflowing the loss to inf on every
+        # step (confirmed by reproducing this exact overflow with a
+        # numpy fp16 simulation at realistic init logit scales). DeepSpeed's
+        # plain fp16 mode casts the whole model (and this reduction) to
+        # fp16 with no per-op exception, unlike torch.cuda.amp.autocast,
+        # which specifically forces cross_entropy/log_softmax to run in
+        # fp32 for exactly this reason. Upcasting just for this reduction
+        # avoids the overflow; the extra copy costs far less than a
+        # model+optimizer step that's been training on garbage gradients.
         ce_loss = torch.nn.functional.cross_entropy(
-            shift_logits.transpose(1, 2),
+            shift_logits.float().transpose(1, 2),
             shift_labels,
             ignore_index=-100,
         )
@@ -543,9 +557,13 @@ class Trainer:
                 shift_labels = batch["labels"][..., 1:]
                 # See train_step's identical fix: transpose (metadata-only)
                 # instead of reshape (forces a full contiguous copy of the
-                # whole logits tensor) to flatten for cross_entropy.
+                # whole logits tensor) to flatten for cross_entropy. .float()
+                # avoids the same vocab-size-driven fp16 overflow in the
+                # per-token logsumexp reduction that train_step fixes --
+                # reduction="sum" here doesn't avoid it, since the overflow
+                # happens per-token before the sum/mean combination.
                 loss = torch.nn.functional.cross_entropy(
-                    shift_logits.transpose(1, 2),
+                    shift_logits.float().transpose(1, 2),
                     shift_labels,
                     ignore_index=-100,
                     reduction="sum",

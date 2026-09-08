@@ -168,4 +168,20 @@ def build_dataloader(
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=num_workers > 0,
+        # multiprocessing_context="spawn" (only meaningful when
+        # num_workers > 0; ignored otherwise): by the time this
+        # DataLoader's workers actually get created, the model is already
+        # on the GPU and DeepSpeed's engine has already initialized a CUDA
+        # context in this process. PyTorch's default worker start method
+        # on Linux is fork, which duplicates that already-initialized CUDA
+        # context into every worker -- CUDA is not fork-safe, and combined
+        # with pin_memory=True (which needs the workers' host-memory
+        # pinning to interact with CUDA) this reliably deadlocks rather
+        # than erroring, hanging the training loop the moment a worker is
+        # actually needed. spawn starts each worker as a fresh interpreter
+        # with no inherited CUDA state, which is the standard fix for this
+        # exact deadlock (see PyTorch's multiprocessing-best-practices
+        # docs). Slightly slower worker startup than fork, but correctness
+        # over a few hundred ms of startup latency.
+        multiprocessing_context="spawn" if num_workers > 0 else None,
     )

@@ -43,8 +43,12 @@ def compute_mtp_loss_from_logits(
             continue
         pred = logits[:, : seq_len - k, :].contiguous()
         target = labels[:, k:].contiguous()
+        # .float(): see ats/training/trainer.py's identical fix -- the
+        # per-token logsumexp reduction over vocab_size classes overflows
+        # fp16 purely from vocab_size (sums to >65504 regardless of
+        # prediction quality) unless logits are upcast first.
         loss_k = F.cross_entropy(
-            pred.reshape(-1, vocab_size),
+            pred.float().reshape(-1, vocab_size),
             target.reshape(-1),
             ignore_index=IGNORE_INDEX,
         )

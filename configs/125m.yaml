@@ -18,7 +18,7 @@ model:
   quantization: none
   dropout: 0.0
   use_flash_attention: true
-  gradient_checkpointing: true
+  gradient_checkpointing: false
 
 training:
   max_steps: 50000

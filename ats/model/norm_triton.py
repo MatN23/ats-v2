@@ -47,6 +47,27 @@ try:
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
+except Exception as exc:  # noqa: BLE001 -- deliberately broad: this
+    # is an optional-dependency import guard (see the comment below)
+    # and must catch whatever a broken/mismatched native install
+    # raises, not just ImportError, or the fallback this guard exists
+    # for never triggers.
+    # BUG-123 (same class as ats.model.moe's DeepSpeed import guard): triton
+    # is a compiled, torch/CUDA-version-sensitive dependency. An
+    # incompatible install can raise something other than ImportError deep
+    # inside its own import machinery, which previously crashed this module
+    # (and everything that imports it) instead of degrading to the
+    # documented PyTorch fallback every function in this file already has.
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "triton is installed but failed to import cleanly (%s: %s). Falling "
+        "back to the pure-PyTorch implementation. Fix: reinstall triton "
+        "matching your installed torch/CUDA version.",
+        type(exc).__name__,
+        exc,
+    )
+    HAS_TRITON = False
 
 
 if HAS_TRITON:
@@ -142,7 +163,11 @@ def fused_rmsnorm_residual(
             f"x last dim {x.shape[-1]}."
         )
     use_triton = HAS_TRITON and x.is_cuda
-    if use_triton and torch.is_grad_enabled() and (x.requires_grad or residual.requires_grad or weight.requires_grad):
+    if (
+        use_triton
+        and torch.is_grad_enabled()
+        and (x.requires_grad or residual.requires_grad or weight.requires_grad)
+    ):
         raise RuntimeError(
             "fused_rmsnorm_residual: the Triton path is not differentiable (it launches a raw "
             "kernel into a torch.empty buffer, which autograd cannot see), and "

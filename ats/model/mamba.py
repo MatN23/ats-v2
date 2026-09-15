@@ -35,8 +35,8 @@ pre-norm residual wrapping: `x + MambaBlock(norm(x))`.
 from __future__ import annotations
 
 import torch
-import torch.utils.checkpoint
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch import nn
 
 

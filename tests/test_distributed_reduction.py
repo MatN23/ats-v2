@@ -41,9 +41,7 @@ def _worker(rank: int, world_size: int, queue) -> None:  # pragma: no cover - su
         local_loss = torch.tensor(1.0 if rank == 0 else 5.0)
         reduced = _distributed_mean(local_loss.clone())
 
-        local_util = (
-            {0: 1.0, 1: 0.0} if rank == 0 else {0: 0.0, 1: 1.0}
-        )
+        local_util = {0: 1.0, 1: 0.0} if rank == 0 else {0: 0.0, 1: 1.0}
         reduced_util = _reduce_expert_utilization(local_util, torch.device("cpu"))
 
         # And confirm the controller actually agrees given identical input.
@@ -72,7 +70,13 @@ def _worker(rank: int, world_size: int, queue) -> None:  # pragma: no cover - su
                 None if action is None else action.type,
             )
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 -- deliberately broad: this runs in a
+        # forked worker process, and the ONLY way the parent test learns
+        # what went wrong is this queue.put. Narrowing the type would mean
+        # an unexpected failure (an import error, a torch internal error,
+        # an assertion from a future edit to this function) hangs the
+        # parent's queue.get() with no diagnostic instead of failing the
+        # test with a clear traceback.
         queue.put((rank, None, None, "ERROR:\n" + traceback.format_exc()))
     finally:
         dist.destroy_process_group()
@@ -128,5 +132,3 @@ def test_controller_inputs_are_identical_across_ranks():
     assert action0 == action1 == "emergency_lr_cut", (
         "ranks took different adaptive actions from the same step"
     )
-
-

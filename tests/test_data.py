@@ -352,7 +352,7 @@ def test_preprocessed_source_read_by_mixed_dataset(tmp_path):
     # below are unchanged in strength -- exact token ids, exact label
     # masking -- they just compare through .tolist() so `==` is a value
     # comparison rather than numpy's elementwise broadcast.
-    input_ids_seen = {tuple(list(ex["input_ids"])) for ex in examples}
+    input_ids_seen = {tuple(ex["input_ids"]) for ex in examples}
     assert input_ids_seen == {tuple(blocks[0]), tuple(blocks[1])}
 
     padded_example = next(

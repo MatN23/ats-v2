@@ -31,6 +31,37 @@ try:
 except ImportError:
     DeepSpeedMoE = None
     _DEEPSPEED_MOE_AVAILABLE = False
+except Exception as exc:  # noqa: BLE001 -- deliberately broad: this
+    # is an optional-dependency import guard (see the comment below)
+    # and must catch whatever a broken/mismatched native install
+    # raises, not just ImportError, or the fallback this guard exists
+    # for never triggers.
+    # BUG-123: deepspeed is a large package with its own internal import
+    # chain (module_inject -> pipe -> activation_checkpointing -> compile ->
+    # custom_ops, at last count), and that chain calls torch APIs (e.g.
+    # torch.library.custom_op) whose accepted argument types have changed
+    # between torch releases. `pip install deepspeed` with no upper pin
+    # against an incompatible installed torch version raises deep inside
+    # that chain -- a plain ValueError, TypeError, or AttributeError, NOT
+    # ImportError -- so the narrower except above did not catch it and this
+    # module failed to import at all, taking every caller of
+    # ats.model.moe down with it (including the pure-PyTorch fallback path
+    # this try/except exists to protect). A broken/mismatched optional
+    # dependency should degrade to the documented fallback, not crash
+    # unrelated code that never asked for DeepSpeed's MoE. Logged at
+    # warning level (not silently swallowed) so a real installation
+    # problem is still visible.
+    logger.warning(
+        "deepspeed is installed but failed to import cleanly (%s: %s). This "
+        "usually means the installed deepspeed version is incompatible with "
+        "the installed torch version. Falling back to the pure-PyTorch MoE "
+        "implementation. Fix: check `pip show deepspeed torch` for a version "
+        "mismatch, or reinstall deepspeed matching your torch version.",
+        type(exc).__name__,
+        exc,
+    )
+    DeepSpeedMoE = None
+    _DEEPSPEED_MOE_AVAILABLE = False
 
 
 class _PyTorchMoEFallback(nn.Module):

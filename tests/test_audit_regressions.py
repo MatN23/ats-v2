@@ -9,7 +9,9 @@ shape of the code.
 
 from __future__ import annotations
 
+import contextlib
 import gc
+import unittest.mock
 
 import pytest
 import torch
@@ -21,7 +23,6 @@ from ats.model.mamba import MambaBlock
 from ats.model.mla import MLAAttention
 from ats.model.mod import MixtureOfDepths
 from ats.model.transformer import ATSTransformer
-
 
 # ---------------------------------------------------------------------------
 # BUG-101: the flash_attn dispatch condition ignored attention_mask, so a
@@ -96,7 +97,10 @@ def test_padded_batch_stays_causal_even_when_flash_is_available(monkeypatch):
 
     torch.manual_seed(0)
     attn = GroupedQueryAttention(
-        hidden_size=32, num_heads=4, num_kv_heads=2, max_seq_len=16,
+        hidden_size=32,
+        num_heads=4,
+        num_kv_heads=2,
+        max_seq_len=16,
         use_flash_attention=True,
     )
     attn.eval()
@@ -221,8 +225,9 @@ class _RecordingBlock(torch.nn.Module):
         self.seen_shapes: list[tuple[int, ...]] = []
         self.seen_masks: list[torch.Tensor | None] = []
 
-    def forward(self, x, attention_mask=None, past_key_value=None,
-                use_cache=False, causal=True):
+    def forward(
+        self, x, attention_mask=None, past_key_value=None, use_cache=False, causal=True
+    ):
         self.seen_shapes.append(tuple(x.shape))
         self.seen_masks.append(attention_mask)
         return self.lin(x), torch.zeros(()), None
@@ -231,12 +236,12 @@ class _RecordingBlock(torch.nn.Module):
 @pytest.mark.parametrize(
     "seq_len, capacity_factor, expected_capacity",
     [
-        (16, 0.25, 4),   # capacity well below seq_len
+        (16, 0.25, 4),  # capacity well below seq_len
         (16, 0.5, 8),
-        (16, 1.0, 16),   # capacity == seq_len
-        (1, 0.5, 1),     # degenerate: max(1, ...) floor
-        (3, 0.5, 1),     # very short sequence
-        (7, 0.75, 5),    # non-divisible
+        (16, 1.0, 16),  # capacity == seq_len
+        (1, 0.5, 1),  # degenerate: max(1, ...) floor
+        (3, 0.5, 1),  # very short sequence
+        (7, 0.75, 5),  # non-divisible
     ],
 )
 def test_mod_block_receives_exactly_capacity_tokens(
@@ -379,9 +384,16 @@ def test_mod_falls_back_to_dense_for_cached_generation():
 
 def test_mod_end_to_end_through_transformer_with_padding_and_gradients():
     config = ModelConfig(
-        hidden_size=32, num_layers=2, num_heads=4, num_kv_heads=2,
-        intermediate_size=64, vocab_size=50, max_seq_len=32,
-        use_mod=True, mod_capacity_factor=0.5, use_flash_attention=False,
+        hidden_size=32,
+        num_layers=2,
+        num_heads=4,
+        num_kv_heads=2,
+        intermediate_size=64,
+        vocab_size=50,
+        max_seq_len=32,
+        use_mod=True,
+        mod_capacity_factor=0.5,
+        use_flash_attention=False,
     )
     torch.manual_seed(0)
     model = ATSTransformer(config)
@@ -406,11 +418,17 @@ def _live_tensor_bytes() -> int:
     gc.collect()
     total = 0
     for obj in gc.get_objects():
+        # gc.get_objects() can return objects mid-teardown (e.g. a tensor
+        # whose storage was already freed), where isinstance/attribute
+        # access on it can raise. This is a defensive best-effort memory
+        # measurement, not correctness-critical code, so a stray object of
+        # that kind is skipped rather than failing the test.
+        if not torch.is_tensor(obj):
+            continue
         try:
-            if torch.is_tensor(obj):
-                total += obj.numel() * obj.element_size()
-        except Exception:  # pragma: no cover - defensive during gc walk
-            pass
+            total += obj.numel() * obj.element_size()
+        except RuntimeError:  # pragma: no cover - freed/invalid storage
+            continue
     return total
 
 
@@ -474,9 +492,7 @@ def test_mamba_retained_activations_do_not_scale_with_chunk_count():
     multiple of ONE chunk, independent of sequence length.
     """
     b, s, hidden, d_state, chunk = 2, 512, 128, 16, 32
-    block = MambaBlock(
-        hidden_size=hidden, d_state=d_state, expand=2, chunk_size=chunk
-    )
+    block = MambaBlock(hidden_size=hidden, d_state=d_state, expand=2, chunk_size=chunk)
     x = torch.randn(b, s, hidden, requires_grad=True)
 
     before = _live_tensor_bytes()
@@ -728,9 +744,9 @@ def test_preprocessed_block_output_matches_the_original_implementation(
 
     seq_length = 6
     blocks = [
-        [1, 2, 3, 4, 5, 6],       # fully valid
-        [7, 8, 9, 0, 0, 0],       # partially padded
-        [0, 0, 0, 0, 0, 11],      # almost entirely padded
+        [1, 2, 3, 4, 5, 6],  # fully valid
+        [7, 8, 9, 0, 0, 0],  # partially padded
+        [0, 0, 0, 0, 0, 11],  # almost entirely padded
         [12, 13, 14, 15, 16, 17],  # fully valid again
     ]
     valid_lengths = [6, 3, 1, 6]
@@ -748,8 +764,7 @@ def test_preprocessed_block_output_matches_the_original_implementation(
             f"({padding_side} padding)"
         )
         assert list(example["labels"]) == ref_labels, (
-            f"labels diverged from the original implementation "
-            f"({padding_side} padding)"
+            f"labels diverged from the original implementation ({padding_side} padding)"
         )
         # Tokens themselves are never masked -- only labels are.
         assert list(example["input_ids"]) == list(row)
@@ -788,7 +803,7 @@ def test_preprocessed_sharding_still_partitions_blocks_disjointly(tmp_path):
         for example in _iter_preprocessed_examples(
             bin_path, seq_length, shard_id=shard_id, num_shards=3
         ):
-            seen.append(list(example["input_ids"])[0])
+            seen.append(next(iter(example["input_ids"])))
     assert sorted(seen) == list(range(10)), "sharding dropped or duplicated blocks"
 
 
@@ -817,3 +832,126 @@ def test_collate_accepts_both_array_and_list_examples():
     assert torch.equal(a["labels"], b["labels"])
     assert a["input_ids"].dtype == torch.long
     assert b["labels"].dtype == torch.long
+
+
+# ---------------------------------------------------------------------------
+# BUG-123: optional heavy-dependency import guards (deepspeed's MoE layer,
+# flash_attn, triton) only caught ImportError. Reproduced live during this
+# audit: deepspeed 0.19.6 installed against torch 2.5.1 raised a bare
+# ValueError from deep inside deepspeed's own import chain (its
+# torch.library.custom_op registration), which propagated straight through
+# ats/model/moe.py's `except ImportError` and crashed the import of every
+# caller of that module -- not just MoE users. The fallback these guards
+# exist for never got a chance to run.
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _reloaded_with_broken_import(target_module, import_name, exc):
+    """Simulates `import <import_name>` raising `exc` instead of succeeding,
+    reloads target_module so its module-level try/except re-runs against
+    the broken import, yields the reloaded module, and then restores the
+    EXACT original module object afterwards -- not a second fresh import.
+
+    This matters: ats.model.__init__ and ats.model.transformer import
+    classes (e.g. MoELayer) FROM these modules at import time and keep
+    their own reference. Popping a module from sys.modules and reimporting
+    it creates a NEW, distinct class object; every isinstance() check
+    elsewhere in the process that closed over the original class then
+    silently starts failing for the rest of the test session. Restoring
+    the original module object (rather than importing a fresh one) is what
+    makes this test hermetic.
+    """
+    import builtins
+    import importlib
+    import sys
+
+    # Ensure target_module is actually loaded before capturing "the
+    # original" -- run in isolation (e.g. `pytest
+    # tests/test_audit_regressions.py` on its own), a module like
+    # ats.model.mla_triton may never have been imported by anything else
+    # yet, so sys.modules would not have an entry to restore.
+    if target_module not in sys.modules:
+        importlib.import_module(target_module)
+    original_module = sys.modules[target_module]
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == import_name or name.startswith(import_name + "."):
+            raise exc
+        return real_import(name, *args, **kwargs)
+
+    try:
+        with unittest.mock.patch("builtins.__import__", side_effect=fake_import):
+            del sys.modules[target_module]
+            reloaded = importlib.import_module(target_module)
+            yield reloaded
+    finally:
+        sys.modules[target_module] = original_module
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ValueError("infer_schema(func): unsupported parameter type"),
+        TypeError("unexpected keyword argument"),
+        AttributeError("module has no attribute 'custom_op'"),
+    ],
+)
+def test_moe_survives_a_non_import_error_from_deepspeed(exc):
+    """This is the exact failure mode reproduced live: deepspeed installed,
+    but its own import chain raises something other than ImportError.
+    ats.model.moe must still import and fall back, not crash.
+    """
+    with _reloaded_with_broken_import("ats.model.moe", "deepspeed", exc) as module:
+        assert module._DEEPSPEED_MOE_AVAILABLE is False
+        assert module.DeepSpeedMoE is None
+        # And the fallback actually works, not just the flag. Built via
+        # this reloaded module's OWN MoELayer/_PyTorchMoEFallback classes
+        # (not the ones imported at the top of this test file), since
+        # those are now two distinct class objects for the duration of
+        # this `with` block.
+        layer = module.MoELayer(
+            hidden_size=8,
+            intermediate_size=16,
+            num_experts=2,
+            num_layers=1,
+            top_k=1,
+        )
+        assert layer.uses_deepspeed is False
+        out, aux = layer(torch.randn(1, 3, 8))
+        assert out.shape == (1, 3, 8)
+        assert torch.isfinite(aux)
+
+
+def test_moe_still_falls_back_cleanly_on_plain_import_error():
+    """The original, narrower behaviour must be unchanged: a plain
+    ImportError (deepspeed simply not installed) still falls back exactly
+    as before.
+    """
+    with _reloaded_with_broken_import(
+        "ats.model.moe", "deepspeed", ImportError("no module")
+    ) as module:
+        assert module._DEEPSPEED_MOE_AVAILABLE is False
+        assert module.DeepSpeedMoE is None
+
+
+@pytest.mark.parametrize(
+    "module_name,import_name",
+    [
+        ("ats.model.attention", "flash_attn"),
+        ("ats.model.moe_triton", "triton"),
+        ("ats.model.rope_triton", "triton"),
+        ("ats.model.norm_triton", "triton"),
+        ("ats.model.mla_triton", "triton"),
+    ],
+)
+def test_optional_dependency_guards_survive_non_import_errors(module_name, import_name):
+    """Same bug class, audited across every module with the same pattern:
+    flash_attn and each Triton module. A version-mismatch failure inside
+    the optional dependency's own import machinery must not propagate.
+    """
+    exc = RuntimeError("simulated incompatible native extension")
+    with _reloaded_with_broken_import(module_name, import_name, exc) as module:
+        flag_name = "_FLASH_ATTN_AVAILABLE" if "flash" in import_name else "HAS_TRITON"
+        assert getattr(module, flag_name) is False

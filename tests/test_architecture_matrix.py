@@ -30,16 +30,16 @@ from ats.model.rope import RotaryEmbedding, apply_rotary_pos_emb
 from ats.model.swa import generate_swa_mask, is_full_attention_layer
 from ats.model.transformer import ATSTransformer
 
-BASE = dict(
-    hidden_size=32,
-    num_layers=4,
-    num_heads=4,
-    num_kv_heads=2,
-    intermediate_size=64,
-    vocab_size=41,
-    max_seq_len=32,
-    use_flash_attention=False,
-)
+BASE = {
+    "hidden_size": 32,
+    "num_layers": 4,
+    "num_heads": 4,
+    "num_kv_heads": 2,
+    "intermediate_size": 64,
+    "vocab_size": 41,
+    "max_seq_len": 32,
+    "use_flash_attention": False,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -47,13 +47,17 @@ BASE = dict(
 # ---------------------------------------------------------------------------
 
 _FEATURES = {
-    "swa": dict(use_swa=True, swa_window_size=4, swa_full_attention_interval=2),
-    "mla": dict(use_mla=True),
-    "mamba": dict(use_mamba=True, mamba_every_n_layers=2, mamba_d_state=4,
-                  mamba_chunk_size=4),
-    "moe": dict(use_moe=True, num_experts=4, moe_top_k=2),
-    "mod": dict(use_mod=True, mod_capacity_factor=0.5),
-    "mtp": dict(use_mtp=True, mtp_num_tokens=2),
+    "swa": {"use_swa": True, "swa_window_size": 4, "swa_full_attention_interval": 2},
+    "mla": {"use_mla": True},
+    "mamba": {
+        "use_mamba": True,
+        "mamba_every_n_layers": 2,
+        "mamba_d_state": 4,
+        "mamba_chunk_size": 4,
+    },
+    "moe": {"use_moe": True, "num_experts": 4, "moe_top_k": 2},
+    "mod": {"use_mod": True, "mod_capacity_factor": 0.5},
+    "mtp": {"use_mtp": True, "mtp_num_tokens": 2},
 }
 
 
@@ -83,10 +87,13 @@ def _run_forward_backward(config, batch=2, seq_len=12, with_mask=False):
     assert torch.isfinite(out.logits).all(), "non-finite logits"
     assert torch.isfinite(out.aux_loss).all(), "non-finite aux loss"
 
-    loss = F.cross_entropy(
-        out.logits[:, :-1].reshape(-1, config.vocab_size),
-        input_ids[:, 1:].reshape(-1),
-    ) + out.aux_loss
+    loss = (
+        F.cross_entropy(
+            out.logits[:, :-1].reshape(-1, config.vocab_size),
+            input_ids[:, 1:].reshape(-1),
+        )
+        + out.aux_loss
+    )
     if out.mtp_logits is not None:
         for logits in out.mtp_logits:
             assert logits.shape == (batch, seq_len, config.vocab_size)
@@ -105,9 +112,7 @@ def test_dense_baseline(names):
     _run_forward_backward(_build(names))
 
 
-@pytest.mark.parametrize(
-    "names", [(n,) for n in _FEATURES], ids=list(_FEATURES)
-)
+@pytest.mark.parametrize("names", [(n,) for n in _FEATURES], ids=list(_FEATURES))
 def test_single_feature(names):
     _run_forward_backward(_build(names))
     _run_forward_backward(_build(names), with_mask=True)
@@ -138,9 +143,7 @@ def test_all_features_at_once():
     _run_forward_backward(config)
 
 
-@pytest.mark.parametrize(
-    "seq_len,batch", [(1, 1), (2, 1), (3, 3), (12, 1), (17, 2)]
-)
+@pytest.mark.parametrize("seq_len,batch", [(1, 1), (2, 1), (3, 3), (12, 1), (17, 2)])
 def test_odd_shapes_across_a_representative_combination(seq_len, batch):
     """Unusual batch sizes and sequence lengths, including seq_len below
     MoD's capacity floor and below MTP's offset count.
@@ -156,8 +159,12 @@ def test_odd_shapes_across_a_representative_combination(seq_len, batch):
 def test_diffusion_backbone_composes_with_supported_features():
     from ats.model.diffusion import DiffusionLM
 
-    for extra in ({}, dict(use_moe=True, num_experts=4, moe_top_k=2),
-                  dict(use_mod=True, mod_capacity_factor=0.5)):
+    extras = (
+        {},
+        {"use_moe": True, "num_experts": 4, "moe_top_k": 2},
+        {"use_mod": True, "mod_capacity_factor": 0.5},
+    )
+    for extra in extras:
         kwargs = dict(BASE)
         kwargs.update(extra)
         kwargs["model_type"] = "diffusion"
@@ -229,7 +236,7 @@ def test_rope_cache_growth_is_value_preserving():
 
 def _reference_gqa(q, k, v, num_kv_groups, causal=True, key_mask=None):
     """Naive GQA: expand kv heads with a Python loop, score, mask, softmax."""
-    b, h, s, d = q.shape
+    _b, h, s, d = q.shape
     out = torch.zeros_like(q)
     for head in range(h):
         kv_head = head // num_kv_groups
@@ -246,7 +253,10 @@ def _reference_gqa(q, k, v, num_kv_groups, causal=True, key_mask=None):
 def test_gqa_attention_matches_a_naive_reference_including_gradients():
     torch.manual_seed(0)
     attn = GroupedQueryAttention(
-        hidden_size=32, num_heads=4, num_kv_heads=2, max_seq_len=16,
+        hidden_size=32,
+        num_heads=4,
+        num_kv_heads=2,
+        max_seq_len=16,
         use_flash_attention=False,
     ).double()
     attn.eval()
@@ -313,9 +323,15 @@ def test_swa_and_full_attention_layers_actually_differ_in_a_real_model():
     far-past token and checking the two layer types respond differently.
     """
     torch.manual_seed(0)
-    config = ModelConfig(**{**BASE, "num_layers": 2, "use_swa": True,
-                            "swa_window_size": 2,
-                            "swa_full_attention_interval": 2})
+    config = ModelConfig(
+        **{
+            **BASE,
+            "num_layers": 2,
+            "use_swa": True,
+            "swa_window_size": 2,
+            "swa_full_attention_interval": 2,
+        }
+    )
     model = ATSTransformer(config)
     blocks = [layer for layer in model.layers]
     assert blocks[0].force_full_attention is False
@@ -354,7 +370,10 @@ def test_mla_incremental_decode_matches_a_full_forward():
 def test_gqa_incremental_decode_matches_a_full_forward():
     torch.manual_seed(0)
     attn = GroupedQueryAttention(
-        hidden_size=32, num_heads=4, num_kv_heads=2, max_seq_len=16,
+        hidden_size=32,
+        num_heads=4,
+        num_kv_heads=2,
+        max_seq_len=16,
         use_flash_attention=False,
     ).double()
     attn.eval()
@@ -403,8 +422,7 @@ def test_mtp_raises_rather_than_silently_skipping_an_impossible_offset():
 
 
 def test_gradient_checkpointing_produces_identical_values_and_gradients():
-    """Checkpointing is a memory/compute tradeoff, not an approximation.
-    """
+    """Checkpointing is a memory/compute tradeoff, not an approximation."""
     config_kwargs = {**BASE, "num_layers": 4}
     torch.manual_seed(0)
     plain = ATSTransformer(ModelConfig(**config_kwargs)).double()

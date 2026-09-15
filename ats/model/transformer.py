@@ -539,9 +539,7 @@ class ATSTransformer(nn.Module):
         # skips them by default, and `return_mtp_logits` lets any caller
         # override in either direction (e.g. speculative decoding asking
         # for the auxiliary heads during generation).
-        want_mtp = (
-            return_mtp_logits if return_mtp_logits is not None else not use_cache
-        )
+        want_mtp = return_mtp_logits if return_mtp_logits is not None else not use_cache
         mtp_logits = self.mtp_head(x) if (self.uses_mtp and want_mtp) else None
         expert_utilization = self._collect_expert_utilization()
 
@@ -597,7 +595,9 @@ class ATSTransformer(nn.Module):
             [
                 t
                 if t.numel() == num_experts
-                else F.pad(t.flatten()[:num_experts], (0, max(0, num_experts - t.numel())))
+                else F.pad(
+                    t.flatten()[:num_experts], (0, max(0, num_experts - t.numel()))
+                )
                 for t in per_layer
             ]
         )

@@ -182,9 +182,10 @@ def test_mod_respects_capacity(dummy_model_config):
         expected_idx, _ = torch.sort(
             torch.topk(gate_probs, expected_capacity, dim=1).indices, dim=1
         )
-    assert torch.equal(block.seen_inputs[0], x.gather(
-        1, expected_idx.unsqueeze(-1).expand(-1, -1, hidden_size)
-    ))
+    assert torch.equal(
+        block.seen_inputs[0],
+        x.gather(1, expected_idx.unsqueeze(-1).expand(-1, -1, hidden_size)),
+    )
 
 
 def test_mod_forward_does_not_crash_wrapping_a_real_transformer_block():

@@ -25,6 +25,29 @@ try:
 except ImportError:
     flash_attn_func = None
     _FLASH_ATTN_AVAILABLE = False
+except Exception as exc:  # noqa: BLE001 -- deliberately broad: this
+    # is an optional-dependency import guard (see the comment below)
+    # and must catch whatever a broken/mismatched native install
+    # raises, not just ImportError, or the fallback this guard exists
+    # for never triggers.
+    # BUG-123 (same class as ats.model.moe's DeepSpeed import guard):
+    # flash_attn is a compiled CUDA extension whose ABI is sensitive to the
+    # installed torch/CUDA version. An incompatible combination can raise
+    # from deep inside flash_attn's own import (e.g. a CUDA symbol lookup
+    # failure), which is not an ImportError and was previously uncaught --
+    # crashing this entire module (and every model that imports
+    # GroupedQueryAttention) instead of degrading to the documented SDPA
+    # fallback.
+    logger.warning(
+        "flash_attn is installed but failed to import cleanly (%s: %s). "
+        "Falling back to torch.nn.functional.scaled_dot_product_attention. "
+        "Fix: reinstall flash_attn matching your installed torch/CUDA "
+        "version.",
+        type(exc).__name__,
+        exc,
+    )
+    flash_attn_func = None
+    _FLASH_ATTN_AVAILABLE = False
 
 PastKeyValue = tuple[torch.Tensor, torch.Tensor]
 

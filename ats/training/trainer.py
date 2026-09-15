@@ -7,7 +7,7 @@ scheduler/checkpoint/monitor/adaptive-controller infrastructure."""
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 import torch
@@ -21,6 +21,7 @@ from ats.training.adaptive_controller import AdaptiveController, TrainingMetrics
 from ats.training.checkpoint import CheckpointManager, TrainingHaltError
 from ats.training.monitor import Monitor
 from ats.training.scheduler import WarmupCosineScheduler
+from ats.utils.device import resolve_device
 from ats.utils.logging_utils import get_logger
 from ats.utils.memory import estimate_memory
 
@@ -148,6 +149,53 @@ def _distributed_sum(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _is_distributed() -> bool:
+    return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+
+
+def _distributed_mean(tensor: torch.Tensor) -> torch.Tensor:
+    """Averages a scalar across the data-parallel group, in place.
+
+    BUG-107: AdaptiveController's inputs must be IDENTICAL on every rank.
+    Its decisions (emergency LR cut, spike cut, plateau boost, and the
+    training_halt that raises TrainingHaltError) change the LR the
+    optimizer uses and whether the process keeps running. Fed a rank-local
+    micro-batch loss, rank 0 could cut the LR on a spike its own shard
+    happened to see while rank 1 did not -- leaving ranks training the same
+    all-reduced gradients with DIFFERENT learning rates, which silently
+    stops being synchronous SGD. Worse, a rank-local `training_halt` raises
+    on one rank only; the remaining ranks then block forever on the next
+    collective. Averaging first makes every rank compute the same action
+    from the same numbers.
+
+    Cost: one all_reduce of a single scalar per optimizer step, which is
+    immaterial next to the full-model gradient reduction on the same step.
+    """
+    if _is_distributed():
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor = tensor / dist.get_world_size()
+    return tensor
+
+
+def _reduce_expert_utilization(
+    utilization: Mapping[int, float] | None, device: torch.device
+) -> Mapping[int, float] | None:
+    """Averages per-expert utilization across ranks, for the same reason as
+    _distributed_mean: expert-collapse warnings should describe the whole
+    job, not one rank's shard, and must not differ between ranks. With
+    expert parallelism a single rank only hosts a subset of experts, so a
+    rank-local view of "expert 3 is unused" is close to meaningless.
+    """
+    if utilization is None or not _is_distributed():
+        return utilization
+    keys = sorted(utilization)
+    values = torch.tensor(
+        [utilization[k] for k in keys], dtype=torch.float32, device=device
+    )
+    values = _distributed_mean(values)
+    return dict(zip(keys, values.tolist()))
+
+
 def _capture_controller_state(controller: AdaptiveController) -> dict[str, Any]:
     """Snapshots the AdaptiveController's mutable internal counters so they
     survive a checkpoint/resume cycle. Without this, a resumed run forgets
@@ -174,6 +222,74 @@ def _restore_controller_state(
     controller._consecutive_plateau_boosts = client_state.get(
         "controller_consecutive_plateau_boosts", controller._consecutive_plateau_boosts
     )
+
+
+class _GradNormTracker:
+    """Reports the global gradient norm for an optimizer step.
+
+    BUG-108: the previous fallback ran clip_grad_norm_(max_norm=inf) AFTER
+    model_engine.step() had already cleared the gradients, so on any engine
+    that does not expose get_global_grad_norm() (a plain non-DeepSpeed
+    engine, or DeepSpeed with gradient_clipping disabled) the reported norm
+    was ~0.0 on every single step -- forever. That number is not just
+    logged: it is fed to AdaptiveController.step() as `grad_norm`, and the
+    emergency gradient-explosion check is `grad_norm > threshold`. A
+    permanent 0.0 means that safety check could never fire on those
+    engines, silently, while the logs showed a plausible-looking zero.
+
+    The fix keeps the fast path intact -- when the engine reports its own
+    (already globally reduced) norm, nothing extra is computed -- and only
+    falls back to a manual pass for engines that have proven they do not
+    report one, computing it BEFORE step() where the gradients still exist.
+    The first step on such an engine still reports the degraded value,
+    because whether the engine reports a norm is not knowable until it has
+    been asked once; that one step is called out in the warning.
+    """
+
+    def __init__(self, engine: Any) -> None:
+        self.engine = engine
+        # None = not yet known whether this engine reports its own norm.
+        self._engine_reports: bool | None = (
+            None if hasattr(engine, "get_global_grad_norm") else False
+        )
+
+    @property
+    def needs_pre_step_norm(self) -> bool:
+        return self._engine_reports is False
+
+    def pre_step(self) -> float | None:
+        """Call immediately BEFORE engine.step(). Returns a manually
+        computed norm when this engine is known not to report one."""
+        if not self.needs_pre_step_norm:
+            return None
+        return self._manual_norm()
+
+    def post_step(self, pre_step_norm: float | None) -> float:
+        """Call immediately AFTER engine.step()."""
+        getter = getattr(self.engine, "get_global_grad_norm", None)
+        if getter is not None:
+            reported = getter()
+            if reported is not None:
+                self._engine_reports = True
+                return float(reported)
+        if pre_step_norm is not None:
+            return pre_step_norm
+        if self._engine_reports is None:
+            self._engine_reports = False
+            logger.warning(
+                "This engine does not report a global gradient norm; ats will "
+                "compute it directly before each optimizer step from now on. "
+                "The norm reported for this first step is measured after the "
+                "step cleared gradients and is therefore not meaningful."
+            )
+        return self._manual_norm()
+
+    def _manual_norm(self) -> float:
+        return float(
+            torch.nn.utils.clip_grad_norm_(
+                self.engine.parameters(), max_norm=float("inf")
+            )
+        )
 
 
 class Trainer:
@@ -227,6 +343,23 @@ class Trainer:
         self.epoch = 0
         self._accumulation_step = 0
         self._accumulated_tokens = 0
+
+    @property
+    def _grad_norm_tracker(self) -> _GradNormTracker:
+        """Lazily bound to whatever engine this trainer currently holds.
+
+        A property rather than an __init__ assignment so the tracker is
+        always consistent with self.model_engine even when a trainer is
+        assembled without running __init__ (the pattern the test suite uses
+        to exercise train_step against a stub engine without standing up
+        DeepSpeed), and so swapping the engine cannot leave a tracker
+        holding a stale reference and reporting another engine's norms.
+        """
+        tracker = self.__dict__.get("_grad_norm_tracker_impl")
+        if tracker is None or tracker.engine is not self.model_engine:
+            tracker = _GradNormTracker(self.model_engine)
+            self.__dict__["_grad_norm_tracker_impl"] = tracker
+        return tracker
 
     def resume(self, checkpoint_dir: str) -> None:
         client_state = self.checkpoint_manager.load(self.model_engine, checkpoint_dir)
@@ -299,49 +432,44 @@ class Trainer:
     def train_step(self, batch: Any) -> TrainingMetrics | None:
         """Process one micro-batch. Returns metrics only on optimizer step boundary."""
         # Reset accumulation state at start to prevent stale gradients after exceptions
-        device = (
-            self.model_engine.local_rank
-            if isinstance(self.model_engine.local_rank, torch.device)
-            else torch.device(f"cuda:{self.model_engine.local_rank}")
-        )
+        # BUG-105: this used to hardcode torch.device(f"cuda:{local_rank}"),
+        # making CPU and MPS training impossible. See ats.utils.device.
+        device = resolve_device(self.model_engine)
         batch = _move_batch_to_device(batch, device)
 
         output = self.model_engine(
             batch["input_ids"], attention_mask=batch.get("attention_mask")
         )
 
-        # shift_logits (a slice off dim=-2, not the last dim) is NOT
-        # contiguous: its per-batch stride still reflects the original
-        # (unsliced) seq_len, so .reshape(-1, vocab) below used to force a
-        # full contiguous copy of the ENTIRE [batch*(seq_len-1), vocab]
-        # logits tensor just to flatten it -- at seq_len=4096, vocab=100352,
-        # fp16 and the batch=8 micro-batch from Fix 4, that's an extra
-        # ~6.5 GiB allocation on every single forward pass (and it has to
-        # stick around for backward), on top of whatever logits already
-        # cost. F.cross_entropy natively accepts (N, C, d1, ...) input with
-        # (N, d1, ...) targets (the same convention as its 2D/segmentation
-        # use), so transposing to put the class dim second -- a metadata-only
-        # operation, 0 extra bytes -- and passing shift_labels as-is (no
-        # reshape needed there either) avoids the copy entirely.
         shift_logits = output.logits[..., :-1, :]
         shift_labels = batch["labels"][..., 1:]
-        # .float(): cross_entropy's softmax reduction sums vocab_size
-        # (100352 here) exp() terms. Each term is ~exp(0)==1 near a
-        # well-behaved max-subtracted logit, so the running sum lands
-        # around 100k+ regardless of how good or bad the model's
-        # predictions are -- and that alone exceeds fp16's ~65504 max
-        # representable value, overflowing the loss to inf on every
-        # step (confirmed by reproducing this exact overflow with a
-        # numpy fp16 simulation at realistic init logit scales). DeepSpeed's
-        # plain fp16 mode casts the whole model (and this reduction) to
-        # fp16 with no per-op exception, unlike torch.cuda.amp.autocast,
-        # which specifically forces cross_entropy/log_softmax to run in
-        # fp32 for exactly this reason. Upcasting just for this reduction
-        # avoids the overflow; the extra copy costs far less than a
-        # model+optimizer step that's been training on garbage gradients.
+        # BUG-122: the comment that used to sit here claimed transposing the
+        # class dimension into position (instead of reshaping) avoided "a
+        # full contiguous copy of the ENTIRE logits tensor". That claim is
+        # false in two ways. First, the .float() upcast immediately below it
+        # already materialises a full contiguous fp32 copy of the whole
+        # tensor, so the copy it claimed to avoid happens regardless --
+        # there is no memory saving at all. Second, cross_entropy is
+        # measurably SLOWER on the transposed (channels-second,
+        # non-contiguous) layout: benchmarked on CPU at batch=4,
+        # seq_len=1024, vocab=32000, the transpose form took 2120 ms per
+        # call against 989 ms for the flattened form -- a 2.1x pessimisation
+        # in the hot path of every training step. Both forms produce
+        # numerically identical losses. Reverted to the flattened form.
+        # (Timings are CPU-only; this environment has no GPU, so the
+        # relative cost on CUDA is reasoned from the layout, not measured.)
+        #
+        # .float(): cross_entropy's softmax reduction sums vocab_size exp()
+        # terms per token. Each is ~1 near a max-subtracted logit, so the
+        # running sum lands around vocab_size regardless of prediction
+        # quality -- which alone exceeds fp16's 65504 maximum and overflows
+        # the loss to inf on every step. DeepSpeed's plain fp16 mode casts
+        # this reduction to fp16 with no per-op exception, unlike
+        # torch.cuda.amp.autocast, which forces cross_entropy to fp32 for
+        # exactly this reason. This upcast is load-bearing; do not remove it.
         ce_loss = torch.nn.functional.cross_entropy(
-            shift_logits.float().transpose(1, 2),
-            shift_labels,
+            shift_logits.float().reshape(-1, shift_logits.shape[-1]),
+            shift_labels.reshape(-1),
             ignore_index=-100,
         )
         total_loss = ce_loss + output.aux_loss
@@ -389,6 +517,10 @@ class Trainer:
         # single optimizer step) purely to log it -- doubling the per-step
         # gradient-norm cost for no behavioral benefit, since max_norm=inf
         # never actually clips anything.
+        # BUG-108: gradients must still exist to measure them. See
+        # _GradNormTracker -- this is a no-op on engines that report their
+        # own (already globally reduced) norm.
+        pre_step_norm = self._grad_norm_tracker.pre_step()
         self.model_engine.step()
 
         # Capture actual accumulated tokens BEFORE resetting
@@ -396,25 +528,7 @@ class Trainer:
         self._accumulation_step = 0
         self._accumulated_tokens = 0
 
-        grad_norm = self.model_engine.get_global_grad_norm()
-        if grad_norm is not None:
-            grad_norm = float(grad_norm)
-        else:
-            # Fallback only: some engines/configs (e.g. gradient_clipping
-            # disabled DeepSpeed-side, or a non-DeepSpeed engine, as in
-            # tests) don't expose a post-step grad norm at all. This runs
-            # after model_engine.step() has already cleared gradients, so
-            # it reports ~0.0 rather than the true pre-clip norm -- a
-            # degraded fallback, but this branch is not on the hot path for
-            # real DeepSpeed runs with gradient_clipping configured (which
-            # is the normal case here; see build_deepspeed_config), so it
-            # never pays the double-computation cost that used to run
-            # unconditionally on every single step.
-            grad_norm = float(
-                torch.nn.utils.clip_grad_norm_(
-                    self.model_engine.parameters(), max_norm=float("inf")
-                )
-            )
+        grad_norm = self._grad_norm_tracker.post_step(pre_step_norm)
 
         if self.global_step % self.config.logging.log_every == 0:
             fp16_opt = self.model_engine.optimizer
@@ -430,12 +544,22 @@ class Trainer:
                     overflow,
                 )
 
+        # BUG-107: the AdaptiveController must see the SAME numbers on every
+        # rank or ranks diverge in learning rate (and a rank-local
+        # training_halt deadlocks the others). Reduce before constructing
+        # the metrics, not after. On a single process both helpers are
+        # no-ops, so this costs nothing off the distributed path.
+        # grad_norm is left alone: DeepSpeed's get_global_grad_norm() is
+        # already reduced over the whole job.
+        reduced_loss = _distributed_mean(ce_loss.detach().float())
         metrics = TrainingMetrics(
             step=self.global_step,
-            loss=float(ce_loss.detach().item()),
+            loss=float(reduced_loss.item()),
             grad_norm=grad_norm,
             learning_rate=self.model_engine.optimizer.param_groups[0]["lr"],
-            expert_utilization=output.expert_utilization,
+            expert_utilization=_reduce_expert_utilization(
+                output.expert_utilization, device
+            ),
         )
 
         action = self.adaptive_controller.step(metrics)
@@ -538,11 +662,9 @@ class Trainer:
                 "Fix: pass eval_dataloader=... when constructing Trainer."
             )
         self.model_engine.eval()
-        device = (
-            self.model_engine.local_rank
-            if isinstance(self.model_engine.local_rank, torch.device)
-            else torch.device(f"cuda:{self.model_engine.local_rank}")
-        )
+        # BUG-105: this used to hardcode torch.device(f"cuda:{local_rank}"),
+        # making CPU and MPS training impossible. See ats.utils.device.
+        device = resolve_device(self.model_engine)
 
         total_loss = torch.tensor(0.0, device=device)
         total_tokens = torch.tensor(0, dtype=torch.long, device=device)
@@ -555,16 +677,16 @@ class Trainer:
                 )
                 shift_logits = output.logits[..., :-1, :]
                 shift_labels = batch["labels"][..., 1:]
-                # See train_step's identical fix: transpose (metadata-only)
-                # instead of reshape (forces a full contiguous copy of the
-                # whole logits tensor) to flatten for cross_entropy. .float()
-                # avoids the same vocab-size-driven fp16 overflow in the
-                # per-token logsumexp reduction that train_step fixes --
-                # reduction="sum" here doesn't avoid it, since the overflow
-                # happens per-token before the sum/mean combination.
+                # See BUG-122 in train_step: the transpose form is slower
+                # and saves no memory (.float() materialises the copy
+                # either way). .float() itself is load-bearing -- it avoids
+                # the same vocab-size-driven fp16 overflow in the per-token
+                # logsumexp reduction, which reduction="sum" does not
+                # prevent since the overflow happens per token, before the
+                # sum.
                 loss = torch.nn.functional.cross_entropy(
-                    shift_logits.float().transpose(1, 2),
-                    shift_labels,
+                    shift_logits.float().reshape(-1, shift_logits.shape[-1]),
+                    shift_labels.reshape(-1),
                     ignore_index=-100,
                     reduction="sum",
                 )
@@ -650,6 +772,23 @@ class DiffusionTrainer:
         self._accumulation_step = 0
         self._accumulated_tokens = 0
 
+    @property
+    def _grad_norm_tracker(self) -> _GradNormTracker:
+        """Lazily bound to whatever engine this trainer currently holds.
+
+        A property rather than an __init__ assignment so the tracker is
+        always consistent with self.model_engine even when a trainer is
+        assembled without running __init__ (the pattern the test suite uses
+        to exercise train_step against a stub engine without standing up
+        DeepSpeed), and so swapping the engine cannot leave a tracker
+        holding a stale reference and reporting another engine's norms.
+        """
+        tracker = self.__dict__.get("_grad_norm_tracker_impl")
+        if tracker is None or tracker.engine is not self.model_engine:
+            tracker = _GradNormTracker(self.model_engine)
+            self.__dict__["_grad_norm_tracker_impl"] = tracker
+        return tracker
+
     def resume(self, checkpoint_dir: str) -> None:
         client_state = self.checkpoint_manager.load(self.model_engine, checkpoint_dir)
         self.global_step = client_state["global_step"]
@@ -705,11 +844,9 @@ class DiffusionTrainer:
             )
 
     def train_step(self, batch: Any) -> TrainingMetrics | None:
-        device = (
-            self.model_engine.local_rank
-            if isinstance(self.model_engine.local_rank, torch.device)
-            else torch.device(f"cuda:{self.model_engine.local_rank}")
-        )
+        # BUG-105: this used to hardcode torch.device(f"cuda:{local_rank}"),
+        # making CPU and MPS training impossible. See ats.utils.device.
+        device = resolve_device(self.model_engine)
         batch = _move_batch_to_device(batch, device)
 
         output = self.model_engine(
@@ -740,27 +877,23 @@ class DiffusionTrainer:
         # computes the global grad norm internally, so recomputing it here
         # was a second full norm pass over every parameter's gradient on
         # every optimizer step, purely for logging.
+        # BUG-108: see Trainer.train_step / _GradNormTracker.
+        pre_step_norm = self._grad_norm_tracker.pre_step()
         self.model_engine.step()
 
         actual_tokens = self._accumulated_tokens
         self._accumulation_step = 0
         self._accumulated_tokens = 0
 
-        grad_norm = self.model_engine.get_global_grad_norm()
-        if grad_norm is not None:
-            grad_norm = float(grad_norm)
-        else:
-            # Fallback only -- see Trainer.train_step's identical fallback
-            # for why this is safe to leave as the rare-case path.
-            grad_norm = float(
-                torch.nn.utils.clip_grad_norm_(
-                    self.model_engine.parameters(), max_norm=float("inf")
-                )
-            )
+        grad_norm = self._grad_norm_tracker.post_step(pre_step_norm)
 
+        # BUG-107: same cross-rank reduction as Trainer.train_step -- the
+        # controller's LR actions and halt decision must be identical on
+        # every rank.
+        reduced_loss = _distributed_mean(mse_loss.detach().float())
         metrics = TrainingMetrics(
             step=self.global_step,
-            loss=float(mse_loss.detach().item()),
+            loss=float(reduced_loss.item()),
             grad_norm=grad_norm,
             learning_rate=self.model_engine.optimizer.param_groups[0]["lr"],
         )
@@ -863,11 +996,9 @@ class DiffusionTrainer:
                 "DiffusionTrainer.evaluate() called without eval_dataloader."
             )
         self.model_engine.eval()
-        device = (
-            self.model_engine.local_rank
-            if isinstance(self.model_engine.local_rank, torch.device)
-            else torch.device(f"cuda:{self.model_engine.local_rank}")
-        )
+        # BUG-105: this used to hardcode torch.device(f"cuda:{local_rank}"),
+        # making CPU and MPS training impossible. See ats.utils.device.
+        device = resolve_device(self.model_engine)
 
         total_loss = torch.tensor(0.0, device=device)
         num_batches = torch.tensor(0, dtype=torch.long, device=device)

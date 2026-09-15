@@ -35,6 +35,7 @@ pre-norm residual wrapping: `x + MambaBlock(norm(x))`.
 from __future__ import annotations
 
 import torch
+import torch.utils.checkpoint
 import torch.nn.functional as F
 from torch import nn
 
@@ -107,14 +108,103 @@ class MambaBlock(nn.Module):
 
         self.out_proj = nn.Linear(self.d_inner, hidden_size, bias=False)
 
+    @staticmethod
+    def _chunk_body(
+        dt_chunk: torch.Tensor,
+        x_chunk: torch.Tensor,
+        B_chunk: torch.Tensor,
+        C_chunk: torch.Tensor,
+        A: torch.Tensor,
+        carry: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One chunk of the scan. Returns (y_chunk, new_carry) where
+        y_chunk is [batch, L, d_inner] -- the states are contracted with
+        C *inside* this function and never returned.
+
+        Isolated into its own function (a) so the C contraction happens
+        per-chunk rather than on a materialized full-sequence state tensor,
+        and (b) so _chunked_scan can wrap it in
+        torch.utils.checkpoint.checkpoint and have the huge intermediates
+        below recomputed in backward instead of retained. See _chunked_scan
+        for the memory arithmetic.
+        """
+        L = dt_chunk.shape[1]
+        device, dtype = dt_chunk.device, dt_chunk.dtype
+
+        # log_a[b,t,d,n] = dt[b,t,d] * A[d,n]  (a_t = exp(dt_t * A), so this
+        # IS log(a_t) directly -- no log(exp(...)) round trip needed).
+        log_a = dt_chunk.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0)
+        log_decay = torch.cumsum(log_a, dim=1)  # [batch, L, d_inner, d_state]
+
+        # b_t[b,t,d,n] = dt[b,t,d] * x_conv[b,t,d] * B[b,t,n]
+        b_term = (dt_chunk * x_chunk).unsqueeze(-1) * B_chunk.unsqueeze(2)
+
+        # Contribution carried in from the previous chunk's final state.
+        carry_contrib = carry.unsqueeze(1) * torch.exp(log_decay)
+
+        # Intra-chunk contribution via the lower-triangular decay-ratio
+        # matrix: decay_ratio[b,t,k,d,n] = exp(log_decay[t] - log_decay[k])
+        # for k <= t, else 0. Clamped before exp() to avoid overflow for
+        # the (masked-out, k>t) entries where the difference can be large
+        # and positive.
+        log_decay_t = log_decay.unsqueeze(2)  # [batch, L, 1, d_inner, d_state]
+        log_decay_k = log_decay.unsqueeze(1)  # [batch, 1, L, d_inner, d_state]
+        tri_mask = torch.tril(torch.ones(L, L, device=device, dtype=torch.bool))
+        tri_mask = tri_mask.view(1, L, L, 1, 1)
+        log_diff = torch.clamp(log_decay_t - log_decay_k, max=0.0)
+        decay_ratio = torch.where(
+            tri_mask,
+            torch.exp(log_diff),
+            torch.zeros((), device=device, dtype=dtype),
+        )
+
+        # intra[b,t,d,n] = sum_k decay_ratio[b,t,k,d,n] * b_term[b,k,d,n]
+        intra = torch.einsum("btkdn,bkdn->btdn", decay_ratio, b_term)
+
+        chunk_states = carry_contrib + intra  # [batch, L, d_inner, d_state]
+        y_chunk = torch.einsum("btdn,btn->btd", chunk_states, C_chunk)
+        new_carry = chunk_states[:, -1, :, :]
+        return y_chunk, new_carry
+
     def _chunked_scan(
         self,
         dt: torch.Tensor,
         A: torch.Tensor,
         B: torch.Tensor,
+        C: torch.Tensor,
         x_conv: torch.Tensor,
         initial_carry: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Computes y_t = <state_t, C_t> at every position via a chunked
+        parallel scan, plus the final carry state.
+        dt, x_conv: [batch, seq_len, d_inner]. A: [d_inner, d_state].
+        B, C: [batch, seq_len, d_state].
+        Returns (y: [batch, seq_len, d_inner], final_state: [batch, d_inner, d_state]).
+
+        BUG FIX (BUG-104), two parts, both memory:
+
+        1. This used to return `all_states`, a [batch, seq_len, d_inner,
+           d_state] tensor holding every intermediate state, which the
+           caller then contracted with C. That is d_state (default 16)
+           times larger than the y it exists to produce, and it is retained
+           by autograd for the whole backward pass. Contracting with C
+           inside each chunk removes it entirely.
+
+        2. The per-chunk `decay_ratio` intermediate is [batch, L, L,
+           d_inner, d_state]. einsum saves it for backward, so the *total*
+           retained memory was (seq_len / chunk_size) chunks x that tensor
+           = batch * seq_len * chunk_size * d_inner * d_state * 4 bytes.
+           At batch=8, seq_len=4096, hidden=2048 (d_inner=4096), d_state=16,
+           chunk_size=32 that is ~1.1 TB for ONE Mamba layer -- measured at
+           small scale as 537 MB of retained tensors for a [2, 512, 128]
+           input, i.e. ~600x the size of the layer's own output.
+           Checkpointing each chunk body drops the retained total to a
+           single chunk's worth (a seq_len/chunk_size = 128x reduction at
+           those settings) at the cost of recomputing the chunk in backward.
+
+        Chunk-local recompute is only used when gradients are actually
+        needed; inference and torch.no_grad() paths call the body directly.
+        """
         """Computes state_t at every position via a chunked parallel scan.
         dt, x_conv: [batch, seq_len, d_inner]. A: [d_inner, d_state].
         B: [batch, seq_len, d_state]. Returns states: [batch, seq_len, d_inner, d_state].
@@ -135,64 +225,37 @@ class MambaBlock(nn.Module):
         d_state = A.shape[-1]
         device, dtype = dt.device, dt.dtype
 
-        all_states = torch.empty(
-            batch, seq_len, d_inner, d_state, device=device, dtype=dtype
-        )
         carry = (
             torch.zeros(batch, d_inner, d_state, device=device, dtype=dtype)
             if initial_carry is None
             else initial_carry
         )
 
+        use_recompute = torch.is_grad_enabled() and (
+            dt.requires_grad or x_conv.requires_grad or A.requires_grad
+        )
+
+        y_chunks: list[torch.Tensor] = []
         for start in range(0, seq_len, self.chunk_size):
             end = min(start + self.chunk_size, seq_len)
-            L = end - start
-
-            dt_chunk = dt[:, start:end, :]  # [batch, L, d_inner]
-            x_chunk = x_conv[:, start:end, :]  # [batch, L, d_inner]
-            B_chunk = B[:, start:end, :]  # [batch, L, d_state]
-
-            # log_a[b,t,d,n] = dt[b,t,d] * A[d,n]  (since a_t = exp(dt_t * A), this
-            # IS log(a_t) directly -- no log(exp(...)) round trip needed).
-            log_a = dt_chunk.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(
-                0
-            )  # [batch, L, d_inner, d_state]
-            log_decay = torch.cumsum(log_a, dim=1)  # [batch, L, d_inner, d_state]
-
-            # b_t[b,t,d,n] = dt[b,t,d] * x_conv[b,t,d] * B[b,t,n]
-            b_term = (dt_chunk * x_chunk).unsqueeze(-1) * B_chunk.unsqueeze(
-                2
-            )  # [batch, L, d_inner, d_state]
-
-            # Contribution carried in from the previous chunk's final state.
-            carry_contrib = carry.unsqueeze(1) * torch.exp(
-                log_decay
-            )  # [batch, L, d_inner, d_state]
-
-            # Intra-chunk contribution via the lower-triangular decay-ratio
-            # matrix: decay_ratio[b,t,k,d,n] = exp(log_decay[t] - log_decay[k])
-            # for k <= t, else 0. Clamped before exp() to avoid overflow for
-            # the (masked-out, k>t) entries where the difference can be large
-            # and positive.
-            log_decay_t = log_decay.unsqueeze(2)  # [batch, L, 1, d_inner, d_state]
-            log_decay_k = log_decay.unsqueeze(1)  # [batch, 1, L, d_inner, d_state]
-            tri_mask = torch.tril(torch.ones(L, L, device=device, dtype=torch.bool))
-            tri_mask = tri_mask.view(1, L, L, 1, 1)
-            log_diff = torch.clamp(log_decay_t - log_decay_k, max=0.0)
-            decay_ratio = torch.where(
-                tri_mask,
-                torch.exp(log_diff),
-                torch.zeros((), device=device, dtype=dtype),
+            args = (
+                dt[:, start:end, :],
+                x_conv[:, start:end, :],
+                B[:, start:end, :],
+                C[:, start:end, :],
+                A,
+                carry,
             )
+            if use_recompute:
+                y_chunk, carry = torch.utils.checkpoint.checkpoint(
+                    self._chunk_body, *args, use_reentrant=False
+                )
+            else:
+                y_chunk, carry = self._chunk_body(*args)
+            y_chunks.append(y_chunk)
 
-            # intra[b,t,d,n] = sum_k decay_ratio[b,t,k,d,n] * b_term[b,k,d,n]
-            intra = torch.einsum("btkdn,bkdn->btdn", decay_ratio, b_term)
-
-            chunk_states = carry_contrib + intra
-            all_states[:, start:end, :, :] = chunk_states
-            carry = chunk_states[:, -1, :, :]
-
-        return all_states
+        y = torch.cat(y_chunks, dim=1) if len(y_chunks) > 1 else y_chunks[0]
+        return y, carry
 
     def forward(
         self,
@@ -281,11 +344,13 @@ class MambaBlock(nn.Module):
 
         A = -torch.exp(self.A_log)  # [d_inner, d_state], negative for stability
 
-        states = self._chunked_scan(
-            dt, A, B, x_conv, initial_carry=ssm_state
-        )  # [batch, seq_len, d_inner, d_state]
-        new_ssm_state = states[:, -1, :, :]
-        y = torch.einsum("btdn,btn->btd", states, C)  # [batch, seq_len, d_inner]
+        # _chunked_scan now contracts the states against C internally and
+        # returns only y ([batch, seq_len, d_inner]) plus the final carry,
+        # instead of a full [batch, seq_len, d_inner, d_state] state tensor
+        # -- see BUG-104 in its docstring.
+        y, new_ssm_state = self._chunked_scan(
+            dt, A, B, C, x_conv, initial_carry=ssm_state
+        )
         y = y + x_conv * self.D  # skip connection (D is a per-channel scalar)
 
         y = y * F.silu(gate)  # gating

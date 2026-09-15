@@ -31,8 +31,27 @@ _SAFETENSORS_FILENAME = "model.safetensors"
 
 
 def _current_rank() -> int:
-    """Reads the current process's global rank from the environment (set by
-    DeepSpeed/torchrun launchers), defaulting to 0 for single-process runs."""
+    """The current process's global rank.
+
+    BUG-121: this used to read only the RANK/LOCAL_RANK environment
+    variables. Those are set by the torchrun/deepspeed launchers, but they
+    are NOT the authoritative source once a process group exists -- a job
+    that calls dist.init_process_group() with an explicit rank (or any
+    launcher that does not export RANK) leaves every process reading "0".
+    Every rank then believes it is rank 0 and they all write the same
+    model.safetensors file to the same path simultaneously, which is
+    exactly the corruption this function's callers guard against; save()'s
+    own comment describes that hazard while relying on the weaker signal to
+    detect it. torch.distributed is asked first when it is initialized, and
+    the environment is used only as the pre-initialization fallback.
+    """
+    try:
+        import torch.distributed as dist
+    except ImportError:
+        pass
+    else:
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_rank())
     return int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
 
 
@@ -103,10 +122,48 @@ def _restore_rng_state(state: dict[str, Any]) -> None:
         np_state = tuple(np_state)
     np.random.set_state(np_state)
     torch.set_rng_state(torch.tensor(state["torch"], dtype=torch.uint8))
-    if torch.cuda.is_available() and "torch_cuda" in state:
-        torch.cuda.set_rng_state_all(
-            [torch.tensor(t, dtype=torch.uint8) for t in state["torch_cuda"]]
+
+    # BUG-106: torch.cuda.set_rng_state_all() requires exactly one state per
+    # visible device and raises if the count differs. A checkpoint taken on
+    # an 8-GPU node and resumed on 4 GPUs (or resumed on CPU after being
+    # taken on GPU, or vice versa) therefore either crashed with an opaque
+    # index error deep inside torch, or silently skipped CUDA RNG restore
+    # with nothing said about it. Both cases are now explicit: restore when
+    # the counts match, and say plainly when they do not, because a
+    # half-restored RNG means a "resumed" run is not the run it claims to
+    # continue -- dropout masks and data shuffling diverge from the
+    # original trajectory.
+    cuda_states = state.get("torch_cuda")
+    if not torch.cuda.is_available():
+        if cuda_states:
+            logger.warning(
+                "Checkpoint carries CUDA RNG state for %d device(s) but no CUDA "
+                "device is visible; CUDA RNG was not restored. The resumed run "
+                "is not bitwise-identical to the original.",
+                len(cuda_states),
+            )
+        return
+    if not cuda_states:
+        logger.warning(
+            "Resuming on CUDA from a checkpoint that carries no CUDA RNG state; "
+            "CUDA RNG starts fresh. The resumed run is not bitwise-identical to "
+            "the original."
         )
+        return
+    device_count = torch.cuda.device_count()
+    if len(cuda_states) != device_count:
+        logger.warning(
+            "Checkpoint carries CUDA RNG state for %d device(s) but %d are "
+            "visible now; CUDA RNG was not restored. The resumed run is not "
+            "bitwise-identical to the original. Fix: resume on the same number "
+            "of GPUs the checkpoint was written on.",
+            len(cuda_states),
+            device_count,
+        )
+        return
+    torch.cuda.set_rng_state_all(
+        [torch.tensor(t, dtype=torch.uint8) for t in cuda_states]
+    )
 
 
 def load_model_weights_safetensors(checkpoint_dir: str) -> dict[str, torch.Tensor]:
@@ -326,6 +383,14 @@ class CheckpointManager:
                 f"or start a fresh run if the architecture change is intentional."
             )
 
+        if "rng_state" not in client_state:
+            raise ConfigError(
+                f"Checkpoint at {checkpoint_path} has a client_state but no "
+                f"'rng_state' entry, so RNG cannot be restored and the resumed "
+                f"run would silently diverge from the original trajectory. "
+                f"Fix: resume from a checkpoint written by this version of "
+                f"CheckpointManager.save."
+            )
         _restore_rng_state(client_state["rng_state"])
         logger.info(
             "Resumed from %s at step %d", checkpoint_path, client_state["global_step"]

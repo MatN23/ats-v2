@@ -4,6 +4,23 @@ training this uses a straight-through estimator so gradients flow through the
 hard decision; at inference the gate is thresholded directly (no STE needed
 since there is no backward pass).
 
+The top-`capacity` tokens per sequence are GATHERED into a shorter
+[batch, capacity, hidden] tensor and the wrapped block runs only on that,
+with the results scattered back into the residual stream. This is where the
+compute saving comes from, and it is real: the block sees
+`capacity_factor * seq_len` positions, not `seq_len`. (An earlier version
+ran the block on the full sequence and merely masked the output, which cost
+exactly as much as not using MoD at all -- see the BUG-103 comment in
+forward().)
+
+One stated exception: when `use_cache=True` (or a `past_key_value` is
+supplied), the block runs densely on the full sequence. A block invoked on
+a compressed subsequence returns a KV cache of length `capacity` with no
+record of which absolute positions those entries belong to, so a gathered
+cache cannot be continued correctly on the next decode step. Cached
+autoregressive generation therefore gets no MoD compute saving; training
+and non-cached evaluation do.
+
 The wrapped block (a TransformerBlock or MambaLayer, per
 ats.model.transformer) always returns a 3-tuple
 (hidden_states, aux_loss, past_key_value), matching the calling convention
@@ -97,13 +114,62 @@ class MixtureOfDepths(nn.Module):
             hard_mask = torch.zeros_like(gate_probs).scatter_(1, topk.indices, 1.0)
             ste_mask = hard_mask
 
-        # The wrapped block is called exactly once. It always returns
-        # (hidden_states, aux_loss, past_key_value) -- the same 3-tuple
-        # convention every layer in ATSTransformer._run_layers uses.
-        block_hidden, block_aux_loss, new_past_key_value = self.block(x, **block_kwargs)
+        # BUG FIX (BUG-103): this used to call the wrapped block on the FULL
+        # [batch, seq_len, hidden] tensor and then blend the result with a
+        # 0/1 mask. That computes every token through the block and throws
+        # away the unselected results -- so Mixture-of-Depths cost exactly
+        # as much FLOPs and activation memory as not using it at all, plus
+        # the gate. The entire premise of MoD (skip the block for
+        # (1 - capacity_factor) of tokens) was not implemented; only its
+        # output was simulated. Below, the selected tokens are gathered into
+        # a [batch, capacity, hidden] tensor, the block runs on that, and
+        # the results are scattered back.
+        #
+        # `selected_idx` is sorted ascending so the gathered subsequence
+        # keeps its original relative order: the wrapped block's attention
+        # (and MambaLayer's scan) is causal over the positions it is handed,
+        # so an unsorted gather would let a token attend to one that came
+        # after it in the original sequence.
+        if use_cache or past_key_value is not None:
+            # KV caching is not compatible with a compressed subsequence:
+            # the cache the block returns would be `capacity` long rather
+            # than seq_len, and the next decode step has no way to know
+            # which absolute positions those entries correspond to. Rather
+            # than return a silently mis-indexed cache, run the block
+            # densely for cached generation. This is stated, not silent --
+            # see the class docstring. Training and non-cached evaluation
+            # (where the compute actually matters) take the gather path.
+            block_hidden, block_aux_loss, new_past_key_value = self.block(
+                x, **block_kwargs
+            )
+            mask = ste_mask.unsqueeze(-1)  # [batch, seq_len, 1]
+            output = mask * block_hidden + (1.0 - mask) * x
+        else:
+            selected_idx, _ = torch.sort(topk.indices, dim=1)  # [batch, capacity]
+            gather_idx = selected_idx.unsqueeze(-1).expand(-1, -1, hidden_size)
+            x_selected = torch.gather(x, 1, gather_idx)  # [batch, capacity, hidden]
 
-        mask = ste_mask.unsqueeze(-1)  # [batch, seq_len, 1]
-        output = mask * block_hidden + (1.0 - mask) * x
+            if attention_mask is not None:
+                # The padding mask has to be gathered the same way, or the
+                # block would apply position i's pad flag to whatever token
+                # happens to land in slot i of the compressed sequence.
+                block_kwargs["attention_mask"] = torch.gather(
+                    attention_mask, 1, selected_idx
+                )
+
+            block_out, block_aux_loss, new_past_key_value = self.block(
+                x_selected, **block_kwargs
+            )
+
+            # Straight-through gate applied only to the tokens that were
+            # actually processed: forward value 1, backward gradient
+            # d/d gate_prob. Unselected tokens pass through untouched (they
+            # were never computed), and their gate logits are trained by
+            # the load-balancing aux loss below rather than by a gradient
+            # through a block output that does not exist for them.
+            gate_selected = torch.gather(ste_mask, 1, selected_idx).unsqueeze(-1)
+            update = gate_selected * (block_out - x_selected)
+            output = x.scatter_add(1, gather_idx, update)
 
         # Load-balancing aux loss: encourage the mean gate probability to sit
         # near the target capacity_factor, so routing doesn't collapse to

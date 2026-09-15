@@ -79,6 +79,23 @@ def build_deepspeed_config(config: ATSConfig, micro_batch_size: int) -> dict[str
 
     zero_stage = _ZERO_STAGE_BY_STRATEGY[strategy]
 
+    # BUG-110: DeepSpeed's engine asserts `not self.has_moe_layers` when the
+    # ZeRO stage is 3 (deepspeed/runtime/engine.py, the
+    # ZeroStageEnum.weights branch). Verified against the deepspeed 0.14.4
+    # source. ats used to accept this combination silently and let the run
+    # die inside deepspeed.initialize() on a bare assert with no message
+    # about which ats config field caused it -- and only after the model had
+    # already been built and moved to device. Reject it here with the fix
+    # spelled out instead.
+    if zero_stage == 3 and config.model.use_moe:
+        raise ConfigError(
+            "model.use_moe=True cannot be combined with ZeRO stage 3 (resolved "
+            f"from parallelism.strategy='{strategy}'): DeepSpeed does not "
+            "support MoE layers under stage 3 and asserts on it during engine "
+            "initialization. Fix: use parallelism.strategy: deepspeed_moe (or "
+            "deepspeed_zero2 / deepspeed_zero1), or disable model.use_moe."
+        )
+
     if config.parallelism.offload_param and zero_stage != 3:
         raise ConfigError(
             f"parallelism.offload_param=True requires ZeRO stage 3 (got resolved "
@@ -172,16 +189,17 @@ def build_deepspeed_config(config: ATSConfig, micro_batch_size: int) -> dict[str
             },
         }
 
-    if strategy == "deepspeed_moe" or config.model.use_moe:
-        ds_config["moe"] = {
-            "enabled": True,
-            "ep_size": max(1, config.parallelism.gpus * config.parallelism.nodes),
-            "num_experts": config.model.num_experts,
-            "top_k": config.model.moe_top_k,
-            "capacity_factor": config.model.moe_capacity_factor,
-            "min_capacity": 4,
-            "moe_param_group": True,
-        }
+    # BUG-111: a "moe" block used to be written into the DeepSpeed JSON
+    # config here (ep_size / num_experts / top_k / capacity_factor /
+    # moe_param_group). DeepSpeed has no such config key -- grepped against
+    # deepspeed/runtime/config.py and constants.py in 0.14.4, there is no
+    # reader for it -- and unknown keys are ignored, so none of those values
+    # had any effect at all. It was dead configuration that read as though
+    # it were driving expert parallelism, while the values that actually
+    # matter are the constructor arguments passed to deepspeed.moe.layer.MoE
+    # in ats.model.moe.MoELayer (ep_size, num_experts, k, capacity_factor).
+    # Removed rather than left in place, so nobody tunes a knob that is not
+    # connected to anything.
 
     return ds_config
 
@@ -207,6 +225,37 @@ def _build_bitsandbytes_optimizer(
         betas=(0.9, 0.95),
         eps=1e-8,
     )
+
+
+def _split_moe_param_groups(
+    param_groups: list[dict[str, Any]], config: ATSConfig
+) -> list[dict[str, Any]]:
+    """Applies DeepSpeed's own expert/dense param-group split to
+    `param_groups`. See BUG-109 at the call site for why this is needed on
+    the client-optimizer path.
+
+    Uses DeepSpeed's helper rather than reimplementing the rule, so the
+    definition of "is an expert parameter" (the `param.allreduce is False`
+    marker that deepspeed.moe.experts.Experts sets) stays owned by
+    DeepSpeed and cannot drift out of sync with it.
+    """
+    if not config.model.use_moe:
+        return param_groups
+    try:
+        from deepspeed.moe.utils import (
+            split_params_into_different_moe_groups_for_optimizer,
+        )
+    except ImportError:
+        logger.warning(
+            "model.use_moe=True with optimizer.bits=8, but "
+            "deepspeed.moe.utils could not be imported, so expert parameters "
+            "cannot be split into their own optimizer group. Expert gradients "
+            "will be reduced as if they were replicated dense parameters, "
+            "which is incorrect under expert parallelism. Fix: check your "
+            "DeepSpeed installation, or use optimizer.bits=32."
+        )
+        return param_groups
+    return split_params_into_different_moe_groups_for_optimizer(param_groups)
 
 
 def initialize_engine(
@@ -248,11 +297,26 @@ def initialize_engine(
         weight_decay=config.training.weight_decay,
     )
 
-    client_optimizer = (
-        _build_bitsandbytes_optimizer(config, param_groups)
-        if config.optimizer.bits == 8
-        else None
-    )
+    if config.optimizer.bits == 8:
+        # BUG-109: DeepSpeed only calls configure_moe_param_groups() when
+        # client_optimizer is None (deepspeed/runtime/engine.py
+        # _configure_optimizer, verified against 0.14.4). The fp32 path
+        # passes model_parameters and no optimizer, so DeepSpeed splits the
+        # expert parameters into their own `moe=True` param group itself.
+        # The 8-bit path passes a fully constructed bitsandbytes optimizer,
+        # so that split NEVER happened: expert parameters stayed in the
+        # ordinary dense groups, ZeRO treated them as replicated
+        # data-parallel parameters, and their gradients were all-reduced
+        # across the whole data-parallel group. Under expert parallelism
+        # each rank holds DIFFERENT experts, so that averages unrelated
+        # experts' gradients together -- silently wrong training, no error,
+        # only reachable with optimizer.bits=8 AND model.use_moe=True.
+        # Doing the split ourselves before constructing the optimizer
+        # restores the same grouping the fp32 path gets.
+        param_groups = _split_moe_param_groups(param_groups, config)
+        client_optimizer = _build_bitsandbytes_optimizer(config, param_groups)
+    else:
+        client_optimizer = None
 
     model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
         model=model,

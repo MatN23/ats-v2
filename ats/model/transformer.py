@@ -4,9 +4,11 @@ its FFN through MoE and/or wraps blocks with Mixture-of-Depths."""
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from typing import NamedTuple, cast
 
 import torch
+import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 
@@ -21,6 +23,42 @@ from ats.model.moe import MoELayer
 from ats.model.mtp import MultiTokenPredictionHead
 from ats.model.norm import RMSNorm
 from ats.model.swa import is_full_attention_layer
+
+
+class _LazyExpertUtilization(Mapping):
+    """A read-only {expert_id: fraction} mapping backed by a device tensor.
+
+    The transfer happens on first access and is cached, so a forward pass
+    that nobody inspects costs zero synchronization. Behaves like the dict
+    it replaced for every operation the consumers perform (len, iteration,
+    indexing, .values(), .get(), equality with a plain dict).
+    """
+
+    __slots__ = ("_tensor", "_values")
+
+    def __init__(self, tensor: torch.Tensor) -> None:
+        self._tensor = tensor.detach()
+        self._values: list[float] | None = None
+
+    def _materialize(self) -> list[float]:
+        if self._values is None:
+            self._values = self._tensor.float().tolist()
+        return self._values
+
+    def __getitem__(self, key: int) -> float:
+        values = self._materialize()
+        if not isinstance(key, int) or not 0 <= key < len(values):
+            raise KeyError(key)
+        return values[key]
+
+    def __iter__(self):
+        return iter(range(self._tensor.numel()))
+
+    def __len__(self) -> int:
+        return int(self._tensor.numel())
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({dict(self)!r})"
 
 
 class TransformerOutput(NamedTuple):
@@ -42,7 +80,7 @@ class TransformerOutput(NamedTuple):
     aux_loss: torch.Tensor
     past_key_values: list[PastKeyValue | None] | None = None
     mtp_logits: list[torch.Tensor] | None = None
-    expert_utilization: dict[int, float] | None = None
+    expert_utilization: Mapping[int, float] | None = None
 
 
 class MambaLayer(nn.Module):
@@ -432,35 +470,47 @@ class ATSTransformer(nn.Module):
         past_key_values: list[PastKeyValue | None] | None = None,
         use_cache: bool = False,
         validate_input_ids: bool | None = None,
+        return_mtp_logits: bool | None = None,
     ) -> TransformerOutput:
         if input_ids.dim() != 2:
             raise ValueError(
                 f"ATSTransformer expected input_ids of shape [batch, seq_len], "
                 f"got shape {tuple(input_ids.shape)}."
             )
-        # validate_input_ids=None (the default) means "validate on CPU,
-        # skip on CUDA": input_ids.max()/.min().item() force a synchronous
-        # GPU->CPU transfer, which on every single training-loop forward
-        # pass is a real, silent throughput cost (this check has no
-        # sync cost at all on CPU tensors, so it stays on by default there
-        # -- e.g. for the test suite and for CPU-only smoke tests). Pass
-        # True/False explicitly to force the check on/off regardless of
-        # device -- e.g. one-off debugging of a suspected tokenizer/vocab
-        # mismatch on a GPU run.
+        # validate_input_ids=None (the default) means "validate on CPU only".
+        # Reading input_ids.max()/.min() back to the host forces a blocking
+        # device synchronization on every single forward pass, which is a
+        # real and invisible throughput cost in a training loop; on a CPU
+        # tensor it costs nothing, so it stays on there (test suite, CPU
+        # smoke tests). Pass True/False explicitly to force the check on or
+        # off regardless of device -- e.g. one-off debugging of a suspected
+        # tokenizer/vocab mismatch on a GPU run.
+        #
+        # BUG-115: the condition used to be `not input_ids.is_cuda`, which
+        # is only the same thing as "is on CPU" if CUDA is the only
+        # accelerator. On MPS (now a supported device -- see
+        # ats.utils.device) is_cuda is False, so every forward pass ran the
+        # check and paid THREE separate device synchronizations
+        # (.max().item(), .min().item(), and the message's repeat) per
+        # micro-batch. Keyed on the device type instead, and collapsed to a
+        # single aminmax + one transfer so the CPU path is cheaper too and
+        # the explicit-True path costs one sync rather than three.
         should_validate = (
             validate_input_ids
             if validate_input_ids is not None
-            else not input_ids.is_cuda
+            else input_ids.device.type == "cpu"
         )
-        if should_validate and (
-            input_ids.max().item() >= self.config.vocab_size
-            or input_ids.min().item() < 0
-        ):
-            raise ValueError(
-                f"input_ids contains token ids outside [0, {self.config.vocab_size}). "
-                f"Got min={input_ids.min().item()}, max={input_ids.max().item()}. "
-                f"Fix: check your tokenizer's vocab_size matches model.vocab_size."
-            )
+        if should_validate:
+            low, high = torch.aminmax(input_ids)
+            min_id, max_id = torch.stack((low, high)).tolist()
+            if max_id >= self.config.vocab_size or min_id < 0:
+                raise ValueError(
+                    f"input_ids contains token ids outside "
+                    f"[0, {self.config.vocab_size}). "
+                    f"Got min={min_id}, max={max_id}. "
+                    f"Fix: check your tokenizer's vocab_size matches "
+                    f"model.vocab_size."
+                )
 
         x = self.embed_tokens(input_ids) * self.embed_scale
         x, total_aux_loss, new_past_key_values = self._run_layers(
@@ -472,7 +522,27 @@ class ATSTransformer(nn.Module):
         x = self.final_norm(x)
         logits = self.lm_head(x)
 
-        mtp_logits = self.mtp_head(x) if self.uses_mtp else None
+        # BUG-117: this used to be an unconditional `self.mtp_head(x)`
+        # whenever use_mtp was set, so every auxiliary future-token head
+        # produced a full [batch, seq_len, vocab_size] logits tensor on
+        # EVERY forward pass -- including autoregressive generation, where
+        # only the main lm_head output is ever read. With vocab_size=32000,
+        # batch=8, seq_len=2048 that is ~1 GiB per extra head, allocated
+        # and thrown away per decode step. mtp.MultiTokenPredictionHead's
+        # own docstring already states "Inference uses only the first (t+1)
+        # head unless the caller explicitly requests the others"; the
+        # implementation simply did not honour it.
+        #
+        # Training behaviour is deliberately unchanged: the default still
+        # computes every offset whenever a cache is not in use, which is
+        # exactly what Trainer.train_step consumes. Only cached generation
+        # skips them by default, and `return_mtp_logits` lets any caller
+        # override in either direction (e.g. speculative decoding asking
+        # for the auxiliary heads during generation).
+        want_mtp = (
+            return_mtp_logits if return_mtp_logits is not None else not use_cache
+        )
+        mtp_logits = self.mtp_head(x) if (self.uses_mtp and want_mtp) else None
         expert_utilization = self._collect_expert_utilization()
 
         return TransformerOutput(
@@ -483,16 +553,27 @@ class ATSTransformer(nn.Module):
             expert_utilization=expert_utilization,
         )
 
-    def _collect_expert_utilization(self) -> dict[int, float] | None:
+    def _collect_expert_utilization(self) -> Mapping[int, float] | None:
         """Averages per-expert utilization across every MoE-enabled layer in
         the stack (unwrapping MixtureOfDepths where present), so
         AdaptiveController's expert-collapse detection actually receives a
         signal for MoE models instead of always getting None. Returns None
-        if the model has no MoE layers (the common case)."""
+        if the model has no MoE layers (the common case).
+
+        BUG-114: this used to read each layer's `last_expert_utilization`
+        dict, which forced a GPU->CPU sync per MoE layer per forward pass,
+        then build a Python dict from the results -- on every micro-batch,
+        during evaluation, and during token-by-token generation, even
+        though the only consumer (Trainer.train_step) reads it once per
+        optimizer step and nothing reads it at all outside training. Now
+        the per-layer tensors are averaged on-device and wrapped in a lazy
+        Mapping that transfers exactly once, and only if someone actually
+        looks at the values.
+        """
         if not self.config.use_moe:
             return None
 
-        per_layer_utilization: list[dict[int, float]] = []
+        per_layer: list[torch.Tensor] = []
         for layer in self.layers:
             block = layer.block if isinstance(layer, MixtureOfDepths) else layer
             if (
@@ -500,23 +581,24 @@ class ATSTransformer(nn.Module):
                 and block.ffn_is_moe
                 and isinstance(block.ffn, MoELayer)
             ):
-                utilization = block.ffn.last_expert_utilization
-                if utilization is not None:
-                    per_layer_utilization.append(utilization)
+                tensor = block.ffn.last_expert_utilization_tensor
+                if tensor is not None:
+                    per_layer.append(tensor)
 
-        if not per_layer_utilization:
+        if not per_layer:
             return None
 
-        # self.config.num_experts, not len(per_layer_utilization[0]): every
-        # MoE layer should have the same expert count, but deriving it from
-        # whichever layer happened to be first in the list would silently
-        # under/over-count if a future change ever let per-layer expert
-        # counts vary, or if the first collected layer's dict happened to be
-        # missing entries for some reason.
+        # self.config.num_experts, not per_layer[0].numel(): every MoE layer
+        # should report the same expert count, but deriving it from whichever
+        # layer happened to be first would silently under/over-count if a
+        # future change ever let per-layer expert counts vary.
         num_experts = self.config.num_experts
-        averaged = {
-            expert_id: sum(u.get(expert_id, 0.0) for u in per_layer_utilization)
-            / len(per_layer_utilization)
-            for expert_id in range(num_experts)
-        }
-        return averaged
+        stacked = torch.stack(
+            [
+                t
+                if t.numel() == num_experts
+                else F.pad(t.flatten()[:num_experts], (0, max(0, num_experts - t.numel())))
+                for t in per_layer
+            ]
+        )
+        return _LazyExpertUtilization(stacked.mean(dim=0))

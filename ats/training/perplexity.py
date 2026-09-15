@@ -16,6 +16,7 @@ from ats.data.dataloader import build_dataloader
 from ats.model.transformer import ATSTransformer
 from ats.parallelism.deepspeed_utils import initialize_engine
 from ats.training.checkpoint import CheckpointManager
+from ats.utils.device import resolve_device
 from ats.utils.logging_utils import get_logger
 
 logger = get_logger("ats.training.perplexity")
@@ -65,11 +66,8 @@ def compute_perplexity(
         seed=config.training.seed,
         num_workers=config.data.num_workers,
     )
-    device = (
-        model_engine.local_rank
-        if isinstance(model_engine.local_rank, torch.device)
-        else torch.device(f"cuda:{model_engine.local_rank}")
-    )
+    # BUG-105: was hardcoded to cuda:{local_rank}. See ats.utils.device.
+    device = resolve_device(model_engine)
     # Accumulate on-device across the whole eval set and only call .item()
     # once, after the loop -- calling .item() per batch (as this used to)
     # forces a host-device sync every iteration, serializing what should be

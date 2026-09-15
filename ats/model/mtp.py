@@ -41,12 +41,23 @@ def compute_mtp_loss_from_logits(
     for k, logits in enumerate(logits_per_offset, start=1):
         if k >= seq_len:
             continue
-        pred = logits[:, : seq_len - k, :].contiguous()
-        target = labels[:, k:].contiguous()
-        # .float(): see ats/training/trainer.py's identical fix -- the
-        # per-token logsumexp reduction over vocab_size classes overflows
-        # fp16 purely from vocab_size (sums to >65504 regardless of
-        # prediction quality) unless logits are upcast first.
+        # BUG-122: an earlier revision of this audit rewrote these two
+        # lines into the transpose form used by trainer.py, on the
+        # assumption that avoiding .contiguous() was a win. Benchmarking
+        # showed the opposite -- batch=4, seq_len=512, vocab=32000, two
+        # offsets: 688 ms per call for the flattened form against 1471 ms
+        # for the transpose form, a 2.1x regression -- so the change was
+        # reverted and trainer.py's matching claim was corrected too. The
+        # explicit .contiguous() calls are dropped because .float() and
+        # .reshape() already produce the contiguous copy; keeping them just
+        # added a second one.
+        #
+        # .float(): the per-token logsumexp reduction over vocab_size
+        # classes overflows fp16 purely from vocab_size (the sum exceeds
+        # 65504 regardless of prediction quality) unless logits are upcast
+        # first. Load-bearing; do not remove.
+        pred = logits[:, : seq_len - k, :]
+        target = labels[:, k:]
         loss_k = F.cross_entropy(
             pred.float().reshape(-1, vocab_size),
             target.reshape(-1),

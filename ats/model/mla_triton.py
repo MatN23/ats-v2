@@ -16,6 +16,29 @@ structure as Triton's own canonical matmul tutorial kernel); this is the
 best-understood, most heavily-precedented Triton kernel pattern, which is
 why it's the one attempted here for the actual matmul rather than a novel
 kernel shape.
+
+EXPERIMENTAL -- NOT ON ANY PRODUCTION EXECUTION PATH.
+
+Audit status (BUG-119): nothing under ats/ imports this module. The only
+callers anywhere in the repository are tests/test_triton.py. Production
+training, evaluation, export and generation all go through the PyTorch
+implementations instead (the plain nn.Linear up-projections in ats.model.mla.MLAAttention), so this code cannot execute during
+a real run no matter what hardware is present.
+
+It is also not usable as-is for training: the Triton path launches a raw
+kernel that writes into a torch.empty() buffer. Raw kernel launches are
+invisible to autograd, so the returned tensor carries no grad_fn and
+gradients stop dead at this call. The PyTorch fallback in the same function
+IS differentiable -- which means the function would silently be
+differentiable on CPU and silently NOT differentiable on CUDA. To prevent
+that from ever becoming a silent training bug, the Triton path now refuses
+to run on inputs that require gradients (see the guard in the wrapper
+below) rather than returning a detached result.
+
+Wiring any of this into the model would require, at minimum, wrapping each
+kernel in a torch.autograd.Function with a hand-written backward, and
+validating it on real hardware. None of that has been done, and none of it
+can be validated in an environment without a GPU.
 """
 
 from __future__ import annotations
@@ -138,7 +161,16 @@ def fused_mla_kv_decompress(
     c_flat = c.reshape(-1, latent_dim)
     out_dim = w_uk.shape[0]
 
-    if HAS_TRITON and c.is_cuda:
+    use_triton = HAS_TRITON and c.is_cuda
+    if use_triton and torch.is_grad_enabled() and (c.requires_grad or w_uk.requires_grad or w_uv.requires_grad):
+        raise RuntimeError(
+            "fused_mla_kv_decompress: the Triton path is not differentiable (it launches a raw "
+            "kernel into a torch.empty buffer, which autograd cannot see), and "
+            "an input requires grad. Refusing to return a silently detached "
+            "result. This module is experimental and is not used by any "
+            "production path in ats -- see its module docstring."
+        )
+    if use_triton:
         concat_weight = torch.cat([w_uk, w_uv], dim=0)  # [2*out_dim, latent_dim]
         combined = _triton_matmul(c_flat, concat_weight.t())  # [num_rows, 2*out_dim]
         k_flat, v_flat = combined.split(out_dim, dim=-1)

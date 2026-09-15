@@ -10,6 +10,7 @@ the recent metrics history.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
@@ -23,7 +24,7 @@ class TrainingMetrics:
     loss: float
     grad_norm: float
     learning_rate: float
-    expert_utilization: dict[int, float] | None = None
+    expert_utilization: Mapping[int, float] | None = None
     # BUG FIX: found while verifying the audit's BUG-001 -- unrelated to
     # MTP, but in the same method (Trainer.train_step) a few lines below the
     # MTP fix. TrainingMetrics is frozen (immutable by design, so metrics

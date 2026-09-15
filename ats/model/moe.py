@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ats.model.ffn import SwiGLU
-from ats.model.initialization import init_residual_projection
+from ats.model.initialization import init_residual_projection, init_weights
 from ats.model.quantization import QuantizationMode
 
 logger = logging.getLogger("ats.model.moe")
@@ -71,7 +71,20 @@ class _PyTorchMoEFallback(nn.Module):
             # narrow explicitly so expert.down_proj is seen as nn.Linear.
             assert isinstance(expert, SwiGLU)
             init_residual_projection(expert.down_proj, num_layers)
-        self.last_expert_utilization: dict[int, float] | None = None
+        self.last_expert_utilization_tensor: torch.Tensor | None = None
+
+    @property
+    def last_expert_utilization(self) -> dict[int, float] | None:
+        """Per-expert dispatch fraction as a plain dict.
+
+        Reading this synchronizes with the device. It is kept as the
+        public, human-facing accessor (tests and debugging tools use it),
+        while the hot path stores and propagates
+        last_expert_utilization_tensor instead -- see BUG-114.
+        """
+        if self.last_expert_utilization_tensor is None:
+            return None
+        return dict(enumerate(self.last_expert_utilization_tensor.tolist()))
 
     def compute_routing(
         self, flat_x: torch.Tensor
@@ -157,11 +170,16 @@ class _PyTorchMoEFallback(nn.Module):
         normalized_utilization = dispatch_fraction / dispatch_fraction.sum().clamp(
             min=1e-8
         )
-        # normalized_utilization.tolist() does ONE GPU->CPU sync for the
-        # whole vector; the previous per-expert `.item()` inside this dict
-        # comprehension did num_experts separate syncs every forward pass on
-        # every MoE layer (only when use_moe=True, but real for MoE runs).
-        self.last_expert_utilization = dict(enumerate(normalized_utilization.tolist()))
+        # BUG-114: this used to call .tolist() here, which is a blocking
+        # GPU->CPU synchronization inside forward() -- once per MoE layer,
+        # on every micro-batch, including during generation and evaluation
+        # where nothing ever reads the result. At 32 MoE layers that is 32
+        # forced sync points per forward pass, each draining the CUDA queue
+        # and serializing work that should overlap. The tensor is kept on
+        # device instead and converted lazily, at most once per forward, and
+        # only if a caller actually reads the values (see
+        # _LazyExpertUtilization and ATSTransformer._collect_expert_utilization).
+        self.last_expert_utilization_tensor = normalized_utilization.detach()
 
         return output.reshape(batch, seq_len, hidden_size), aux_loss
 
@@ -185,7 +203,7 @@ class MoELayer(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.uses_deepspeed = _DEEPSPEED_MOE_AVAILABLE
-        self.last_expert_utilization: dict[int, float] | None = None
+        self.last_expert_utilization_tensor: torch.Tensor | None = None
         # Only used on the DeepSpeed path (the fallback scales its own
         # aux_loss internally) -- see the load_balancing_weight comment in
         # forward() for why this is applied here rather than passed into
@@ -213,7 +231,28 @@ class MoELayer(nn.Module):
                 ep_size=ep_size,
                 k=top_k,
                 capacity_factor=capacity_factor,
+                # BUG-112: eval_capacity_factor defaults to 1.0 in
+                # deepspeed.moe.layer.MoE (verified against 0.14.4), so
+                # leaving it unset meant evaluation used a DIFFERENT
+                # per-expert capacity than training -- with
+                # moe_capacity_factor=1.25 the model drops tokens at eval
+                # that it would not have dropped at train, making eval loss
+                # systematically worse than the model actually is, for a
+                # reason nothing in the config or logs points at.
+                eval_capacity_factor=capacity_factor,
             )
+            # BUG-113: deepspeed.moe.experts.Experts builds its experts with
+            # copy.deepcopy(expert) (verified against 0.14.4), so EVERY
+            # expert starts life with byte-identical weights. Expert
+            # specialization then has to be bootstrapped entirely by the
+            # router, from a starting point where all experts compute the
+            # same function -- which is precisely the configuration that
+            # makes expert collapse most likely. Re-initializing each
+            # constructed expert independently gives them distinct starting
+            # points, matching what a hand-written MoE (and this file's own
+            # PyTorch fallback, which builds N separate SwiGLU modules)
+            # already does.
+            self._reinitialize_deepspeed_experts(num_layers)
         else:
             logger.warning(
                 "deepspeed.moe.layer.MoE could not be imported; using a single-process "
@@ -230,6 +269,46 @@ class MoELayer(nn.Module):
                 num_layers=num_layers,
                 quantization=quantization,
             )
+
+    def _reinitialize_deepspeed_experts(self, num_layers: int) -> None:
+        """Gives each DeepSpeed-constructed expert its own initialization.
+
+        See BUG-113 at the call site. Written defensively against
+        DeepSpeed's internal module layout: if the attribute path is not
+        what this expects, warn loudly rather than silently leaving every
+        expert identical, since "all experts are the same function" is
+        exactly the failure this exists to prevent and it is invisible from
+        the outside.
+        """
+        experts = None
+        try:
+            experts = self.moe.deepspeed_moe.experts.deepspeed_experts
+        except AttributeError:
+            pass
+        if experts is None:
+            logger.warning(
+                "Could not reach DeepSpeed's per-expert modules to give them "
+                "independent initialization; every expert will start from "
+                "byte-identical weights (DeepSpeed builds them with "
+                "copy.deepcopy of a single template). Training will run, but "
+                "expert specialization has to be bootstrapped by the router "
+                "alone. This usually means the installed DeepSpeed version's "
+                "MoE module layout differs from what ats-v2 expects."
+            )
+            return
+        for expert in experts:
+            expert.apply(lambda m: init_weights(m, num_layers))
+            down_proj = getattr(expert, "down_proj", None)
+            if isinstance(down_proj, nn.Linear):
+                init_residual_projection(down_proj, num_layers)
+
+    @property
+    def last_expert_utilization(self) -> dict[int, float] | None:
+        """See _PyTorchMoEFallback.last_expert_utilization -- same contract,
+        same synchronization caveat, for whichever backend is in use."""
+        if self.last_expert_utilization_tensor is None:
+            return None
+        return dict(enumerate(self.last_expert_utilization_tensor.tolist()))
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.uses_deepspeed:
@@ -255,13 +334,12 @@ class MoELayer(nn.Module):
             try:
                 counts = exp_counts.detach().float()
                 total = counts.sum()
-                if total > 0:
-                    # Single .tolist() sync instead of one .item() per
-                    # expert -- see the matching fix in the pure-PyTorch
-                    # MoE fallback above for why this matters.
-                    self.last_expert_utilization = dict(
-                        enumerate((counts / total).tolist())
-                    )
+                # BUG-114: kept as a device tensor (no .tolist() sync in
+                # forward) -- see the matching change in the PyTorch
+                # fallback above. clamp() rather than a `if total > 0`
+                # Python branch, because that branch was itself a sync on
+                # a device tensor.
+                self.last_expert_utilization_tensor = counts / total.clamp(min=1e-8)
             except (AttributeError, TypeError, IndexError) as exc:
                 logger.warning(
                     "Could not derive expert_utilization from DeepSpeed's exp_counts "
@@ -274,5 +352,5 @@ class MoELayer(nn.Module):
             # is applied here rather than passed into DeepSpeedMoE's ctor).
             return output, aux_loss * self.load_balancing_weight
         output, aux_loss = self.moe(x)
-        self.last_expert_utilization = self.moe.last_expert_utilization
+        self.last_expert_utilization_tensor = self.moe.last_expert_utilization_tensor
         return output, aux_loss

@@ -142,12 +142,33 @@ def dpo_loss(
         chosen_reward = beta * (policy_chosen_logps - ref_chosen_logps)
         rejected_reward = beta * (policy_rejected_logps - ref_rejected_logps)
         accuracy = (chosen_reward > rejected_reward).float().mean()
+        # BUG-116: this built its five diagnostic floats with five separate
+        # .item() calls, i.e. five blocking device synchronizations on every
+        # DPO training step, for five scalars that are all already on the
+        # same device. Stacking them into one tensor and transferring once
+        # gives identical numbers for one sync instead of five.
+        stacked = torch.stack(
+            (
+                loss.detach(),
+                chosen_reward.mean(),
+                rejected_reward.mean(),
+                (chosen_reward - rejected_reward).mean(),
+                accuracy,
+            )
+        )
+        (
+            loss_value,
+            chosen_value,
+            rejected_value,
+            margin_value,
+            accuracy_value,
+        ) = stacked.float().tolist()
         metrics = DPOStepMetrics(
-            loss=loss.item(),
-            chosen_reward=chosen_reward.mean().item(),
-            rejected_reward=rejected_reward.mean().item(),
-            reward_margin=(chosen_reward - rejected_reward).mean().item(),
-            accuracy=accuracy.item(),
+            loss=loss_value,
+            chosen_reward=chosen_value,
+            rejected_reward=rejected_value,
+            reward_margin=margin_value,
+            accuracy=accuracy_value,
         )
     return loss, metrics
 

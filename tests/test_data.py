@@ -347,11 +347,18 @@ def test_preprocessed_source_read_by_mixed_dataset(tmp_path):
     )
     examples = list(dataset)
     assert len(examples) == 2
-    input_ids_seen = {tuple(ex["input_ids"]) for ex in examples}
+    # BUG-118 changed the preprocessed path to yield numpy arrays instead of
+    # Python lists (the list conversion was the bottleneck). The assertions
+    # below are unchanged in strength -- exact token ids, exact label
+    # masking -- they just compare through .tolist() so `==` is a value
+    # comparison rather than numpy's elementwise broadcast.
+    input_ids_seen = {tuple(list(ex["input_ids"])) for ex in examples}
     assert input_ids_seen == {tuple(blocks[0]), tuple(blocks[1])}
 
-    padded_example = next(ex for ex in examples if ex["input_ids"] == blocks[1])
-    assert padded_example["labels"] == [7, 8, 9, -100, -100, -100]
+    padded_example = next(
+        ex for ex in examples if list(ex["input_ids"]) == list(blocks[1])
+    )
+    assert list(padded_example["labels"]) == [7, 8, 9, -100, -100, -100]
 
 
 def test_preprocessed_source_seq_length_mismatch_raises(tmp_path):

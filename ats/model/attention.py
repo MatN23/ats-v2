@@ -5,6 +5,7 @@ written by ats itself in either path."""
 
 from __future__ import annotations
 
+import functools
 import logging
 
 import torch
@@ -82,11 +83,60 @@ def build_padding_causal_mask(
     ]  # [batch,1,1,seq_len]
     mask = key_mask.expand(batch, 1, seq_len, seq_len)
     if is_causal:
-        causal = torch.tril(
-            torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
-        )
-        mask = mask & causal
+        mask = mask & _causal_tril(seq_len, device)
     return mask
+
+
+@functools.lru_cache(maxsize=8)
+def _causal_tril(seq_len: int, device: torch.device) -> torch.Tensor:
+    """Memoized lower-triangular causal mask (True = attend).
+
+    PERF: build_padding_causal_mask is called once per attention layer per
+    forward pass, and previously rebuilt this O(seq_len^2) tensor from
+    scratch every time -- num_layers redundant rebuilds per step for a
+    tensor that is identical across layers and across steps for a fixed
+    seq_len. Memoized on (seq_len, device) the same way
+    ats.model.swa.generate_swa_mask is, with the same caller contract:
+    the returned tensor must never be mutated in place (it is only ever
+    read via `&`, which allocates a new tensor).
+    """
+    return torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+
+
+def can_use_flash_attention(
+    flash_enabled: bool,
+    is_cuda: bool,
+    dtype: torch.dtype,
+    attention_mask: torch.Tensor | None,
+    past_key_value: PastKeyValue | None,
+) -> bool:
+    """Whether the flash_attn kernel path is usable for this call.
+
+    BUG FIX (BUG-101): the dispatch condition this replaces checked only
+    (flash enabled, tensor on CUDA, fp16/bf16). It did NOT check
+    attention_mask. flash_attn_func has no attn_mask argument at all, so a
+    supplied [batch, seq_len] padding mask was silently dropped -- and
+    because `is_causal` is forced False the moment attention_mask is not
+    None, the call went out as `causal=False` with no mask whatsoever.
+    Result: on CUDA in fp16/bf16 with flash_attn installed, any batch
+    carrying a padding mask trained with FULL BIDIRECTIONAL attention over
+    padding included -- every position attending to every future position.
+    No exception, no warning, correct-looking shapes, and CPU/SDPA tests
+    (which take a different branch) stay green. Requiring attention_mask is
+    None here routes those batches to the SDPA branch, which folds padding
+    AND causality into an explicit mask.
+
+    past_key_value is included for the same reason the incremental branch
+    exists: flash's causal/window flags cannot express "new queries start
+    at absolute position past_len".
+    """
+    return (
+        flash_enabled
+        and is_cuda
+        and dtype in (torch.float16, torch.bfloat16)
+        and attention_mask is None
+        and past_key_value is None
+    )
 
 
 class GroupedQueryAttention(nn.Module):
@@ -302,10 +352,12 @@ class GroupedQueryAttention(nn.Module):
             attn_out = attn_out.transpose(1, 2).reshape(
                 batch, seq_len, self.num_heads * self.head_dim
             )
-        elif (
-            self.use_flash_attention
-            and x.is_cuda
-            and x.dtype in (torch.float16, torch.bfloat16)
+        elif can_use_flash_attention(
+            self.use_flash_attention,
+            x.is_cuda,
+            x.dtype,
+            attention_mask,
+            past_key_value,
         ):
             q_bshd = q.transpose(1, 2)
             k_bshd = k.transpose(1, 2)

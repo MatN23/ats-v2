@@ -146,17 +146,45 @@ def test_mod_respects_capacity(dummy_model_config):
         def __init__(self):
             super().__init__()
             self.lin = lin
+            self.seen_seq_lens = []
+            self.seen_inputs = []
 
         def forward(self, x, **kwargs):
+            self.seen_seq_lens.append(x.shape[1])
+            self.seen_inputs.append(x.detach().clone())
             return self.lin(x), torch.zeros(()), None
 
-    mod = MixtureOfDepths(hidden_size, _FakeBlock(), capacity_factor=0.5)
+    block = _FakeBlock()
+    mod = MixtureOfDepths(hidden_size, block, capacity_factor=0.5)
     mod.eval()
-    x = torch.randn(1, 10, hidden_size)
+    seq_len = 10
+    x = torch.randn(1, seq_len, hidden_size)
     out, aux_loss, past_kv = mod(x)
     assert out.shape == x.shape
     assert aux_loss.dim() == 0
     assert past_kv is None
+
+    # This test is named "respects capacity", so it has to actually check
+    # capacity. It previously asserted only the output shape and tuple
+    # arity, which every implementation passes -- including the pre-BUG-103
+    # one that ran the block on all 10 positions and merely masked the
+    # result. Assert on what the wrapped block was actually handed.
+    expected_capacity = max(1, int(0.5 * seq_len))
+    assert block.seen_seq_lens == [expected_capacity], (
+        f"block was invoked with {block.seen_seq_lens} positions; "
+        f"capacity_factor=0.5 over seq_len={seq_len} means it must see "
+        f"exactly {expected_capacity}"
+    )
+
+    # And that the positions it saw are the top-scoring ones, in order.
+    with torch.no_grad():
+        gate_probs = torch.sigmoid(mod.gate(x).squeeze(-1))
+        expected_idx, _ = torch.sort(
+            torch.topk(gate_probs, expected_capacity, dim=1).indices, dim=1
+        )
+    assert torch.equal(block.seen_inputs[0], x.gather(
+        1, expected_idx.unsqueeze(-1).expand(-1, -1, hidden_size)
+    ))
 
 
 def test_mod_forward_does_not_crash_wrapping_a_real_transformer_block():
@@ -853,8 +881,16 @@ def test_mamba_chunked_scan_matches_naive_sequential_reference():
         sequential_y = torch.stack(ys, dim=1)
 
         # Now call the actual shipped chunked-scan implementation.
-        chunked_states = block._chunked_scan(dt, A, B, x_conv)
-        chunked_y = torch.einsum("btdn,btn->btd", chunked_states, C)
+        # BUG-104 changed _chunked_scan to contract the states against C
+        # internally (returning y + final carry) instead of returning a
+        # full [batch, seq_len, d_inner, d_state] state tensor, so the
+        # C contraction that used to live here moved inside it.
+        chunked_y, final_carry = block._chunked_scan(dt, A, B, C, x_conv)
+        assert final_carry.shape == (batch, expand * hidden_size, d_state)
+        assert torch.allclose(final_carry, state, atol=1e-5), (
+            "final carry returned by _chunked_scan does not match the "
+            "sequential reference's final state"
+        )
 
     assert torch.allclose(sequential_y, chunked_y, atol=1e-4), (
         f"Chunked scan diverges from sequential reference: "

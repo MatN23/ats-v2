@@ -15,6 +15,29 @@ non-power-of-2 dimensions), which is a much larger risk to author blind
 than an elementwise op. Fusing "matmul -> reshape -> rope" end-to-end, as an
 ambitious version of this kernel could in principle do, is left as future
 work rather than claimed here.
+
+EXPERIMENTAL -- NOT ON ANY PRODUCTION EXECUTION PATH.
+
+Audit status (BUG-119): nothing under ats/ imports this module. The only
+callers anywhere in the repository are tests/test_triton.py. Production
+training, evaluation, export and generation all go through the PyTorch
+implementations instead (ats.model.rope.apply_rotary_pos_emb), so this code cannot execute during
+a real run no matter what hardware is present.
+
+It is also not usable as-is for training: the Triton path launches a raw
+kernel that writes into a torch.empty() buffer. Raw kernel launches are
+invisible to autograd, so the returned tensor carries no grad_fn and
+gradients stop dead at this call. The PyTorch fallback in the same function
+IS differentiable -- which means the function would silently be
+differentiable on CPU and silently NOT differentiable on CUDA. To prevent
+that from ever becoming a silent training bug, the Triton path now refuses
+to run on inputs that require gradients (see the guard in the wrapper
+below) rather than returning a detached result.
+
+Wiring any of this into the model would require, at minimum, wrapping each
+kernel in a torch.autograd.Function with a hand-written backward, and
+validating it on real hardware. None of that has been done, and none of it
+can be validated in an environment without a GPU.
 """
 
 from __future__ import annotations
@@ -123,6 +146,15 @@ def fused_apply_rope(
             f"fused_apply_rope: x head_dim ({x.shape[-1]}) must match cos/sin dim "
             f"({cos.shape[-1]})."
         )
-    if HAS_TRITON and x.is_cuda:
+    use_triton = HAS_TRITON and x.is_cuda
+    if use_triton and torch.is_grad_enabled() and x.requires_grad:
+        raise RuntimeError(
+            "fused_apply_rope: the Triton path is not differentiable (it launches a raw "
+            "kernel into a torch.empty buffer, which autograd cannot see), and "
+            "an input requires grad. Refusing to return a silently detached "
+            "result. This module is experimental and is not used by any "
+            "production path in ats -- see its module docstring."
+        )
+    if use_triton:
         return _triton_apply_rope(x, cos, sin)
     return _pytorch_apply_rope(x, cos, sin)

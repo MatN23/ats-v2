@@ -208,10 +208,26 @@ class MLAAttention(nn.Module):
         # (folding attention_mask's padding info in when given, same as
         # GroupedQueryAttention's fix), and by reshaping attention_mask
         # properly via build_padding_causal_mask for the plain case.
+        # BUG FIX (BUG-102): GroupedQueryAttention passes window_size into
+        # build_incremental_causal_mask so an SWA model keeps attending to
+        # only the trailing window during generation. MLA did not -- it
+        # called build_incremental_causal_mask with no window_size at all,
+        # so every SWA+MLA layer silently attended to the ENTIRE KV cache
+        # once past_key_value was set. That makes generation use a
+        # different attention pattern than training used, which is a real
+        # (and silent) train/inference mismatch, not just a perf loss. The
+        # `force_full_attention` / `causal` conditions match the prefill
+        # branch below so the windowed and non-windowed layers stay
+        # consistent between prefill and decode.
+        apply_swa = self.use_swa and not self.force_full_attention and causal
+
         attn_mask: torch.Tensor | None
         if past_key_value is not None:
             incremental_mask = build_incremental_causal_mask(
-                seq_len, past_len, x.device
+                seq_len,
+                past_len,
+                x.device,
+                window_size=self.swa_window_size if apply_swa else None,
             )  # [seq_len, total_len], True = attend
             if attention_mask is not None:
                 # attention_mask is the padding mask for the seq_len NEW
@@ -253,12 +269,7 @@ class MLAAttention(nn.Module):
         # inherently a causal band, with no bidirectional-windowed variant
         # implemented -- ModelConfig itself already rejects use_swa=True
         # combined with model_type="diffusion", so this is defense in depth.
-        if (
-            self.use_swa
-            and not self.force_full_attention
-            and past_key_value is None
-            and causal
-        ):
+        if apply_swa and past_key_value is None:
             swa_mask = generate_swa_mask(seq_len, self.swa_window_size, x.device)
             attn_mask = swa_mask if attn_mask is None else (attn_mask & swa_mask)
             is_causal = False

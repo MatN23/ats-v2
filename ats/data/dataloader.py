@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
@@ -102,8 +103,17 @@ def _collate(batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
                 f"got {len(example['input_ids'])}. All examples from MixedDataset "
                 f"should already be fixed-length; this indicates a bug upstream."
             )
-    input_ids = torch.tensor([ex["input_ids"] for ex in batch], dtype=torch.long)
-    labels = torch.tensor([ex["labels"] for ex in batch], dtype=torch.long)
+    # np.asarray stacks a list of equal-length sequences in C in one pass,
+    # whether the elements are Python lists (the raw-text path) or numpy
+    # arrays (the preprocessed path after BUG-118). torch.tensor() on a
+    # list of numpy arrays is both slow and warns; torch.as_tensor on the
+    # stacked array avoids an extra copy.
+    input_ids = torch.as_tensor(
+        np.asarray([ex["input_ids"] for ex in batch]), dtype=torch.long
+    )
+    labels = torch.as_tensor(
+        np.asarray([ex["labels"] for ex in batch]), dtype=torch.long
+    )
     # No attention_mask here: every example in this pipeline is already a
     # fixed-length seq_length block (asserted above), and the only padding
     # that ever occurs (the final partial chunk of a stream, or a

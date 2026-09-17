@@ -17,12 +17,130 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from ats.config.schema import ModelConfig
+from ats.config.schema import (
+    ATSConfig,
+    CheckpointConfig,
+    DataConfig,
+    DataSource,
+    ModelConfig,
+    TrainingConfig,
+)
 from ats.model.attention import GroupedQueryAttention, can_use_flash_attention
 from ats.model.mamba import MambaBlock
 from ats.model.mla import MLAAttention
 from ats.model.mod import MixtureOfDepths
 from ats.model.transformer import ATSTransformer
+from ats.training.adaptive_controller import AdaptiveController
+from ats.training.scheduler import WarmupCosineScheduler
+from ats.training.trainer import Trainer
+
+
+class _FakeEngineWrapper:
+    """Stands in for a DeepSpeed model_engine in Trainer.train_step tests,
+    without needing DeepSpeed: forward/backward run through a REAL
+    ATSTransformer (so the MTP loss path is exercised authentically, not
+    mocked), while step()/get_global_grad_norm()/optimizer are lightweight
+    stand-ins for bookkeeping DeepSpeed would otherwise own.
+
+    Duplicated from tests/test_bug_audit_fixes.py rather than imported from
+    it: `tests/` has no __init__.py, so `from tests.test_bug_audit_fixes
+    import ...` is not a reliable cross-environment import -- it depends on
+    how pytest happens to insert rootdir onto sys.path, which varies by
+    invocation. This is exactly what broke CI: `python -m pytest` (used
+    while verifying this locally) implicitly adds the current directory to
+    sys.path, so the dotted import worked there; plain `pytest` (what CI
+    actually runs) does not, so it failed with `ModuleNotFoundError: No
+    module named 'tests'`. See the identical note and duplication in
+    test_bug_audit_fixes.py's own _TinyModelEngine.
+    """
+
+    def __init__(
+        self, model: torch.nn.Module, optimizer: torch.optim.Optimizer
+    ) -> None:
+        self.module = model
+        self.optimizer = optimizer
+        self.local_rank = torch.device("cpu")
+
+    def __call__(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+    def parameters(self):
+        return self.module.parameters()
+
+    def backward(self, loss: torch.Tensor) -> None:
+        loss.backward()
+
+    def step(self) -> None:
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def zero_grad(self) -> None:
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def get_global_grad_norm(self):
+        return None
+
+    def eval(self) -> None:
+        self.module.eval()
+
+    def train(self) -> None:
+        self.module.train()
+
+
+def _make_mtp_trainer(tmp_path) -> Trainer:
+    """Builds a real Trainer for train_step tests, bypassing __init__'s
+    initialize_engine() call (the only piece that actually requires
+    DeepSpeed) in favor of _FakeEngineWrapper around a real model.
+
+    Duplicated from tests/test_bug_audit_fixes.py -- see
+    _FakeEngineWrapper's docstring above for why.
+    """
+    config = ATSConfig(
+        model=ModelConfig(
+            hidden_size=16,
+            num_layers=2,
+            num_heads=2,
+            num_kv_heads=2,
+            intermediate_size=32,
+            vocab_size=30,
+            max_seq_len=16,
+            use_mtp=True,
+            mtp_num_tokens=2,
+            use_flash_attention=False,
+        ),
+        training=TrainingConfig(
+            max_steps=10, learning_rate=1e-3, warmup_steps=1, grad_accum_steps=1
+        ),
+        data=DataConfig(sources=[DataSource(path="x.jsonl")], seq_length=8),
+        checkpoint=CheckpointConfig(output_dir=str(tmp_path)),
+    )
+    model = ATSTransformer(config.model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.learning_rate)
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.config = config
+    trainer.model_engine = _FakeEngineWrapper(model, optimizer)
+    trainer.optimizer = optimizer
+    trainer.grad_accum_steps = 1
+    trainer.scheduler = WarmupCosineScheduler(
+        base_lr=config.training.learning_rate,
+        warmup_steps=config.training.warmup_steps,
+        max_steps=config.training.max_steps,
+        min_lr_ratio=config.training.min_lr_ratio,
+    )
+    trainer.checkpoint_manager = None
+    trainer.monitor = None
+    trainer.adaptive_controller = AdaptiveController(config.adaptive)
+    trainer._adaptive_lr_multiplier = 1.0
+    trainer._max_adaptive_multiplier = config.adaptive.max_lr_multiplier
+    trainer._min_adaptive_multiplier = config.adaptive.min_lr_multiplier
+    trainer._adaptive_multiplier_decay = config.adaptive.lr_multiplier_decay
+    trainer.global_step = 0
+    trainer.epoch = 0
+    trainer._accumulation_step = 0
+    trainer._accumulated_tokens = 0
+    return trainer
+
 
 # ---------------------------------------------------------------------------
 # BUG-101: the flash_attn dispatch condition ignored attention_mask, so a
@@ -608,8 +726,6 @@ def test_trainer_train_step_runs_with_an_int_local_rank_engine(tmp_path):
     DeepSpeed shape) must train. Pre-fix this raised on the first
     .to(device) because device was torch.device("cuda:0").
     """
-    from tests.test_bug_audit_fixes import _FakeEngineWrapper, _make_mtp_trainer
-
     trainer = _make_mtp_trainer(tmp_path)
     engine = trainer.model_engine
     assert isinstance(engine, _FakeEngineWrapper)
@@ -638,8 +754,6 @@ def test_grad_norm_is_measured_before_gradients_are_cleared(tmp_path):
     reported ~0.0 on every step forever -- which also meant
     AdaptiveController's gradient-explosion check could never fire.
     """
-    from tests.test_bug_audit_fixes import _make_mtp_trainer
-
     trainer = _make_mtp_trainer(tmp_path)
     batch = {
         "input_ids": torch.randint(0, 30, (2, 8)),

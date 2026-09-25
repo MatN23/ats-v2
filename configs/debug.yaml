@@ -37,7 +37,7 @@ training:
 
 data:
   sources:
-    - path: ./data/debug.jsonl
+    - path: ./data/train.jsonl
       weight: 1.0
   seq_length: 512
   tokenizer_name: "tiktoken:cl100k_base"

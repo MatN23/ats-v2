@@ -14,6 +14,13 @@ from ats.config.schema import ConfigError, ModelConfig
 # Architecture presets: hidden_size, num_layers, num_heads, num_kv_heads,
 # intermediate_size chosen to roughly match published dense-model recipes.
 MODEL_SIZE_PRESETS: dict[str, dict[str, int]] = {
+    "50m": {
+        "hidden_size": 512,
+        "num_layers": 12,
+        "num_heads": 8,
+        "num_kv_heads": 8,
+        "intermediate_size": 1408,
+    },
     "125m": {
         "hidden_size": 768,
         "num_layers": 12,

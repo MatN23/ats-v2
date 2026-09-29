@@ -801,7 +801,15 @@ class ATSConfig(BaseModel):
         # the resolved architecture/training semantics, so changing either
         # between runs (e.g. pointing --resume at a different output
         # directory) must not cause a spurious config_hash mismatch on resume.
-        payload = self.model_dump_json(exclude={"logging", "checkpoint"}).encode(
-            "utf-8"
-        )
+        #
+        # BUG FIX: training.max_steps is also excluded so --resume can
+        # extend (or shorten) the total training schedule without being
+        # treated as an incompatible config change -- e.g. resuming a
+        # 50,000-step run with --max-steps 150000 to continue training
+        # further. Every other training/model/architecture field is still
+        # hashed, so a genuine mismatch (hidden_size, num_layers, learning
+        # rate, etc.) still fails loudly as intended.
+        payload = self.model_dump_json(
+            exclude={"logging": True, "checkpoint": True, "training": {"max_steps"}}
+        ).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()[:16]

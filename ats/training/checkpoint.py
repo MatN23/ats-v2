@@ -96,43 +96,17 @@ def _lists_to_tuples(value: Any) -> Any:
 def _restore_rng_state(state: dict[str, Any]) -> None:
     python_state = state["python"]
     if isinstance(python_state, list):
-        # Defensive path for RNG state that went through JSON at some point
-        # (see the comment on the numpy branch below for why the real
-        # CheckpointManager.save/load path doesn't do this). A single
-        # outer tuple(...) isn't enough: random.getstate() is nested
-        # (version, big-tuple-of-ints, gauss_next), and JSON flattens every
-        # level to a list, while random.setstate() requires the inner
-        # structure to be tuples too.
         python_state = _lists_to_tuples(python_state)
     random.setstate(python_state)
 
     np_state = state["numpy"]
     if isinstance(np_state, (list, tuple)):
-        # Defensive path for a hypothetical caller that hands this function
-        # RNG state that went through JSON at some point (the real
-        # CheckpointManager.save/load path does NOT do this -- client_state
-        # goes through DeepSpeed's own checkpoint_engine, which is
-        # torch.save/torch.load (pickle) by default and preserves the numpy
-        # ndarray exactly). `tuple(np_state)` alone leaves the inner array
-        # (element 1) as a plain Python list, which np.random.set_state
-        # rejects; convert it back to a real ndarray with the dtype
-        # np.random.get_state() actually produces (uint32) before use.
         np_state = list(np_state)
         np_state[1] = np.array(np_state[1], dtype=np.uint32)
         np_state = tuple(np_state)
     np.random.set_state(np_state)
     torch.set_rng_state(torch.tensor(state["torch"], dtype=torch.uint8))
 
-    # BUG-106: torch.cuda.set_rng_state_all() requires exactly one state per
-    # visible device and raises if the count differs. A checkpoint taken on
-    # an 8-GPU node and resumed on 4 GPUs (or resumed on CPU after being
-    # taken on GPU, or vice versa) therefore either crashed with an opaque
-    # index error deep inside torch, or silently skipped CUDA RNG restore
-    # with nothing said about it. Both cases are now explicit: restore when
-    # the counts match, and say plainly when they do not, because a
-    # half-restored RNG means a "resumed" run is not the run it claims to
-    # continue -- dropout masks and data shuffling diverge from the
-    # original trajectory.
     cuda_states = state.get("torch_cuda")
     if not torch.cuda.is_available():
         if cuda_states:
@@ -168,9 +142,7 @@ def _restore_rng_state(state: dict[str, Any]) -> None:
 
 def load_model_weights_safetensors(checkpoint_dir: str) -> dict[str, torch.Tensor]:
     """Loads just the model weights from a checkpoint's model.safetensors
-    file, with no DeepSpeed engine and no pickle execution risk. Useful for
-    export/inspection tooling that only needs weights, not optimizer state
-    or the ability to resume training."""
+    file, with no DeepSpeed engine and no pickle execution risk."""
     path = Path(checkpoint_dir) / _SAFETENSORS_FILENAME
     if not path.exists():
         raise ConfigError(
@@ -183,25 +155,7 @@ def load_model_weights_safetensors(checkpoint_dir: str) -> dict[str, torch.Tenso
 
 def load_initial_weights(model: Any, path: str) -> None:
     """Loads model weights only -- no optimizer state, no global_step, no RNG
-    state, and no config_hash match requirement -- from either a checkpoint
-    directory (containing model.safetensors) or a direct .safetensors file
-    path, straight into an already-constructed model in place.
-
-    This is deliberately a different, narrower operation than
-    CheckpointManager.load()/resume(): it exists for population-based
-    training ("breeding"), where a losing population member's weights are
-    replaced with a winning member's weights but the losing member's
-    hyperparameters (learning rate, weight decay, dropout, ...) are then
-    perturbed and therefore intentionally no longer match the source
-    checkpoint's config_hash. Resetting the optimizer state on transplant is
-    correct here, not a bug: Adam's moments were accumulated under the old
-    hyperparameters and shouldn't carry over to the new ones.
-
-    Raises ConfigError if the destination model's parameter names/shapes
-    don't match the source weights exactly -- a transplant is only valid
-    between members with identical architecture (hidden_size, num_layers,
-    etc.); only training-level hyperparameters are expected to differ.
-    """
+    state, and no config_hash match requirement."""
     p = Path(path)
     if p.is_dir():
         weights = load_model_weights_safetensors(str(p))
@@ -226,10 +180,6 @@ def load_initial_weights(model: Any, path: str) -> None:
     try:
         missing, unexpected = model.load_state_dict(weights, strict=False)
     except RuntimeError as exc:
-        # strict=False only tolerates missing/extra KEYS -- torch still
-        # raises RuntimeError for a shape mismatch on a key present in both,
-        # which is exactly the case we need to turn into a clear
-        # ConfigError instead of a passthrough torch stack trace.
         raise ConfigError(
             f"--init-weights source {source_desc} does not match the destination "
             f"model's architecture (shape mismatch): {exc}. Fix: --init-weights is "
@@ -238,6 +188,28 @@ def load_initial_weights(model: Any, path: str) -> None:
             f"match); only training-level hyperparameters (learning rate, weight "
             f"decay, dropout, ...) may differ between source and destination."
         ) from exc
+
+    if missing:
+        # BUG FIX: tied parameters (e.g. lm_head.weight sharing storage
+        # with embed_tokens.weight when model.tie_word_embeddings=True) are
+        # legitimately absent from a saved checkpoint -- see
+        # CheckpointManager.save's dedup-by-storage-identity fix. The model
+        # ties them together at construction time (before this function
+        # ever runs), so loading the OTHER half of the tie already updates
+        # the shared tensor. A "missing" key is not actually missing if the
+        # model's current parameter for that name shares storage with a
+        # parameter that WAS loaded.
+        model_state = model.state_dict()
+        loaded_ptrs = {
+            model_state[k].data_ptr() for k in weights if k in model_state
+        }
+        missing = [
+            name
+            for name in missing
+            if name not in model_state
+            or model_state[name].data_ptr() not in loaded_ptrs
+        ]
+
     if missing or unexpected:
         raise ConfigError(
             f"--init-weights source {source_desc} does not match the destination "
@@ -277,16 +249,8 @@ class CheckpointManager:
             "config_hash": self.config.config_hash(),
             "rng_state": _capture_rng_state(),
         }
-        # Merge in caller-supplied state (e.g. trainer.py's adaptive LR
-        # multiplier, gradient-accumulation counters, and AdaptiveController
-        # internals) without trainer.py needing to know about or duplicate
-        # the fields this method already tracks.
         if extra_client_state:
             client_state.update(extra_client_state)
-        # DeepSpeed's own save_checkpoint() already coordinates correctly
-        # across ranks for its ZeRO-sharded optimizer/model checkpoint --
-        # that rank coordination is DeepSpeed's responsibility and is left
-        # untouched here.
         model_engine.save_checkpoint(
             str(self.output_dir),
             tag=tag,
@@ -294,30 +258,44 @@ class CheckpointManager:
             save_latest=True,
         )
 
-        # module.state_dict() must be called on EVERY rank even though only
-        # rank 0 will write it to disk: under ZeRO-3, gathering the full
-        # (desharded) state dict is a collective operation that every rank
-        # must participate in together, or it will hang waiting for ranks
-        # that never call it.
-        module = (
-            model_engine.module if hasattr(model_engine, "module") else model_engine
-        )
-        # BUG FIX: only rank 0 actually needs a full CPU copy of the model.
-        # The original code built `{k: v.detach().cpu().contiguous() for k, v
-        # in module.state_dict().items()}` on EVERY rank -- meaning every
-        # rank's host process retained a full desharded copy of the model in
-        # CPU RAM, not just rank 0's (for a 70B model in bf16, ~140GB of host
-        # RAM per node). Every rank must still call module.state_dict()
-        # itself (the collective gather), but only rank 0 needs to move it
-        # to CPU and keep it around afterward; other ranks let the gathered
-        # GPU tensors get freed immediately.
-        full_state_dict = module.state_dict()
+        # BUG FIX: plain module.state_dict() under ZeRO-3 does NOT gather
+        # sharded/offloaded parameters -- it returns each rank's local
+        # partition, which for a single-rank offloaded run comes back as
+        # empty (shape [0]) placeholder tensors. save_16bit_model() is
+        # DeepSpeed's purpose-built method that performs the actual
+        # collective gather internally before returning a full state dict.
+        # It must still be called on every rank (the gather is collective),
+        # but only returns a non-empty dict on rank 0.
+        tmp_dir = ckpt_dir / "_tmp_16bit"
+        success = model_engine.save_16bit_model(str(tmp_dir), "model.pt")
 
         if rank == 0:
-            state_dict = {
-                k: v.detach().cpu().contiguous() for k, v in full_state_dict.items()
-            }
-        del full_state_dict
+            if not success:
+                raise RuntimeError(
+                    "model_engine.save_16bit_model() failed to produce a "
+                    "consolidated state dict on rank 0."
+                )
+            full_state_dict = torch.load(tmp_dir / "model.pt", map_location="cpu")
+
+            # BUG FIX: tied weights (lm_head.weight sharing storage with
+            # embed_tokens.weight when model.tie_word_embeddings=True) are
+            # the same underlying tensor under two different keys.
+            # safetensors_save_file() refuses to save two keys aliasing the
+            # same storage. Deduplicate by storage identity, keeping only
+            # the first key seen per unique tensor -- ATSTransformer.__init__
+            # already re-ties lm_head.weight = embed_tokens.weight at
+            # construction time (see ats/model/transformer.py), so loading
+            # only the kept key is sufficient; nothing is lost.
+            seen_data_ptrs: dict[int, str] = {}
+            state_dict: dict[str, torch.Tensor] = {}
+            for key, tensor in full_state_dict.items():
+                ptr = tensor.data_ptr()
+                if ptr in seen_data_ptrs:
+                    continue
+                seen_data_ptrs[ptr] = key
+                state_dict[key] = tensor.detach().cpu().contiguous()
+            del full_state_dict
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
         if rank == 0:
             state_path = ckpt_dir / _TRAINING_STATE_FILENAME
@@ -332,20 +310,10 @@ class CheckpointManager:
                     indent=2,
                 )
 
-            # Write a copy of the resolved config alongside the checkpoint so
-            # export.py (and manual inspection) can find it without requiring
-            # --config to be passed explicitly every time.
             config_path = ckpt_dir / "config.yaml"
             with open(config_path, "w", encoding="utf-8") as f:
                 yaml.safe_dump(self.config.model_dump(), f, sort_keys=False)
 
-            # Write a plain safetensors snapshot of the model weights alongside
-            # DeepSpeed's own checkpoint (an ADDITIONAL, de-sharded,
-            # pickle-free artifact for fast loading / HF export / manual
-            # inspection). Only rank 0 writes it -- without this guard, every
-            # rank under ZeRO-3 would redundantly write the same
-            # potentially-huge file simultaneously, corrupting it or
-            # serializing via filesystem locks.
             safetensors_save_file(state_dict, str(ckpt_dir / _SAFETENSORS_FILENAME))
 
             logger.info("Saved checkpoint at step %d to %s", global_step, ckpt_dir)

@@ -36,8 +36,8 @@ training:
 
 data:
   sources:
-    - path: ./data/train.jsonl
-  weight: 1.0
+    - path: ./data/fineweb_edu.jsonl
+      weight: 1.0
   seq_length: 4096
   tokenizer_name: "tiktoken:cl100k_base"
   streaming: true
@@ -50,7 +50,7 @@ parallelism:
 
 logging:
   project_name: ats-125m
-  use_wandb: false
+  use_wandb: true
   use_tensorboard: true
   log_every: 50
 

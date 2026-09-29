@@ -125,6 +125,12 @@ def build_deepspeed_config(config: ATSConfig, micro_batch_size: int) -> dict[str
             "device": "cpu",
             "pin_memory": True,
         }
+    if zero_stage == 3:
+        # Without this flag, DeepSpeed's save_16bit_model() silently
+        # returns False instead of performing the collective gather of
+        # sharded/offloaded parameters -- CheckpointManager.save() then
+        # raises since it has no consolidated state dict to write.
+        zero_optimization["stage3_gather_16bit_weights_on_model_save"] = True
 
     ds_config: dict[str, Any] = {
         "train_micro_batch_size_per_gpu": micro_batch_size,
